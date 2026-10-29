@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1A1A1A">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Prumo">
+  <meta name="description" content="Sua vida no prumo: finanças, treinos, alimentação, tarefas, metas e rotinas.">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/favicon.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <title>Prumo</title>
+  <script src="config.js"></script>
+  <style>
+    :root { --bg: #1A1A1A; --ink: #FFF3D6; --muted: rgba(255, 243, 214, .62); --gold: #F2B705; --line: #3A3A3A; --card: #222222; }
+    * { box-sizing: border-box; margin: 0; }
+    html, body { height: 100%; background: var(--bg); color: var(--ink); font-family: 'Plus Jakarta Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
+    body { overflow: hidden; transition: background .2s; }
+    body.light { --bg: #FFFFFF; --ink: #1A1A1A; --muted: rgba(26, 26, 26, .62); --line: rgba(26, 26, 26, .1); --card: #FFFFFF; }
+    #app { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; background: var(--bg); padding-top: env(safe-area-inset-top); }
+    .cover { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; padding: 32px; background: var(--bg); text-align: center; transition: opacity .3s; }
+    .cover.hide { opacity: 0; pointer-events: none; }
+    .cover p { color: var(--muted); font-size: 15px; line-height: 1.5; max-width: 320px; }
+    .cover h1 { font-size: 22px; letter-spacing: -.02em; }
+    .logo { width: 64px; height: auto; }
+    .word { font-weight: 800; font-size: 30px; letter-spacing: -.035em; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .bar { width: 120px; height: 3px; border-radius: 3px; background: var(--line); overflow: hidden; }
+    .bar i { display: block; width: 40%; height: 100%; background: var(--gold); border-radius: 3px; animation: slide 1.1s ease-in-out infinite; }
+    @keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(260%); } }
+    .btn { appearance: none; border: 0; border-radius: 999px; height: 50px; padding: 0 24px; font: inherit; font-weight: 700; font-size: 15px; cursor: pointer; }
+    .btn-primary { background: var(--gold); color: #1A1A1A; }
+    .btn-ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+    input.url { width: min(420px, 100%); height: 50px; border-radius: 14px; border: 1px solid var(--line); background: var(--card); color: var(--ink); padding: 0 14px; font: inherit; font-size: 14px; }
+    .sheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; padding: 24px 24px calc(24px + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--line); border-radius: 28px 28px 0 0; box-shadow: 0 -20px 50px -20px rgba(0, 0, 0, .6); transform: translateY(110%); transition: transform .28s cubic-bezier(.2, .8, .2, 1); }
+    .sheet.open { transform: none; }
+    .sheet h2 { font-size: 20px; letter-spacing: -.02em; margin: 14px 0 6px; }
+    .sheet p { color: var(--muted); font-size: 14.5px; line-height: 1.5; }
+    .sheet .row { justify-content: stretch; margin-top: 20px; }
+    .sheet .row .btn { flex: 1; }
+    .tile { width: 48px; height: 48px; border-radius: 14px; display: grid; place-items: center; background: rgba(242, 183, 5, .14); color: var(--gold); }
+    .chip { position: fixed; z-index: 15; right: 16px; bottom: calc(92px + env(safe-area-inset-bottom)); display: flex; align-items: center; gap: 8px; padding: 0 16px; height: 44px; border-radius: 999px; background: var(--gold); color: #1A1A1A; font-weight: 700; font-size: 14px; border: 0; box-shadow: 0 10px 30px -10px rgba(0, 0, 0, .6); }
+    .scrim { position: fixed; inset: 0; z-index: 19; background: rgba(10, 10, 10, .55); opacity: 0; pointer-events: none; transition: opacity .25s; }
+    .scrim.on { opacity: 1; pointer-events: auto; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <iframe id="app" title="Prumo" allow="clipboard-write; camera; microphone; screen-wake-lock"></iframe>
+
+  <div class="cover" id="splash">
+    <div class="brand"><svg class="logo" viewBox="140 40 232 432" aria-hidden="true"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F6D365"/><stop offset="1" stop-color="#F2B705"/></linearGradient></defs><g transform="translate(-16 7)"><path d="M200 40 V118" stroke="currentColor" stroke-width="9" stroke-linecap="round" fill="none"/><path fill="url(#g)" fill-rule="evenodd" d="M168 118 H276 A100 100 0 0 1 276 318 H232 V366 L200 424 L168 366 Z M276 176 A42 42 0 1 1 275.99 176 Z"/><rect x="174" y="448" width="52" height="10" rx="5" fill="currentColor"/></g></svg><span class="word">prumo</span></div>
+    <div class="bar"><i></i></div>
+  </div>
+
+  <div class="cover hide" id="fail" hidden>
+    <h1 id="fail-t">Não conseguimos abrir o Prumo</h1>
+    <p id="fail-p">Confira a internet e tente de novo. Se o endereço do app mudou, cole o novo link abaixo.</p>
+    <div class="row"><button class="btn btn-primary" id="retry">Tentar de novo</button><button class="btn btn-ghost" id="cfg">Trocar o link</button></div>
+    <div id="cfg-box" hidden style="width:100%;display:flex;flex-direction:column;align-items:center;gap:10px">
+      <input class="url" id="url" placeholder="https://script.google.com/macros/s/…/exec" inputmode="url" autocomplete="off">
+      <button class="btn btn-primary" id="save">Salvar e abrir</button>
+    </div>
+  </div>
+
+  <div class="scrim" id="scrim"></div>
+  <div class="sheet" id="push" role="dialog" aria-modal="true" aria-labelledby="push-t">
+    <div class="tile"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></div>
+    <h2 id="push-t">Receber avisos do Prumo?</h2>
+    <p>Lembretes de tarefas, rotinas, contas a vencer e metas chegam aqui mesmo com o app fechado. Você pode desligar quando quiser.</p>
+    <div class="row"><button class="btn btn-ghost" id="push-no">Agora não</button><button class="btn btn-primary" id="push-yes">Permitir</button></div>
+  </div>
+
+  <button class="chip" id="install" hidden><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>Instalar o Prumo</button>
+
+  <div class="sheet" id="ios" role="dialog" aria-modal="true">
+    <h2>Instale o Prumo no iPhone</h2>
+    <p>Toque em <b>Compartilhar</b> (o quadrado com a seta) na barra do Safari e depois em <b>Adicionar à Tela de Início</b>. Com o app instalado, as notificações passam a funcionar.</p>
+    <div class="row"><button class="btn btn-primary" id="ios-ok">Entendi</button></div>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+    var $ = function (id) { return document.getElementById(id); };
+    var frame = $('app'), appWin = null, ready = false, failTimer = null, pending = null, deferredInstall = null;
+    var standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+    var pushSupported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+    var swReg = null;
+
+    function store(k, v) { try { if (v === undefined) return localStorage.getItem('prumo.shell.' + k); localStorage.setItem('prumo.shell.' + k, v); } catch (e) { return null; } }
+    function execUrl() { return store('exec') || (window.PRUMO && PRUMO.EXEC_URL) || ''; }
+    function remember(url) { if (!url) return; store('exec', url); if ('caches' in window) caches.open('prumo-config').then(function (c) { return c.put('exec-url', new Response(url)); }).catch(function () {}); }
+
+    function load() {
+      var url = execUrl();
+      ready = false;
+      $('fail').hidden = true; $('fail').classList.add('hide');
+      $('splash').classList.remove('hide');
+      if (!url) return fail('Falta o endereço do app', 'Cole o link do Web App do Prumo (termina em /exec).', true);
+      if (!navigator.onLine) return fail('Sem internet', 'O Prumo precisa de conexão para abrir. Conecte e tente de novo.');
+      frame.src = url + (location.hash || '');
+      clearTimeout(failTimer);
+      failTimer = setTimeout(function () { if (!ready) fail(); }, 25000);
+    }
+    function fail(t, p, showCfg) {
+      $('splash').classList.add('hide');
+      if (t) $('fail-t').textContent = t;
+      if (p) $('fail-p').textContent = p;
+      $('fail').hidden = false; requestAnimationFrame(function () { $('fail').classList.remove('hide'); });
+      $('cfg-box').hidden = !showCfg; $('url').value = execUrl();
+    }
+    $('retry').onclick = load;
+    $('cfg').onclick = function () { $('cfg-box').hidden = false; $('url').focus(); };
+    $('save').onclick = function () { var u = $('url').value.trim(); if (!/^https:\/\/script\.google\.com\/.+\/exec/.test(u)) { $('url').style.borderColor = '#E5675B'; return; } remember(u); load(); };
+    window.addEventListener('online', function () { if (!ready) load(); });
+
+    function reply(msg) { if (appWin) try { appWin.postMessage(Object.assign({ shell: 'prumo' }, msg), '*'); } catch (e) { /* noop */ } }
+    function theme(dark) {
+      document.body.classList.toggle('light', !dark);
+      var m = document.querySelector('meta[name=theme-color]'); if (m) m.content = dark ? '#1A1A1A' : '#FFFFFF';
+    }
+    function device() {
+      var ua = navigator.userAgent;
+      var os = /iPhone|iPad/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Mac/.test(ua) ? 'Mac' : /Linux/.test(ua) ? 'Linux' : 'Outro';
+      var br = /Edg\//.test(ua) ? 'Edge' : /SamsungBrowser/.test(ua) ? 'Samsung' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : '';
+      return os + (br ? ' · ' + br : '') + (standalone ? ' · app' : '');
+    }
+    async function pushState() {
+      var s = { supported: pushSupported, permission: pushSupported ? Notification.permission : 'unsupported', subscribed: false, endpoint: '' };
+      try { if (pushSupported && swReg) { var sub = await swReg.pushManager.getSubscription(); if (sub) { s.subscribed = true; s.endpoint = sub.endpoint; } } } catch (e) { /* noop */ }
+      return s;
+    }
+    function b64ToBytes(b64) { var pad = '='.repeat((4 - b64.length % 4) % 4); var raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/')); var out = new Uint8Array(raw.length); for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i); return out; }
+
+    async function subscribe(publicKey) {
+      try {
+        if (!swReg) swReg = await navigator.serviceWorker.ready;
+        var perm = await Notification.requestPermission();
+        if (perm !== 'granted') return reply({ type: 'prumo:push:sub', error: perm === 'denied' ? 'As notificações foram bloqueadas. Libere nas configurações do celular.' : 'Permissão não concedida.' });
+        var key = b64ToBytes(publicKey);
+        var sub = await swReg.pushManager.getSubscription();
+        if (sub && sub.options && sub.options.applicationServerKey) {
+          var cur = new Uint8Array(sub.options.applicationServerKey);
+          if (cur.length !== key.length || cur.some(function (b, i) { return b !== key[i]; })) { await sub.unsubscribe(); sub = null; }
+        }
+        if (!sub) sub = await swReg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+        reply({ type: 'prumo:push:sub', sub: sub.toJSON(), device: device() });
+      } catch (e) { reply({ type: 'prumo:push:sub', error: 'Não foi possível ativar: ' + (e && e.message ? e.message : e) }); }
+    }
+    function openSheet(id) { $(id).classList.add('open'); $('scrim').classList.add('on'); }
+    function closeSheet(id) { $(id).classList.remove('open'); $('scrim').classList.remove('on'); }
+    $('push-yes').onclick = function () { closeSheet('push'); var k = pending; pending = null; if (k) subscribe(k); };
+    $('push-no').onclick = function () { closeSheet('push'); pending = null; reply({ type: 'prumo:push:sub', error: 'Tudo bem, você pode ativar depois.' }); };
+
+    window.addEventListener('message', async function (e) {
+      var d = e.data;
+      if (!d || d.app !== 'prumo' || !/\.googleusercontent\.com$|^http:\/\/localhost(:\d+)?$/.test(e.origin)) return;
+      appWin = e.source;
+      if (d.type === 'prumo:ready') {
+        ready = true; clearTimeout(failTimer);
+        $('splash').classList.add('hide'); $('fail').hidden = true;
+        theme(d.dark !== false);
+        if (d.execUrl && /\/exec$/.test(d.execUrl)) remember(d.execUrl);
+        reply({ type: 'prumo:shell', standalone: standalone, push: await pushState() });
+      }
+      if (d.type === 'prumo:theme') theme(!!d.dark);
+      if (d.type === 'prumo:push:enable') {
+        if (!pushSupported) return reply({ type: 'prumo:push:sub', error: /iPhone|iPad/.test(navigator.userAgent) && !standalone ? 'No iPhone, adicione o Prumo à Tela de Início e abra por lá.' : 'Este navegador não aceita notificações push.' });
+        pending = d.publicKey; openSheet('push');
+      }
+      if (d.type === 'prumo:push:disable') {
+        var ep = '';
+        try { var sub = swReg && await swReg.pushManager.getSubscription(); if (sub) { ep = sub.endpoint; await sub.unsubscribe(); } } catch (x) { /* noop */ }
+        reply({ type: 'prumo:push:off', endpoint: ep });
+      }
+    });
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').then(function (r) { swReg = r; }).catch(function () { /* sem SW: o app abre, só sem push/offline */ });
+      navigator.serviceWorker.addEventListener('message', function (e) { if (e.data && e.data.type === 'navigate') reply({ type: 'prumo:go', route: e.data.route }); });
+    }
+
+    // Instalação: Android/desktop usam o convite do navegador; iPhone recebe a dica do Compartilhar uma vez.
+    window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferredInstall = e; if (!standalone) $('install').hidden = false; });
+    $('install').onclick = async function () { if (!deferredInstall) return; deferredInstall.prompt(); try { await deferredInstall.userChoice; } catch (x) { /* noop */ } deferredInstall = null; $('install').hidden = true; };
+    window.addEventListener('appinstalled', function () { $('install').hidden = true; });
+    if (/iPhone|iPad/.test(navigator.userAgent) && !standalone && !store('iosTip')) setTimeout(function () { openSheet('ios'); }, 4000);
+    $('ios-ok').onclick = function () { closeSheet('ios'); store('iosTip', '1'); };
+
+    load();
+  })();
+  </script>
+</body>
+</html>
