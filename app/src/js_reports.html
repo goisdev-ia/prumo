@@ -1,0 +1,279 @@
+<script>
+/* Prumo · motor único de relatórios.
+   Cada tela descreve o relatório (título, filtros ativos, seções) e o motor gera, a partir dos mesmos dados,
+   o PDF A4 compacto (pdf-lib, Helvetica 9 pt, cabeçalho, rodapé com página X de Y, sumário opcional) e a planilha
+   XLSX (SheetJS: aba Resumo + uma aba por tabela, números e datas como valores). Também baixa, imprime
+   (iframe oculto, com alternativa de abrir em nova aba) e envia ao Telegram pela fila do servidor.
+   Seções: kpis {itens:[[rótulo, valor]]}, tabela {titulo, colunas:[{k,l,fmt,w}], linhas, total},
+   texto {titulo, md}, grade {titulo, colunas, itens:[[número, valor]]}, quebra {}.
+   Funciona no navegador e no Node (testes). */
+(function (root) {
+  'use strict';
+  const A4 = [595.28, 841.89], M = 34, FS = 9;
+  const winAnsi = (s) => String(s == null ? '' : s).normalize('NFC').replace(/[‘’‚′]/g, "'").replace(/[“”„″]/g, '"').replace(/[‐‑‒]/g, '-').replace(/\t/g, '  ').replace(/[^\x0A\x20-\x7E\xA0-\xFF–—•…€]/g, '?');
+  const pad = (n) => String(n).padStart(2, '0');
+  const brNum = (v, d = 2) => { const n = Number(v); if (!isFinite(n)) return ''; const s = Math.abs(n).toFixed(d).split('.'); return (n < 0 ? '-' : '') + s[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.') + (d ? ',' + s[1] : ''); };
+  const isoDate = (v) => { const m = String(v || '').match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? m : null; };
+  /** Texto de uma célula para o PDF, pelo formato da coluna. */
+  function cellText(v, fmt) {
+    if (v == null || v === '') return '';
+    if (fmt === 'brl') return 'R$ ' + brNum(v, 2);
+    if (fmt === 'num') return brNum(v, Number.isInteger(Number(v)) ? 0 : 2);
+    if (fmt === 'num1') return brNum(v, 1);
+    if (fmt === 'pct') return brNum(v, Math.abs(Number(v)) < 10 ? 1 : 0) + '%';
+    if (fmt === 'date') { const m = isoDate(v); return m ? m[3] + '/' + m[2] + '/' + m[1] : String(v); }
+    if (fmt === 'datetime') { const d = new Date(v); return isNaN(d) ? String(v) : pad(d.getDate()) + '/' + pad(d.getMonth() + 1) + '/' + d.getFullYear() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+    if (fmt === 'bool') return v === true || v === 'true' ? 'sim' : 'não';
+    return String(v);
+  }
+  const NUMF = new Set(['brl', 'num', 'num1', 'pct']);
+  function stamp(d = new Date()) { return pad(d.getDate()) + '/' + pad(d.getMonth() + 1) + '/' + d.getFullYear() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+  /** Markdown simples para blocos {t: 'h1'|'h2'|'h3'|'li'|'q'|'p'|'hr', s} (sem formatação inline). */
+  function mdBlocks(src) {
+    const out = [];
+    String(src || '').replace(/\r/g, '').split('\n').forEach((l) => {
+      const t = l.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/__([^_]+)__/g, '$1').replace(/(^|\s)_([^_]+)_(?=\s|$|[.,;:])/g, '$1$2').replace(/`([^`]+)`/g, '$1').replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '$1 ($2)').replace(/\[\[([^\]]+)\]\]/g, '$1');
+      let m;
+      if (!t.trim()) { out.push({ t: 'sp' }); return; }
+      if (/^\s*(-{3,}|\*{3,})\s*$/.test(t)) { out.push({ t: 'hr' }); return; }
+      if ((m = t.match(/^(#{1,3})\s+(.*)$/))) { out.push({ t: 'h' + m[1].length, s: m[2] }); return; }
+      if ((m = t.match(/^\s*(?:[-*•]|\d+[.)])\s+(.*)$/))) { out.push({ t: 'li', s: m[1], n: (t.match(/^\s*(\d+[.)])/) || [])[1] || '', ind: Math.min(3, Math.floor((t.match(/^\s*/)[0].length) / 2)) }); return; }
+      if ((m = t.match(/^>\s?(.*)$/))) { out.push({ t: 'q', s: m[1] }); return; }
+      if (/^\|.*\|\s*$/.test(t)) { if (/^\|[\s:|-]+\|\s*$/.test(t)) return; out.push({ t: 'p', s: t.replace(/^\||\|\s*$/g, '').split('|').map((x) => x.trim()).join('  ·  ') }); return; }
+      out.push({ t: 'p', s: t });
+    });
+    return out;
+  }
+
+  /** Gera o PDF. lib = PDFLib. @return Uint8Array */
+  async function pdf(spec, lib) {
+    const { PDFDocument, StandardFonts, rgb } = lib;
+    const doc = await PDFDocument.create();
+    doc.setTitle(winAnsi(spec.titulo || 'Relatório')); doc.setProducer('Prumo'); doc.setCreator('Prumo');
+    const font = await doc.embedFont(StandardFonts.Helvetica), bold = await doc.embedFont(StandardFonts.HelveticaBold);
+    const ink = rgb(0.1, 0.1, 0.1), gray = rgb(0.42, 0.42, 0.42), line = rgb(0.82, 0.82, 0.82), fill = rgb(0.94, 0.94, 0.93), acc = rgb(0.95, 0.72, 0.02);
+    const W = A4[0] - 2 * M, TOP = A4[1] - M, BOT = M + 18;
+    let pg = null, y = 0;
+    const toc = [];
+    const newPage = () => { pg = doc.addPage(A4); y = TOP; };
+    const need = (h) => { if (!pg || y - h < BOT) { newPage(); return true; } return false; };
+    const wrap = (t, f, size, maxW) => {
+      const out = [];
+      winAnsi(t).split('\n').forEach((par) => {
+        let cur = '';
+        par.split(' ').forEach((wd) => {
+          while (f.widthOfTextAtSize(wd, size) > maxW && wd.length > 1) {
+            let k = wd.length; while (k > 1 && f.widthOfTextAtSize(wd.slice(0, k), size) > maxW) k--;
+            if (cur) { out.push(cur); cur = ''; } out.push(wd.slice(0, k)); wd = wd.slice(k);
+          }
+          const t2 = cur ? cur + ' ' + wd : wd;
+          if (f.widthOfTextAtSize(t2, size) > maxW && cur) { out.push(cur); cur = wd; } else cur = t2;
+        });
+        out.push(cur);
+      });
+      return out;
+    };
+    const text = (s, x, yy, o = {}) => pg.drawText(s, { x, y: yy, size: o.size || FS, font: o.bold ? bold : font, color: o.color || ink });
+    const para = (s, o = {}) => {
+      const size = o.size || FS, f = o.bold ? bold : font, ind = o.indent || 0, lh = size * 1.32;
+      wrap(s, f, size, W - ind).forEach((ln) => { need(lh); text(ln, M + ind, y - size, { size, bold: o.bold, color: o.color }); y -= lh; });
+    };
+    const heading = (s, lvl = 2) => {
+      const size = lvl === 1 ? 12.5 : lvl === 2 ? 11 : 9.5;
+      need(size * 2.4); y -= lvl === 1 ? 6 : 4;
+      if (lvl <= 2) toc.push({ s: winAnsi(s), lvl, page: doc.getPageCount() });
+      para(s, { size, bold: true }); y -= 2;
+      if (lvl === 1) { pg.drawLine({ start: { x: M, y: y + 1 }, end: { x: M + W, y: y + 1 }, thickness: 0.6, color: acc }); y -= 4; }
+    };
+    // capa / cabeçalho
+    newPage();
+    text(winAnsi(spec.titulo || 'Relatório'), M, y - 15, { size: 15, bold: true }); y -= 22;
+    const sub = [spec.subtitulo, spec.filtros ? 'Filtros: ' + spec.filtros : '', 'Gerado em ' + stamp(spec.agora ? new Date(spec.agora) : new Date())].filter(Boolean);
+    sub.forEach((s) => para(s, { size: 8.5, color: gray }));
+    y -= 6; pg.drawLine({ start: { x: M, y }, end: { x: M + W, y }, thickness: 0.8, color: acc }); y -= 10;
+
+    for (const sec of spec.secoes || []) {
+      if (sec.tipo === 'quebra') { newPage(); continue; }
+      if (sec.titulo) heading(sec.titulo, sec.nivel || (sec.tipo === 'capitulo' ? 1 : 2));
+      if (sec.tipo === 'capitulo') continue;
+      if (sec.nota) para(sec.nota, { size: 8, color: gray });
+      if (sec.tipo === 'kpis') {
+        const per = Math.min(4, Math.max(1, sec.itens.length)), bw = (W - (per - 1) * 6) / per, bh = 30;
+        sec.itens.forEach(([l, v], i) => {
+          if (i % per === 0) { need(bh + 6); }
+          const x = M + (i % per) * (bw + 6), yy = y - bh;
+          pg.drawRectangle({ x, y: yy, width: bw, height: bh, color: fill });
+          text(wrap(l, font, 7.2, bw - 10)[0] || '', x + 5, yy + bh - 10, { size: 7.2, color: gray });
+          text(wrap(String(v == null || v === '' ? '—' : v), bold, 10.5, bw - 10)[0] || '', x + 5, yy + 7, { size: 10.5, bold: true });
+          if (i % per === per - 1 || i === sec.itens.length - 1) y -= bh + 6;
+        });
+        y -= 4;
+      } else if (sec.tipo === 'tabela') {
+        const cols = sec.colunas, ws = cols.map((c) => c.w || 1), tw = ws.reduce((a, b) => a + b, 0), cw = ws.map((w) => W * w / tw), size = sec.size || 8, lh = size * 1.25;
+        const head = () => { const hh = Math.max(...cols.map((c, i) => wrap(c.l, bold, size, cw[i] - 6).length)) * lh + 5; need(hh + lh); pg.drawRectangle({ x: M, y: y - hh, width: W, height: hh, color: fill }); let x = M; cols.forEach((c, i) => { wrap(c.l, bold, size, cw[i] - 6).forEach((ln, k) => { const tx = NUMF.has(c.fmt) ? x + cw[i] - 3 - bold.widthOfTextAtSize(ln, size) : x + 3; text(ln, tx, y - 3 - size - k * lh, { size, bold: true }); }); x += cw[i]; }); y -= hh; };
+        const row = (r, isTot) => {
+          const cells = cols.map((c, i) => wrap(cellText(r[c.k], c.fmt), isTot ? bold : font, size, cw[i] - 6));
+          const rh = Math.max(1, ...cells.map((x) => x.length)) * lh + 4;
+          if (need(rh)) head();
+          let x = M; cols.forEach((c, i) => { cells[i].forEach((ln, k) => { const f = isTot ? bold : font, tx = NUMF.has(c.fmt) ? x + cw[i] - 3 - f.widthOfTextAtSize(ln, size) : x + 3; text(ln, tx, y - 2.5 - size - k * lh, { size, bold: isTot }); }); x += cw[i]; });
+          y -= rh; pg.drawLine({ start: { x: M, y }, end: { x: M + W, y }, thickness: 0.35, color: line });
+        };
+        if (!sec.linhas.length) para(sec.vazio || 'Sem dados no período e filtros escolhidos.', { size: 8.5, color: gray });
+        else { head(); sec.linhas.forEach((r) => row(r)); if (sec.total) row(sec.total, true); }
+        y -= 8;
+      } else if (sec.tipo === 'texto') {
+        mdBlocks(sec.md).forEach((b) => {
+          if (b.t === 'sp') { y -= 3; return; }
+          if (b.t === 'hr') { need(8); y -= 3; pg.drawLine({ start: { x: M, y }, end: { x: M + W, y }, thickness: 0.4, color: line }); y -= 4; return; }
+          if (b.t === 'h1' || b.t === 'h2' || b.t === 'h3') { para(b.s, { size: b.t === 'h1' ? 10.5 : 9.6, bold: true }); y -= 1; return; }
+          if (b.t === 'li') { para((b.n || '•') + ' ' + b.s, { indent: 8 + b.ind * 10 }); return; }
+          if (b.t === 'q') { para(b.s, { indent: 10, color: gray }); return; }
+          para(b.s);
+        });
+        y -= 6;
+      } else if (sec.tipo === 'grade') {
+        const n = sec.colunas || 5, cw = W / n, rh = 13;
+        for (let i = 0; i < sec.itens.length; i += n) {
+          need(rh);
+          sec.itens.slice(i, i + n).forEach(([k, v], j) => { const x = M + j * cw; pg.drawRectangle({ x, y: y - rh, width: cw - 3, height: rh - 2, color: fill }); text(winAnsi(String(k)) + '.', x + 4, y - 9.5, { size: 8, color: gray }); text(winAnsi(String(v)), x + 28, y - 9.5, { size: 8.5, bold: true }); });
+          y -= rh;
+        }
+        y -= 6;
+      } else if (sec.tipo === 'lista') {
+        (sec.itens || []).forEach((it) => { para(it.titulo, { bold: true }); if (it.texto) para(it.texto, { indent: 8 }); if (it.extra) para(it.extra, { indent: 8, size: 8, color: gray }); y -= 3; });
+      }
+    }
+
+    // sumário (opcional): página inserida no início, números já ajustados
+    let off = 0;
+    if (spec.sumario && toc.length > 1) {
+      const lines = toc.length, perPage = Math.floor((A4[1] - 2 * M - 60) / 13), pages = Math.ceil(lines / perPage);
+      off = pages;
+      for (let p = 0; p < pages; p++) {
+        const tp = doc.insertPage(p, A4); let yy = TOP;
+        if (!p) { tp.drawText('Sumário', { x: M, y: yy - 14, size: 13, font: bold, color: ink }); yy -= 30; }
+        toc.slice(p * perPage, (p + 1) * perPage).forEach((t) => {
+          const num = String(t.page + pages), ind = t.lvl === 1 ? 0 : 12, f = t.lvl === 1 ? bold : font, s = wrap(t.s, f, 9, W - 60 - ind)[0];
+          tp.drawText(s, { x: M + ind, y: yy - 9, size: 9, font: f, color: ink });
+          tp.drawText(num, { x: M + W - font.widthOfTextAtSize(num, 9), y: yy - 9, size: 9, font, color: gray });
+          yy -= 13;
+        });
+      }
+    }
+    // rodapé
+    const n = doc.getPageCount(), foot = winAnsi('Prumo · ' + (spec.titulo || 'Relatório') + ' · gerado em ' + stamp(spec.agora ? new Date(spec.agora) : new Date()));
+    doc.getPages().forEach((p, i) => {
+      const r = 'p. ' + (i + 1) + ' de ' + n, fw = W - font.widthOfTextAtSize(r, 7) - 12;
+      p.drawText(wrap(foot, font, 7, fw)[0], { x: M, y: M - 2, size: 7, font, color: gray });
+      p.drawText(r, { x: M + W - font.widthOfTextAtSize(r, 7), y: M - 2, size: 7, font, color: gray });
+    });
+    const bytes = await doc.save();
+    pdf.last = { paginas: n, sumario: off, toc };
+    return bytes;
+  }
+
+  /** Gera a planilha. X = SheetJS. @return ArrayBuffer */
+  function xlsx(spec, X) {
+    const wb = X.utils.book_new(), used = new Set();
+    const nome = (s) => { let b = String(s || 'Dados').replace(/[\\?*:[\]\u002F]/g, ' ').slice(0, 28).trim() || 'Dados', k = b, i = 2; while (used.has(k.toLowerCase())) k = b.slice(0, 26) + ' ' + i++; used.add(k.toLowerCase()); return k; };
+    const res = [[spec.titulo || 'Relatório'], spec.subtitulo ? [spec.subtitulo] : null, spec.filtros ? ['Filtros', spec.filtros] : null, ['Gerado em', stamp(spec.agora ? new Date(spec.agora) : new Date())], []].filter(Boolean);
+    (spec.secoes || []).filter((s) => s.tipo === 'kpis').forEach((s) => { if (s.titulo) res.push([s.titulo]); s.itens.forEach(([l, v]) => res.push([l, v])); res.push([]); });
+    const textos = (spec.secoes || []).filter((s) => s.tipo === 'texto' || s.tipo === 'lista');
+    const tabelas = (spec.secoes || []).filter((s) => s.tipo === 'tabela' || s.tipo === 'grade');
+    if (!tabelas.length && !textos.length) res.push(['Sem dados']);
+    const wsR = X.utils.aoa_to_sheet(res); wsR['!cols'] = [{ wch: 34 }, { wch: 40 }]; X.utils.book_append_sheet(wb, wsR, nome('Resumo'));
+    tabelas.forEach((s) => {
+      let aoa, cols;
+      if (s.tipo === 'grade') { cols = [{ l: 'Nº' }, { l: s.rotulo || 'Valor' }]; aoa = [cols.map((c) => c.l)].concat(s.itens.map(([k, v]) => [k, v])); }
+      else {
+        cols = s.colunas;
+        const val = (v, c) => { if (v == null || v === '') return null; if (NUMF.has(c.fmt)) { const n = Number(v); return isFinite(n) ? n : v; } if (c.fmt === 'date') { const m = isoDate(v); return m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12)) : v; } if (c.fmt === 'datetime') { const d = new Date(v); return isNaN(d) ? v : d; } if (c.fmt === 'bool') return v === true || v === 'true'; return String(v); };
+        aoa = [cols.map((c) => c.l)].concat(s.linhas.map((r) => cols.map((c) => val(r[c.k], c))));
+        if (s.total) aoa.push(cols.map((c) => val(s.total[c.k], c)));
+      }
+      const ws = X.utils.aoa_to_sheet(aoa, { cellDates: true });
+      if (s.tipo === 'tabela') {
+        const z = { brl: '"R$" #,##0.00', num: '#,##0.##', num1: '#,##0.0', pct: '0.0"%"', date: 'dd/mm/yyyy', datetime: 'dd/mm/yyyy hh:mm' };
+        cols.forEach((c, j) => { if (!z[c.fmt]) return; for (let i = 1; i < aoa.length; i++) { const ref = X.utils.encode_cell({ r: i, c: j }); if (ws[ref] && (ws[ref].t === 'n' || ws[ref].t === 'd')) ws[ref].z = z[c.fmt]; } });
+        ws['!cols'] = cols.map((c, j) => ({ wch: Math.min(60, Math.max(8, String(c.l).length + 2, ...aoa.slice(1, 200).map((r) => String(r[j] == null ? '' : r[j] instanceof Date ? '00/00/0000' : r[j]).length + 1))) }));
+        ws['!autofilter'] = { ref: X.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: Math.max(0, aoa.length - 1), c: cols.length - 1 } }) };
+      }
+      X.utils.book_append_sheet(wb, ws, nome(s.aba || s.titulo));
+    });
+    if (textos.length) {
+      const rows = [];
+      textos.forEach((s) => { if (s.titulo) rows.push([s.titulo]); if (s.tipo === 'texto') mdBlocks(s.md).forEach((b) => { if (b.t !== 'sp' && b.t !== 'hr') rows.push([(b.t === 'li' ? '• ' : '') + b.s]); }); else (s.itens || []).forEach((it) => rows.push([it.titulo, it.texto || '', it.extra || ''])); rows.push([]); });
+      const ws = X.utils.aoa_to_sheet(rows); ws['!cols'] = [{ wch: 100 }, { wch: 60 }, { wch: 40 }]; X.utils.book_append_sheet(wb, ws, nome('Texto'));
+    }
+    return X.write(wb, { type: 'array', bookType: 'xlsx', compression: true });
+  }
+
+  const slug = (s) => String(s || 'relatorio').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\w-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 60) || 'relatorio';
+  const api = { pdf, xlsx, cellText, mdBlocks, winAnsi, slug, stamp };
+  if (typeof module !== 'undefined' && module.exports) { module.exports = api; return; }
+
+  // ================= navegador =================
+  const P = root.Prumo, ui = P.ui, h = P.h, icon = P.icon;
+  const MIME = { pdf: 'application/pdf', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+  const lib = (n) => P.est.lib(n);
+  function nomeArq(spec, ext) { const d = new Date(); return slug(spec.arquivo || spec.titulo) + '_' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '.' + ext; }
+  async function build(spec, fmt) { return fmt === 'xlsx' ? new Uint8Array(xlsx(spec, await lib('xlsx'))) : await pdf(spec, await lib('pdflib')); }
+  function save(bytes, name, mime) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime })), a = document.createElement('a');
+    a.href = url; a.download = name; a.rel = 'noopener'; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    root.__lastDownload = { name, mime, size: bytes.length };
+  }
+  /** Imprime um PDF: iframe oculto; se o navegador bloquear, abre o PDF numa aba para imprimir de lá. */
+  function print(bytes, name) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    const old = document.getElementById('prumo-print'); if (old) old.remove();
+    const fr = document.createElement('iframe'); fr.id = 'prumo-print'; fr.title = 'Impressão'; fr.setAttribute('aria-hidden', 'true');
+    fr.style.cssText = 'position:fixed;right:0;bottom:0;width:1px;height:1px;border:0;opacity:0;pointer-events:none';
+    let done = false;
+    const fallback = () => { if (done) return; done = true; const w = window.open(url, '_blank', 'noopener'); if (!w) save(bytes, name || 'impressao.pdf', 'application/pdf'); ui.toast(w ? 'O PDF abriu numa nova aba: imprima por lá.' : 'Seu navegador não abriu a impressão: o PDF foi baixado para você imprimir.', { duration: 6000 }); };
+    fr.onload = () => { try { fr.contentWindow.focus(); fr.contentWindow.print(); done = true; root.__lastPrint = { name, size: bytes.length, via: 'iframe' }; } catch (e) { fallback(); } };
+    fr.src = url; document.body.appendChild(fr);
+    setTimeout(() => { if (!done) { root.__lastPrint = { name, size: bytes.length, via: 'nova aba' }; fallback(); } }, 6000);
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+  }
+  /** Guarda o arquivo no Drive (pasta de exportações) e pede o envio ao Telegram pela fila. */
+  async function toTelegram(bytes, name, mime, legenda) {
+    if (!P.est.tg()) { ui.toast('Conecte o seu Telegram em Configurações › Telegram.', { error: true }); return null; }
+    const arq = await P.est.upload(new File([bytes], name, { type: mime }), { destino: 'exportacoes' });
+    const a = arq.arquivo || arq;
+    return P.est.sendTg({ tipo: 'arquivo', id: a.id, legenda: legenda || name });
+  }
+  /**
+   * Gera e entrega. acao: 'pdf' | 'xlsx' | 'imprimir' | 'tg' | 'tg_xlsx'.
+   * specFn pode ser função (assíncrona) para montar os dados só na hora.
+   */
+  async function run(specFn, acao, btn) {
+    if (btn) btn.classList.add('loading');
+    try {
+      const spec = typeof specFn === 'function' ? await specFn() : specFn; if (!spec) return null;
+      const fmt = acao === 'xlsx' || acao === 'tg_xlsx' ? 'xlsx' : 'pdf', bytes = await build(spec, fmt), name = nomeArq(spec, fmt);
+      if (acao === 'imprimir') print(bytes, name);
+      else if (acao === 'tg' || acao === 'tg_xlsx') await toTelegram(bytes, name, MIME[fmt], spec.titulo);
+      else { save(bytes, name, MIME[fmt]); ui.toast((fmt === 'pdf' ? 'PDF' : 'Planilha') + ' gerado: ' + name, { icon: 'download' }); }
+      return { bytes, name };
+    } catch (e) { console.error(e); ui.toast(e.message || String(e), { error: true }); return null; } finally { if (btn) btn.classList.remove('loading'); }
+  }
+  /** Menu padrão de relatório (Baixar PDF, Baixar planilha, Imprimir, Telegram). */
+  function menu(title, specFn, o = {}) {
+    ui.menu(title || 'Relatório', [
+      { label: 'Baixar PDF', sub: 'A4 compacto, com os filtros ativos', icon: 'file', act: () => run(specFn, 'pdf') },
+      o.semXlsx ? null : { label: 'Baixar planilha (XLSX)', sub: 'Os mesmos dados, prontos para o Excel', icon: 'download', act: () => run(specFn, 'xlsx') },
+      { label: 'Imprimir', icon: 'file', act: () => run(specFn, 'imprimir') },
+      P.est && P.est.tg && P.est.tg() ? { label: 'Enviar PDF para meu Telegram', icon: 'message', act: () => run(specFn, 'tg') } : null,
+      P.est && P.est.tg && P.est.tg() && !o.semXlsx ? { label: 'Enviar planilha para meu Telegram', icon: 'message', act: () => run(specFn, 'tg_xlsx') } : null]);
+  }
+  /** Relatórios registrados pelas telas: chave → { titulo, spec() } (spec usa os filtros ativos da tela). */
+  const REG = {};
+  function reg(k, titulo, spec) { REG[k] = { titulo, spec }; }
+  /** Botão "Relatório" para o topo das telas. */
+  const button = (k, label = 'Relatório') => h`<button type="button" class="btn btn-ghost btn-sm" data-act="rep.open" data-k="${k}">${icon('download', 'sm')}${label}</button>`;
+  P.act['rep.open'] = (el) => { const r = REG[el.dataset.k]; if (!r) { ui.toast('Relatório indisponível.', { error: true }); return; } menu(r.titulo, r.spec); };
+  P.rep = { ...api, build, save, print, toTelegram, run, menu, button, reg, REG, MIME };
+})(typeof window !== 'undefined' ? window : this);
+</script>

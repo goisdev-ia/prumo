@@ -1,0 +1,231 @@
+<script>
+/* Prumo · relatórios de cada tela (motor único P.rep): Finanças, Fitness, Alimentação, Tarefas, Metas, Rotinas,
+   Estudos (desempenho) e Logs, sempre com o período e os filtros ativos da tela; e a tela Estudos › Relatórios:
+   (a) resumos e anotações, (b) flashcards, (c) questões sorteadas com folha de gabarito na última página e
+   (d) relatório completo com sumário, gerado em blocos com progresso. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, ui } = P;
+  const S = P.store, D = P.d, E = P.est;
+  const R = P.rep;
+  const per = (key, o) => P.pf.range(key, o);
+  const inP = (r, d) => { const x = String(d || '').slice(0, 10); return (!r.from || x >= r.from) && (!r.to || x <= r.to); };
+  const filtros = (...a) => a.filter(Boolean).join(' · ');
+  const hm = (s) => { s = Math.round(+s || 0); const hh = Math.floor(s / 3600), mm = Math.round((s % 3600) / 60); return hh ? `${hh} h ${String(mm).padStart(2, '0')} min` : `${mm} min`; };
+  const pct = (v) => (v == null ? 'sem dados' : fmt.num(v, 1) + '%');
+
+  // ================= Finanças =================
+  R.reg('fin_tx', 'Relatório de lançamentos', () => {
+    const X = P.finRep; const rows = X.filteredTx(), f = X.txFilter(), r = per('fin.tx');
+    const rec = P.sum(rows.filter((l) => l.tipo === 'receita'), (l) => +l.valor), desp = P.sum(rows.filter((l) => l.tipo === 'despesa'), (l) => +l.valor);
+    return { titulo: 'Lançamentos', arquivo: 'lancamentos', subtitulo: r.label, filtros: filtros(f.tipo !== 'todos' ? 'tipo: ' + f.tipo : '', f.conta ? 'conta: ' + X.F.contaNome(f.conta) : '', f.cartao ? 'cartão: ' + X.F.cartaoNome(f.cartao) : '', f.cat ? 'categoria: ' + X.F.catLabel(f.cat) : '', f.tag ? 'etiqueta: ' + f.tag : '', f.q ? 'busca: "' + f.q + '"' : '') || 'nenhum',
+      secoes: [{ tipo: 'kpis', itens: [['Lançamentos', rows.length], ['Receitas', 'R$ ' + R.cellText(rec, 'num')], ['Despesas', 'R$ ' + R.cellText(desp, 'num')], ['Saldo', 'R$ ' + R.cellText(rec - desp, 'num')]] },
+        { tipo: 'tabela', titulo: 'Lançamentos', aba: 'Lançamentos', colunas: [{ k: 'data', l: 'Data', fmt: 'date', w: 1 }, { k: 'descricao', l: 'Descrição', w: 3 }, { k: 'cat', l: 'Categoria', w: 2 }, { k: 'onde', l: 'Conta/cartão', w: 1.6 }, { k: 'tipo', l: 'Tipo', w: 1 }, { k: 'status', l: 'Situação', w: 0.9 }, { k: 'valor', l: 'Valor', fmt: 'brl', w: 1.3 }],
+          linhas: rows.map((l) => ({ data: l.data, descricao: l.descricao, cat: X.F.catLabel(l.categoria_id) || '', onde: l.cartao_id ? X.F.cartaoNome(l.cartao_id) : X.F.contaNome(l.conta_id), tipo: l.tipo, status: l.status, valor: (l.tipo === 'despesa' ? -1 : 1) * +l.valor })) }] };
+  });
+  R.reg('fin_rel', 'Relatório financeiro', () => {
+    const X = P.finRep; const rows = X.relRows(), r = per('fin.rel', { def: '6m' });
+    const desp = rows.filter((l) => l.tipo === 'despesa'), rec = rows.filter((l) => l.tipo === 'receita');
+    const byCat = {}; desp.forEach((l) => { const id = X.F.parentId(l.categoria_id) || 'none'; byCat[id] = (byCat[id] || 0) + +l.valor; });
+    const tD = P.sum(desp, (l) => +l.valor), tR = P.sum(rec, (l) => +l.valor), fix = P.sum(desp.filter(X.F.isFixed), (l) => +l.valor);
+    const meses = {}; rows.forEach((l) => { const k = String(l.data).slice(0, 7); meses[k] = meses[k] || { mes: k, rec: 0, desp: 0 }; meses[k][l.tipo === 'receita' ? 'rec' : 'desp'] += +l.valor; });
+    return { titulo: 'Relatório financeiro', arquivo: 'financas', subtitulo: r.label, filtros: X.relLabel() || 'todas as contas e cartões',
+      secoes: [{ tipo: 'kpis', itens: [['Receitas', 'R$ ' + R.cellText(tR, 'num')], ['Despesas', 'R$ ' + R.cellText(tD, 'num')], ['Saldo', 'R$ ' + R.cellText(tR - tD, 'num')], ['Despesas fixas', tD ? pct(fix / tD * 100) : 'sem dados']] },
+        { tipo: 'tabela', titulo: 'Por mês', aba: 'Por mês', colunas: [{ k: 'mes', l: 'Mês', w: 1.2 }, { k: 'rec', l: 'Receitas', fmt: 'brl' }, { k: 'desp', l: 'Despesas', fmt: 'brl' }, { k: 'saldo', l: 'Saldo', fmt: 'brl' }], linhas: Object.values(meses).sort((a, b) => (a.mes < b.mes ? -1 : 1)).map((m) => ({ mes: fmt.monthCap(m.mes), rec: m.rec, desp: m.desp, saldo: m.rec - m.desp })) },
+        { tipo: 'tabela', titulo: 'Despesas por categoria', aba: 'Categorias', colunas: [{ k: 'c', l: 'Categoria', w: 2.5 }, { k: 'v', l: 'Total', fmt: 'brl' }, { k: 'p', l: '% das despesas', fmt: 'pct' }], linhas: Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([id, v]) => ({ c: id === 'none' ? 'Sem categoria' : (X.F.cat(id) || {}).nome || '—', v, p: tD ? v / tD * 100 : null })), total: { c: 'Total', v: tD, p: tD ? 100 : null } },
+        { tipo: 'tabela', titulo: 'Lançamentos do período', aba: 'Lançamentos', colunas: [{ k: 'data', l: 'Data', fmt: 'date' }, { k: 'descricao', l: 'Descrição', w: 3 }, { k: 'cat', l: 'Categoria', w: 2 }, { k: 'tipo', l: 'Tipo' }, { k: 'valor', l: 'Valor', fmt: 'brl', w: 1.2 }], linhas: rows.slice().sort((a, b) => (a.data < b.data ? -1 : 1)).map((l) => ({ data: l.data, descricao: l.descricao, cat: X.F.catLabel(l.categoria_id) || '', tipo: l.tipo, valor: (l.tipo === 'despesa' ? -1 : 1) * +l.valor })) }] };
+  });
+
+  // ================= Fitness =================
+  R.reg('fit', 'Relatório de fitness', () => {
+    const r = per('fit.evo', { def: 'tudo' });
+    const ses = S.all('fit_sessoes').filter((x) => x.status !== 'cancelada' && inP(r, x.data)).sort((a, b) => (a.data < b.data ? -1 : 1));
+    const car = S.all('fit_cardio').filter((x) => inP(r, x.data)).sort((a, b) => (a.data < b.data ? -1 : 1));
+    const med = S.all('fit_medidas').filter((x) => inP(r, x.data)).sort((a, b) => (a.data < b.data ? -1 : 1));
+    const series = S.all('fit_series'), nSer = (id) => series.filter((x) => x.sessao_id === id && x.concluida !== false).length;
+    const peso = med.filter((m) => m.peso_kg), dPeso = peso.length > 1 ? +peso[peso.length - 1].peso_kg - +peso[0].peso_kg : null;
+    return { titulo: 'Relatório de fitness', arquivo: 'fitness', subtitulo: r.label, filtros: 'período da tela Evolução',
+      secoes: [{ tipo: 'kpis', itens: [['Treinos', ses.length], ['Tempo de treino', hm(P.sum(ses, (x) => +x.duracao_s || 0))], ['Volume total (kg)', R.cellText(P.sum(ses, (x) => +x.volume_total || 0), 'num')], ['Cardio', car.length + ' · ' + R.cellText(P.sum(car, (x) => +x.distancia_km || 0), 'num1') + ' km'], ['Variação de peso', dPeso == null ? 'sem dados' : (dPeso > 0 ? '+' : '') + R.cellText(dPeso, 'num1') + ' kg']] },
+        { tipo: 'tabela', titulo: 'Treinos', aba: 'Treinos', colunas: [{ k: 'data', l: 'Data', fmt: 'date' }, { k: 'treino', l: 'Treino', w: 2 }, { k: 'dur', l: 'Duração (min)', fmt: 'num' }, { k: 'series', l: 'Séries', fmt: 'num' }, { k: 'vol', l: 'Volume (kg)', fmt: 'num' }, { k: 'rpe', l: 'RPE', fmt: 'num' }], linhas: ses.map((x) => ({ data: x.data, treino: (S.getAny('fit_treinos', x.treino_id) || {}).nome || 'Treino livre', dur: x.duracao_s ? Math.round(x.duracao_s / 60) : null, series: nSer(x.id), vol: +x.volume_total || null, rpe: x.rpe || null })) },
+        { tipo: 'tabela', titulo: 'Cardio', aba: 'Cardio', colunas: [{ k: 'data', l: 'Data', fmt: 'date' }, { k: 'atividade', l: 'Atividade', w: 1.4 }, { k: 'km', l: 'Distância (km)', fmt: 'num1' }, { k: 'min', l: 'Duração (min)', fmt: 'num' }, { k: 'pace', l: 'Ritmo' }, { k: 'kcal', l: 'kcal', fmt: 'num' }], linhas: car.map((x) => ({ data: x.data, atividade: x.atividade, km: x.distancia_km, min: x.duracao_s ? Math.round(x.duracao_s / 60) : null, pace: x.pace || '', kcal: x.kcal })) },
+        { tipo: 'tabela', titulo: 'Medidas', aba: 'Medidas', colunas: [{ k: 'data', l: 'Data', fmt: 'date' }, { k: 'peso_kg', l: 'Peso (kg)', fmt: 'num1' }, { k: 'gordura_pct', l: 'Gordura', fmt: 'pct' }, { k: 'cintura', l: 'Cintura (cm)', fmt: 'num1' }, { k: 'quadril', l: 'Quadril (cm)', fmt: 'num1' }], linhas: med.map((m) => ({ ...m })) }] };
+  });
+
+  // ================= Alimentação =================
+  R.reg('nut', 'Relatório de alimentação', () => {
+    const r = per('nut.rel', { def: '7d' });
+    const di = S.all('nut_diario').filter((x) => inP(r, x.data)), ag = S.all('nut_agua').filter((x) => inP(r, x.data));
+    const dias = {}; di.forEach((x) => { const d = dias[x.data] = dias[x.data] || { data: x.data, kcal: 0, p: 0, c: 0, g: 0, f: 0, agua: 0 }; d.kcal += +x.kcal || 0; d.p += +x.proteina_g || 0; d.c += +x.carbo_g || 0; d.g += +x.gordura_g || 0; d.f += +x.fibra_g || 0; });
+    ag.forEach((x) => { const d = dias[x.data] = dias[x.data] || { data: x.data, kcal: 0, p: 0, c: 0, g: 0, f: 0, agua: 0 }; d.agua += +x.ml || 0; });
+    const L = Object.values(dias).sort((a, b) => (a.data < b.data ? -1 : 1)), comReg = L.filter((d) => d.kcal > 0), n = comReg.length;
+    const REF = { cafe: 'Café da manhã', lanche_manha: 'Lanche da manhã', almoco: 'Almoço', lanche_tarde: 'Lanche da tarde', jantar: 'Jantar', ceia: 'Ceia' };
+    return { titulo: 'Relatório de alimentação', arquivo: 'alimentacao', subtitulo: r.label, filtros: 'período da tela Relatórios de Alimentação',
+      secoes: [{ tipo: 'kpis', itens: [['Dias com registro', n], ['Média de kcal/dia', n ? R.cellText(P.sum(comReg, (d) => d.kcal) / n, 'num') : 'sem dados'], ['Proteína média (g)', n ? R.cellText(P.sum(comReg, (d) => d.p) / n, 'num1') : 'sem dados'], ['Água média (ml)', L.length ? R.cellText(P.sum(L, (d) => d.agua) / L.length, 'num') : 'sem dados']] },
+        { tipo: 'tabela', titulo: 'Por dia', aba: 'Por dia', colunas: [{ k: 'data', l: 'Data', fmt: 'date' }, { k: 'kcal', l: 'kcal', fmt: 'num' }, { k: 'p', l: 'Proteína (g)', fmt: 'num1' }, { k: 'c', l: 'Carboidratos (g)', fmt: 'num1' }, { k: 'g', l: 'Gorduras (g)', fmt: 'num1' }, { k: 'f', l: 'Fibras (g)', fmt: 'num1' }, { k: 'agua', l: 'Água (ml)', fmt: 'num' }], linhas: L },
+        { tipo: 'tabela', titulo: 'Registros do diário', aba: 'Diário', colunas: [{ k: 'data', l: 'Data', fmt: 'date' }, { k: 'ref', l: 'Refeição', w: 1.3 }, { k: 'nome', l: 'Alimento', w: 2.6 }, { k: 'q', l: 'Quantidade (g)', fmt: 'num' }, { k: 'kcal', l: 'kcal', fmt: 'num' }, { k: 'p', l: 'Prot. (g)', fmt: 'num1' }], linhas: di.sort((a, b) => (a.data + (a.hora || '') < b.data + (b.hora || '') ? -1 : 1)).map((x) => ({ data: x.data, ref: REF[x.refeicao] || x.refeicao, nome: x.nome || (S.getAny('nut_alimentos', x.alimento_id) || {}).nome || '', q: x.quantidade_g, kcal: x.kcal, p: x.proteina_g })) }] };
+  });
+
+  // ================= Tarefas =================
+  R.reg('tar', 'Relatório de tarefas', () => {
+    const r = per('tar.stats', { def: '90d' }), all = S.all('tar_tarefas').filter((t) => !t.pai_id);
+    const proj = (id) => (S.getAny('tar_projetos', id) || {}).nome || '';
+    const abertas = all.filter((t) => t.status === 'a_fazer' || t.status === 'fazendo').sort((a, b) => String(a.data_vencimento || '9999') < String(b.data_vencimento || '9999') ? -1 : 1);
+    const feitas = all.filter((t) => t.status === 'feito' && inP(r, t.concluida_em)).sort((a, b) => (a.concluida_em < b.concluida_em ? -1 : 1));
+    const atras = abertas.filter((t) => t.data_vencimento && t.data_vencimento < D.today());
+    const STA = { a_fazer: 'A fazer', fazendo: 'Fazendo', feito: 'Feito', cancelada: 'Cancelada' };
+    return { titulo: 'Relatório de tarefas', arquivo: 'tarefas', subtitulo: 'Concluídas em: ' + r.label, filtros: 'tarefas principais (sem subtarefas)',
+      secoes: [{ tipo: 'kpis', itens: [['Abertas', abertas.length], ['Atrasadas', atras.length], ['Concluídas no período', feitas.length], ['No prazo', feitas.length ? pct(feitas.filter((t) => !t.data_vencimento || String(t.concluida_em).slice(0, 10) <= t.data_vencimento).length / feitas.length * 100) : 'sem dados']] },
+        { tipo: 'tabela', titulo: 'Em aberto', aba: 'Abertas', colunas: [{ k: 'titulo', l: 'Tarefa', w: 3 }, { k: 'proj', l: 'Projeto', w: 1.4 }, { k: 'status', l: 'Situação' }, { k: 'prio', l: 'Prioridade', fmt: 'num' }, { k: 'venc', l: 'Prazo', fmt: 'date' }], linhas: abertas.map((t) => ({ titulo: t.titulo, proj: proj(t.projeto_id), status: STA[t.status], prio: t.prioridade, venc: t.data_vencimento })) },
+        { tipo: 'tabela', titulo: 'Concluídas no período', aba: 'Concluídas', colunas: [{ k: 'titulo', l: 'Tarefa', w: 3 }, { k: 'proj', l: 'Projeto', w: 1.4 }, { k: 'venc', l: 'Prazo', fmt: 'date' }, { k: 'fim', l: 'Concluída em', fmt: 'date' }], linhas: feitas.map((t) => ({ titulo: t.titulo, proj: proj(t.projeto_id), venc: t.data_vencimento, fim: String(t.concluida_em).slice(0, 10) })) }] };
+  });
+
+  // ================= Metas =================
+  R.reg('met', 'Relatório de metas', () => {
+    const ms = S.all('met_metas').sort((a, b) => (a.status === b.status ? (String(a.prazo || '9999') < String(b.prazo || '9999') ? -1 : 1) : a.status === 'ativa' ? -1 : 1));
+    const prog = (m) => { const a = +m.valor_atual || 0, i = +m.valor_inicial || 0, t = +m.valor_alvo; if (!isFinite(t) || t === i) return null; return Math.max(0, Math.min(100, (a - i) / (t - i) * 100)); };
+    const STA = { ativa: 'Ativa', pausada: 'Pausada', concluida: 'Concluída', abandonada: 'Abandonada' };
+    const ativas = ms.filter((m) => m.status === 'ativa');
+    return { titulo: 'Relatório de metas', arquivo: 'metas', subtitulo: 'Situação em ' + fmt.date(D.today()), filtros: 'todas as metas',
+      secoes: [{ tipo: 'kpis', itens: [['Ativas', ativas.length], ['Concluídas', ms.filter((m) => m.status === 'concluida').length], ['Progresso médio (ativas)', (() => { const v = ativas.map(prog).filter((x) => x != null); return v.length ? pct(P.sum(v, (x) => x) / v.length) : 'sem dados'; })()], ['Com prazo vencido', ativas.filter((m) => m.prazo && m.prazo < D.today()).length]] },
+        { tipo: 'tabela', titulo: 'Metas', aba: 'Metas', colunas: [{ k: 'titulo', l: 'Meta', w: 3 }, { k: 'area', l: 'Área', w: 1.2 }, { k: 'status', l: 'Situação' }, { k: 'atual', l: 'Atual', fmt: 'num' }, { k: 'alvo', l: 'Alvo', fmt: 'num' }, { k: 'un', l: 'Unidade' }, { k: 'p', l: 'Progresso', fmt: 'pct' }, { k: 'prazo', l: 'Prazo', fmt: 'date' }], linhas: ms.map((m) => ({ titulo: m.titulo, area: m.area, status: STA[m.status] || m.status, atual: m.valor_atual, alvo: m.valor_alvo, un: m.unidade || '', p: prog(m), prazo: m.prazo })) }] };
+  });
+
+  // ================= Rotinas =================
+  R.reg('rot', 'Relatório de rotinas', () => {
+    const r = per('rot.stats', { def: '30d' }), ex = S.all('rot_execucoes').filter((x) => inP(r, x.data));
+    const rot = S.all('rot_rotinas').filter((x) => x.ativa !== false);
+    const linhas = rot.map((x) => { const e = ex.filter((y) => y.rotina_id === x.id), f = e.filter((y) => y.status === 'feito').length, pa = e.filter((y) => y.status === 'parcial').length, pu = e.filter((y) => y.status === 'pulado').length; return { titulo: x.titulo, cat: x.categoria, freq: x.frequencia, feito: f, parcial: pa, pulado: pu, ader: e.length ? (f + pa * 0.5) / e.length * 100 : null }; });
+    return { titulo: 'Relatório de rotinas', arquivo: 'rotinas', subtitulo: r.label, filtros: 'rotinas ativas',
+      secoes: [{ tipo: 'kpis', itens: [['Rotinas ativas', rot.length], ['Execuções feitas', ex.filter((y) => y.status === 'feito').length], ['Puladas', ex.filter((y) => y.status === 'pulado').length], ['Aderência média', (() => { const v = linhas.map((l) => l.ader).filter((x) => x != null); return v.length ? pct(P.sum(v, (x) => x) / v.length) : 'sem dados'; })()]] },
+        { tipo: 'tabela', titulo: 'Aderência por rotina', aba: 'Rotinas', nota: 'Aderência = (feitas + metade das parciais) ÷ execuções registradas no período.', colunas: [{ k: 'titulo', l: 'Rotina', w: 2.6 }, { k: 'cat', l: 'Categoria' }, { k: 'freq', l: 'Frequência' }, { k: 'feito', l: 'Feitas', fmt: 'num' }, { k: 'parcial', l: 'Parciais', fmt: 'num' }, { k: 'pulado', l: 'Puladas', fmt: 'num' }, { k: 'ader', l: 'Aderência', fmt: 'pct' }], linhas },
+        { tipo: 'tabela', titulo: 'Execuções', aba: 'Execuções', colunas: [{ k: 'data', l: 'Data', fmt: 'date' }, { k: 'rot', l: 'Rotina', w: 2.6 }, { k: 'status', l: 'Situação' }, { k: 'nota', l: 'Nota', w: 2 }], linhas: ex.sort((a, b) => (a.data < b.data ? -1 : 1)).map((y) => ({ data: y.data, rot: (S.getAny('rot_rotinas', y.rotina_id) || {}).titulo || '—', status: y.status, nota: y.nota || '' })) }] };
+  });
+
+  // ================= Logs =================
+  R.reg('logs', 'Relatório de logs', async () => {
+    const f = P.cfgLogs(), r = await P.api.call('logs.list', { ...f, offset: 0, all: true }, { timeout: 120000 }), it = (r.items || []).slice(0, 5000);
+    return { titulo: 'Logs do Prumo', arquivo: 'logs', subtitulo: (r.total || 0) + ' registro(s)' + (r.total > it.length ? ' (os 5.000 mais recentes)' : ''), filtros: filtros(f.nivel ? 'nível: ' + f.nivel : '', f.modulo ? 'módulo: ' + f.modulo : '', f.de ? 'desde ' + fmt.date(f.de) : '', f.q ? 'busca: "' + f.q + '"' : '') || 'nenhum',
+      secoes: [{ tipo: 'tabela', titulo: 'Registros', aba: 'Logs', size: 7, colunas: [{ k: 'ts', l: 'Quando', fmt: 'datetime', w: 1.3 }, { k: 'nivel', l: 'Nível', w: 0.7 }, { k: 'modulo', l: 'Módulo', w: 1 }, { k: 'acao', l: 'Ação', w: 1.2 }, { k: 'entidade', l: 'Entidade', w: 1.1 }, { k: 'mensagem', l: 'Mensagem', w: 3 }], linhas: it.map((x) => ({ ...x, mensagem: x.mensagem || (x.depois_json ? JSON.stringify(x.depois_json).slice(0, 300) : '') })) }] };
+  });
+
+  // ================= Estudos: desempenho =================
+  R.reg('est_des', 'Relatório de desempenho', () => {
+    const st = E.statsRes && E.statsRes(); if (!st) { ui.toast('Aguarde os números carregarem.', { error: true }); return null; }
+    const q = st.questoes.geral, cv = st.cobertura || {};
+    const disc = Object.entries(st.tempo.por_disciplina || {}).sort((a, b) => b[1] - a[1]);
+    return { titulo: 'Desempenho nos estudos', arquivo: 'estudos_desempenho', subtitulo: fmt.date(st.periodo.de) + ' a ' + fmt.date(st.periodo.ate), filtros: filtros(st.filtros.concurso_id ? 'concurso: ' + ((E.conc(st.filtros.concurso_id) || {}).nome || '') : 'todos os concursos', st.filtros.disciplina_id ? 'disciplina: ' + E.discNome(st.filtros.disciplina_id) : '', st.filtros.banca ? 'banca: ' + st.filtros.banca : ''),
+      secoes: [{ tipo: 'kpis', itens: [['Tempo líquido', hm(st.tempo.total_s)], ['Dias com estudo', st.tempo.dias_com_estudo + ' de ' + st.periodo.dias], ['Questões', q.total || 0], ['Precisão', q.respondidas ? pct(q.precisao) : 'sem dados'], ['Revisões feitas', st.revisoes.feitas], ['Revisões no prazo', pct(st.revisoes.no_prazo_pct)], ['Cobertura do edital', cv.total ? pct(cv.pct) : 'sem dados'], ['Erros em aberto', st.erros.abertos]] },
+        { tipo: 'tabela', titulo: 'Tempo por disciplina', aba: 'Tempo', colunas: [{ k: 'd', l: 'Disciplina', w: 3 }, { k: 'h', l: 'Horas', fmt: 'num1' }], linhas: disc.map(([d, s]) => ({ d, h: s / 3600 })) },
+        { tipo: 'tabela', titulo: 'Questões por disciplina', aba: 'Questões', nota: 'Precisão = acertos ÷ (acertos + erros). Com menos de ' + st.questoes.amostra_min + ' respostas, a amostra é pequena.', colunas: [{ k: 'disciplina', l: 'Disciplina', w: 3 }, { k: 'respondidas', l: 'Respondidas', fmt: 'num' }, { k: 'precisao', l: 'Precisão', fmt: 'pct' }, { k: 'pequena', l: 'Amostra pequena' }], linhas: (st.questoes.por_disciplina || []).map((d) => ({ ...d, pequena: d.amostra_pequena ? 'sim' : '' })) },
+        { tipo: 'tabela', titulo: 'Assuntos com dificuldade', aba: 'Dificuldades', colunas: [{ k: 'titulo', l: 'Assunto', w: 3 }, { k: 'respondidas', l: 'Respondidas', fmt: 'num' }, { k: 'precisao', l: 'Precisão', fmt: 'pct' }], linhas: st.dificuldades || [] },
+        { tipo: 'tabela', titulo: 'Simulados', aba: 'Simulados', colunas: [{ k: 'titulo', l: 'Simulado', w: 3 }, { k: 'data', l: 'Data', fmt: 'date' }, { k: 'nota', l: 'Nota', fmt: 'num1' }, { k: 'pct', l: '%', fmt: 'pct' }], linhas: (st.simulados || []).map((s) => ({ titulo: s.titulo, data: String(s.fim || '').slice(0, 10), nota: s.nota, pct: s.pct })) }] };
+  });
+
+  // ================= Estudos › Relatórios =================
+  const st = { q: { n: 50, conc: '', disc: '', banca: '' }, a: { disc: '', tipo: '', aprov: false }, b: { disc: '', baralho: '' }, run: null };
+  const sel = (k, opts, v, label) => h`<select class="input sm" data-rf="${k}" aria-label="${label}"><option value="">${label}</option>${opts.map(([x, l]) => h`<option value="${x}" ${raw(x === v ? 'selected' : '')}>${l}</option>`)}</select>`;
+  const NT = { resumo: 'Resumo', fichamento: 'Fichamento', cornell: 'Cornell', memoria: 'Memória', nota: 'Nota', lei_seca: 'Lei seca', duvida: 'Dúvida', trecho: 'Trecho' };
+  function notasSel() { return S.all('est_anotacoes').filter((n) => (!st.a.disc || n.disciplina_id === st.a.disc) && (!st.a.tipo || n.tipo === st.a.tipo) && (!st.a.aprov || !(n.gerado_ia && n.aprovado === false))).sort((a, b) => E.discNome(a.disciplina_id).localeCompare(E.discNome(b.disciplina_id)) || String(a.titulo).localeCompare(String(b.titulo))); }
+  function cardsSel() { return S.all('est_flashcards').filter((c) => !c.suspenso && (!st.b.disc || c.disciplina_id === st.b.disc) && (!st.b.baralho || c.baralho === st.b.baralho)); }
+  function questoesPool() { return S.all('est_questoes').filter((x) => (x.tipo === 'multipla' || x.tipo === 'certo_errado') && (!st.q.conc || x.concurso_id === st.q.conc) && (!st.q.disc || x.disciplina_id === st.q.disc) && (!st.q.banca || x.banca === st.q.banca)); }
+  function notasSpec(ns, extra = {}) {
+    const secoes = [];
+    let disc = null;
+    ns.forEach((n) => {
+      const d = E.discNome(n.disciplina_id) || 'Sem disciplina';
+      if (d !== disc) { disc = d; secoes.push({ tipo: 'capitulo', titulo: d }); }
+      const ia = n.gerado_ia ? ' (Gerado por IA' + (n.aprovado === false ? ', rascunho' : '') + ')' : '';
+      secoes.push({ tipo: 'texto', titulo: n.titulo + ia, nivel: 2, nota: [NT[n.tipo] || n.tipo, n.assunto_id ? E.assNome(n.assunto_id) : '', n.norma ? n.norma + (n.artigo ? ' ' + n.artigo : '') : '', 'v' + (n.versao || 1)].filter(Boolean).join(' · '), md: n.conteudo || '' });
+    });
+    return { titulo: 'Resumos e anotações', arquivo: 'estudos_resumos', subtitulo: ns.length + ' anotação(ões)', filtros: filtros(st.a.disc ? 'disciplina: ' + E.discNome(st.a.disc) : '', st.a.tipo ? 'tipo: ' + NT[st.a.tipo] : '', st.a.aprov ? 'sem rascunhos da IA' : '') || 'todas', sumario: ns.length > 3, ...extra,
+      secoes: secoes.concat([{ tipo: 'tabela', titulo: 'Índice', aba: 'Anotações', colunas: [{ k: 'disc', l: 'Disciplina', w: 1.6 }, { k: 'titulo', l: 'Título', w: 3 }, { k: 'tipo', l: 'Tipo' }, { k: 'ia', l: 'IA' }, { k: 'em', l: 'Atualizada', fmt: 'date' }], linhas: ns.map((n) => ({ disc: E.discNome(n.disciplina_id), titulo: n.titulo, tipo: NT[n.tipo] || n.tipo, ia: n.gerado_ia ? (n.aprovado === false ? 'rascunho' : 'aprovado') : '', em: String(n.updated_at || '').slice(0, 10) })) }]) };
+  }
+  function cardsSpec(cs) {
+    return { titulo: 'Flashcards', arquivo: 'estudos_flashcards', subtitulo: cs.length + ' cartão(ões) ativos', filtros: filtros(st.b.disc ? 'disciplina: ' + E.discNome(st.b.disc) : '', st.b.baralho ? 'baralho: ' + st.b.baralho : '') || 'todos',
+      secoes: [{ tipo: 'tabela', titulo: 'Cartões', aba: 'Flashcards', colunas: [{ k: 'frente', l: 'Frente', w: 3 }, { k: 'verso', l: 'Verso', w: 3 }, { k: 'baralho', l: 'Baralho', w: 1 }, { k: 'disc', l: 'Disciplina', w: 1.3 }, { k: 'venc', l: 'Próxima revisão', fmt: 'date' }], linhas: cs.map((c) => ({ frente: c.frente, verso: c.verso || '', baralho: c.baralho, disc: E.discNome(c.disciplina_id), venc: c.novo ? '' : c.vencimento })) }] };
+  }
+  /** Sorteio sem repetição (Fisher–Yates). */
+  function sortear(arr, n) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a.slice(0, n); }
+  function gabTxt(q) { if (q.gabarito_status === 'anulada') return 'anulada'; if (!q.gabarito || q.gabarito_status === 'sem_gabarito') return 'sem gabarito'; return q.tipo === 'certo_errado' ? (q.gabarito === 'C' ? 'C (certo)' : 'E (errado)') : q.gabarito; }
+  function questoesSpec(qs) {
+    const itens = qs.map((q, i) => ({ titulo: `${i + 1}. ${q.codigo || ''}${q.banca ? ' · ' + q.banca : ''}${q.ano ? ' ' + q.ano : ''}${q.disciplina_id ? ' · ' + E.discNome(q.disciplina_id) : ''}`, texto: (q.texto_base ? 'Texto de apoio: ' + q.texto_base + '\n\n' : '') + q.enunciado + '\n' + (q.tipo === 'certo_errado' ? '(  ) Certo    (  ) Errado' : (q.alternativas_json || []).map((a) => `${a.letra}) ${a.texto}`).join('\n')) }));
+    const sem = qs.filter((q) => !q.gabarito || q.gabarito_status === 'sem_gabarito' || q.gabarito_status === 'anulada').length;
+    return { titulo: 'Questões sorteadas', arquivo: 'estudos_questoes_' + qs.length, subtitulo: qs.length + ' questão(ões) sorteadas de ' + questoesPool().length + ' no filtro', filtros: filtros(st.q.conc ? 'concurso: ' + ((E.conc(st.q.conc) || {}).nome || '') : '', st.q.disc ? 'disciplina: ' + E.discNome(st.q.disc) : '', st.q.banca ? 'banca: ' + st.q.banca : '') || 'todas',
+      secoes: [{ tipo: 'lista', titulo: 'Questões', itens }, { tipo: 'quebra' },
+        { tipo: 'grade', titulo: 'Gabarito', nota: 'Gabarito cadastrado no banco de questões' + (sem ? `; ${sem} questão(ões) sem gabarito ou anuladas aparecem assim (nada foi adivinhado).` : '.'), colunas: 5, rotulo: 'Gabarito', itens: qs.map((q, i) => [i + 1, gabTxt(q)]) },
+        { tipo: 'tabela', titulo: 'Detalhes', aba: 'Questões', colunas: [{ k: 'n', l: 'Nº', fmt: 'num' }, { k: 'codigo', l: 'Código' }, { k: 'banca', l: 'Banca' }, { k: 'ano', l: 'Ano' }, { k: 'disc', l: 'Disciplina', w: 1.5 }, { k: 'enunciado', l: 'Enunciado', w: 4 }, { k: 'gab', l: 'Gabarito' }], linhas: qs.map((q, i) => ({ n: i + 1, codigo: q.codigo, banca: q.banca, ano: q.ano, disc: E.discNome(q.disciplina_id), enunciado: q.enunciado, gab: gabTxt(q) })) }] };
+  }
+  /** Relatório completo com sumário, gerado em blocos (com progresso e cancelar). */
+  async function completo(prog, sig) {
+    const passo = async (t, k) => { if (sig.parado) throw new Error('Cancelado.'); prog(t, k); await P.sleep(30); };
+    const secoes = [];
+    await passo('Desempenho dos últimos 90 dias…', 0.1);
+    const t = D.today(), stt = await P.api.call('est.stats', { de: D.add(t, -89), ate: t }, { timeout: 90000 });
+    const backup = E.statsRes; E.statsRes = () => stt; let d2; try { d2 = R.REG.est_des.spec(); } finally { E.statsRes = backup; }
+    secoes.push({ tipo: 'capitulo', titulo: 'Desempenho (últimos 90 dias)' }, ...d2.secoes.map((s) => ({ ...s, nivel: 2 })));
+    await passo('Edital e cobertura…', 0.25);
+    const ed = S.all('est_concursos').filter((c) => c.status !== 'encerrado');
+    secoes.push({ tipo: 'capitulo', titulo: 'Concursos' }, { tipo: 'tabela', titulo: 'Concursos acompanhados', aba: 'Concursos', colunas: [{ k: 'nome', l: 'Concurso', w: 2.5 }, { k: 'banca', l: 'Banca' }, { k: 'cargo', l: 'Cargo', w: 1.5 }, { k: 'prova', l: 'Prova', fmt: 'date' }], linhas: ed.map((c) => ({ nome: c.nome, banca: c.banca || '', cargo: c.cargo || '', prova: c.data_prova || '' })) });
+    await passo('Resumos e anotações…', 0.45);
+    const ns = S.all('est_anotacoes').sort((a, b) => E.discNome(a.disciplina_id).localeCompare(E.discNome(b.disciplina_id)));
+    const sa = st.a; st.a = { disc: '', tipo: '', aprov: false }; const nsSpec = notasSpec(ns); st.a = sa;
+    secoes.push({ tipo: 'capitulo', titulo: 'Resumos e anotações' }, ...nsSpec.secoes.filter((s) => s.tipo !== 'capitulo').map((s) => ({ ...s, nivel: 2 })));
+    await passo('Flashcards…', 0.65);
+    const sb = st.b; st.b = { disc: '', baralho: '' }; secoes.push({ tipo: 'capitulo', titulo: 'Flashcards' }, ...cardsSpec(cardsSel()).secoes); st.b = sb;
+    await passo('Caderno de erros e discursivas…', 0.8);
+    const er = S.all('est_erros').filter((e) => e.status !== 'resolvido');
+    secoes.push({ tipo: 'capitulo', titulo: 'Caderno de erros' }, { tipo: 'tabela', titulo: 'Erros em aberto', aba: 'Erros', colunas: [{ k: 'disc', l: 'Disciplina', w: 1.4 }, { k: 'motivo', l: 'Motivo', w: 1.2 }, { k: 'desc', l: 'O que aconteceu', w: 3 }, { k: 'rec', l: 'Vezes', fmt: 'num' }], linhas: er.map((e) => ({ disc: E.discNome(e.disciplina_id), motivo: e.motivo || '', desc: e.descricao || e.titulo || '', rec: e.recorrencias })) });
+    const ds = S.all('est_discursivas');
+    secoes.push({ tipo: 'capitulo', titulo: 'Discursivas' }, { tipo: 'tabela', titulo: 'Discursivas', aba: 'Discursivas', colunas: [{ k: 'titulo', l: 'Título', w: 3 }, { k: 'status', l: 'Situação' }, { k: 'v', l: 'Versão', fmt: 'num' }, { k: 'nota', l: 'Última nota' }], linhas: ds.map((x) => { const av = (x.avaliacoes_json || []).slice(-1)[0]; return { titulo: x.titulo + (x.gerado_ia ? ' (proposta da IA)' : ''), status: x.status, v: x.versao, nota: av ? fmt.num(av.total, 1) + ' / ' + fmt.num(av.max, 1) + (av.sugestao_ia ? ' (sugestão de IA)' : '') : '' }; }) });
+    await passo('Montando o PDF…', 0.92);
+    return { titulo: 'Relatório completo de estudos', arquivo: 'estudos_completo', subtitulo: 'Desempenho, concursos, resumos, flashcards, erros e discursivas', filtros: 'tudo o que está no Prumo', sumario: true, secoes };
+  }
+
+  function relatorios() {
+    const g = E.gate(); if (g) return g;
+    const discs = E.disciplinas().map((d) => [d.id, d.nome]), bancas = [...new Set(S.all('est_questoes').map((q) => q.banca).filter(Boolean))].sort().map((b) => [b, b]);
+    const baralhos = [...new Set(S.all('est_flashcards').map((c) => c.baralho).filter(Boolean))].sort().map((b) => [b, b]);
+    const nN = notasSel().length, nC = cardsSel().length, pool = questoesPool().length;
+    const acts = (k, n) => h`<div class="row-sm wrap mt-3"><button type="button" class="btn btn-primary btn-sm" data-act="est.relGo" data-k="${k}" data-a="pdf" ${raw(n ? '' : 'disabled')}>${icon('file', 'sm')}PDF</button><button type="button" class="btn btn-ghost btn-sm" data-act="est.relGo" data-k="${k}" data-a="xlsx" ${raw(n ? '' : 'disabled')}>${icon('download', 'sm')}Planilha</button><button type="button" class="btn btn-ghost btn-sm" data-act="est.relGo" data-k="${k}" data-a="imprimir" ${raw(n ? '' : 'disabled')}>Imprimir</button>${E.tg() ? h`<button type="button" class="btn btn-ghost btn-sm" data-act="est.relGo" data-k="${k}" data-a="tg" ${raw(n ? '' : 'disabled')}>${icon('message', 'sm')}Telegram</button>` : ''}</div>`;
+    return h`<div class="page-head"><div><h1>Relatórios de estudos</h1><p>PDF A4 compacto ou planilha, com os filtros escolhidos</p></div></div>
+      <div class="dash">
+        <div class="card pad-lg span-6"><b>a) Resumos e anotações</b><p class="muted mt-1" style="font-size:13px">${nN} anotação(ões) no filtro, agrupadas por disciplina, com sumário.</p>
+          <div class="row-f mt-2">${sel('a.disc', discs, st.a.disc, 'Todas as disciplinas')}${sel('a.tipo', Object.entries(NT), st.a.tipo, 'Todos os tipos')}</div>
+          <label class="row-sm mt-2" style="font-size:13px"><input type="checkbox" data-rf="a.aprov" ${raw(st.a.aprov ? 'checked' : '')}> Deixar de fora os rascunhos da IA</label>${acts('a', nN)}</div>
+        <div class="card pad-lg span-6"><b>b) Flashcards</b><p class="muted mt-1" style="font-size:13px">${nC} cartão(ões) ativos no filtro (frente, verso, baralho e próxima revisão).</p>
+          <div class="row-f mt-2">${sel('b.disc', discs, st.b.disc, 'Todas as disciplinas')}${sel('b.baralho', baralhos, st.b.baralho, 'Todos os baralhos')}</div>${acts('b', nC)}</div>
+        <div class="card pad-lg span-6"><b>c) Questões sorteadas com gabarito</b><p class="muted mt-1" style="font-size:13px">Sorteia ${Math.min(st.q.n, pool)} de ${pool} questão(ões) no filtro; a folha de gabarito fica na última página. Questões sem gabarito aparecem como "sem gabarito".</p>
+          <div class="row-f mt-2">${sel('q.conc', E.concursos().map((c) => [c.id, c.nome]), st.q.conc, 'Todos os concursos')}${sel('q.disc', discs, st.q.disc, 'Todas as disciplinas')}${sel('q.banca', bancas, st.q.banca, 'Todas as bancas')}
+            <label class="row-sm" style="font-size:13px">Quantidade <input class="input sm num" style="width:70px" data-rf="q.n" inputmode="numeric" value="${st.q.n}"></label></div>${acts('c', pool)}</div>
+        <div class="card pad-lg span-6"><b>d) Relatório completo</b><p class="muted mt-1" style="font-size:13px">Desempenho (90 dias), concursos, todos os resumos e anotações, flashcards, caderno de erros e discursivas, com sumário. Gerado em blocos; dá para cancelar.</p>${acts('d', 1)}</div>
+      </div>`;
+  }
+  async function relGo(el) {
+    const k = el.dataset.k, a = el.dataset.a;
+    if (k === 'd') {
+      const sig = { parado: false };
+      const s = ui.sheet({ title: 'Relatório completo', body: h`<div class="stack"><b data-t>Preparando…</b><div class="res-bar" role="progressbar"><span data-b style="width:3%"></span></div></div>`, foot: h`<span class="grow"></span><button type="button" class="btn btn-ghost" data-c>Cancelar</button>`, onClose: () => { sig.parado = true; } });
+      s.$('[data-c]').onclick = () => { sig.parado = true; s.close(); ui.toast('Relatório cancelado.'); };
+      try {
+        await E.ensure();
+        const spec = await completo((t, f) => { const x = s.$('[data-t]'), b = s.$('[data-b]'); if (x) x.textContent = t; if (b) b.style.width = Math.round(f * 100) + '%'; }, sig);
+        if (sig.parado) return;
+        await R.run(spec, a, null); if (!sig.parado) s.close();
+      } catch (e) { if (!sig.parado) { ui.toast(e.message || String(e), { error: true }); s.close(); } }
+      return;
+    }
+    await E.ensure();
+    const spec = k === 'a' ? () => notasSpec(notasSel()) : k === 'b' ? () => cardsSpec(cardsSel()) : () => questoesSpec(sortear(questoesPool(), Math.max(1, Math.min(200, +st.q.n || 50))));
+    R.run(spec, a, el);
+  }
+  Object.assign(P.act, {
+    'est.relGo': relGo,
+    'est.relF': (el) => { const [g2, k] = el.dataset.rf.split('.'); st[g2][k] = el.type === 'checkbox' ? el.checked : el.value; P.router.render(true); }
+  });
+  document.addEventListener('change', (e) => { const el = e.target.closest && e.target.closest('[data-rf]'); if (!el || !/^#\/est\/relatorios/.test(location.hash)) return; P.act['est.relF'](el); });
+  R.reg('est_cards', 'Exportar flashcards', async () => { await E.ensure(); const bar = P.flt.get('est.fc', 'baralho', ''), cs = S.all('est_flashcards').filter((c) => !c.suspenso && (!bar || c.baralho === bar)); const sb = st.b; st.b = { disc: '', baralho: bar }; try { return cardsSpec(cs); } finally { st.b = sb; } });
+  P.screen('est/relatorios', { mod: 'est', tab: 'relatorios', title: 'Relatórios de estudos', deps: E.T, render: relatorios });
+  E.REL = { notasSpec, cardsSpec, questoesSpec, sortear, completo, gabTxt, st };
+})();
+</script>

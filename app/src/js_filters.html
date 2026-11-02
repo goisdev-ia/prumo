@@ -1,0 +1,171 @@
+<script>
+/* Prumo · Filtros reutilizáveis: período (mês, ano, intervalo de datas, últimos dias, tudo), chips de tipo
+   e busca. Cada tela guarda o próprio estado (chave), que vale até recarregar o app.
+   Quando o período pedido é mais antigo que o carregado no boot, busca o histórico no servidor (db.list). */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const pad = (n) => String(n).padStart(2, '0');
+  const MODES = { dia: 'Dia', semana: 'Semana', mes: 'Mês', ano: 'Ano', '7d': '7 dias', '30d': '30 dias', '90d': '90 dias', '3m': '3 meses', '6m': '6 meses', '12m': '12 meses', intervalo: 'Período', tudo: 'Tudo' };
+  const ST = {}, REG = {};
+
+  // ---------- Histórico além da janela do boot ----------
+  const hist = P.hist = {
+    since: {},
+    /** Garante no store as linhas de `table` a partir de `from` (yyyy-MM-dd). */
+    async ensure(tables, from) {
+      const win = (P.bootInfo && P.bootInfo.windows) || {};
+      const jobs = (tables || []).filter((t) => win[t]).map(async (t) => {
+        const have = hist.since[t] || win[t];
+        if ((from || '0000-01-01') < have) {
+          const de = from || '0000-01-01';
+          const r = await P.api.call('db.list', { table: t, de, ate: have }, { timeout: 90000 });
+          (r.rows || []).forEach((row) => S.put(t, row));
+          hist.since[t] = de;
+          return true;
+        }
+        return false;
+      });
+      const got = await Promise.all(jobs.map((j) => j.catch((e) => { ui.toast('Não deu para buscar o histórico: ' + e.message, { error: true }); return false; })));
+      return got.some(Boolean);
+    },
+    /** O período começa antes do que foi carregado? */
+    partial(tables, from) {
+      const win = (P.bootInfo && P.bootInfo.windows) || {}, f = from || '0000-01-01';
+      return (tables || []).some((t) => win[t] && f < (hist.since[t] || win[t]));
+    },
+    busy: {},
+    /** Busca em segundo plano (uma vez por tabela/data) e redesenha a tela. */
+    auto(tables, from) {
+      const k = (tables || []).join(',') + '|' + (from || '');
+      if (hist.busy[k]) return;
+      hist.busy[k] = hist.ensure(tables, from).then(() => { P.router.render(true); }).finally(() => { setTimeout(() => { delete hist.busy[k]; }, 3000); });
+    }
+  };
+
+  // ---------- Período ----------
+  const pf = P.pf = {
+    get(key, o = {}) {
+      if (!ST[key]) {
+        const t = D.today();
+        ST[key] = { mode: o.def || 'mes', day: t, month: D.month(t), year: t.slice(0, 4), from: D.add(t, -29), to: t };
+      }
+      return ST[key];
+    },
+    set(key, patch) { Object.assign(pf.get(key), patch); },
+    /** {from, to, label} — from/to vazios = sem limite. */
+    range(key, o = {}) {
+      const s = pf.get(key, o), t = D.today();
+      switch (s.mode) {
+        case 'dia': return { from: s.day, to: s.day, label: fmt.date(s.day) };
+        case 'semana': { const ws = +P.settings.get('geral.inicio_semana', 0) || 0, a = D.weekStart(s.day, ws), b = D.add(a, 6); return { from: a, to: b, label: `${fmt.dm(a)} – ${fmt.dm(b)}` }; }
+        case 'mes': return { from: s.month + '-01', to: `${s.month}-${pad(D.dim(s.month))}`, label: fmt.monthCap(s.month) };
+        case 'ano': return { from: s.year + '-01-01', to: s.year + '-12-31', label: s.year };
+        case '7d': return { from: D.add(t, -6), to: t, label: 'Últimos 7 dias' };
+        case '30d': return { from: D.add(t, -29), to: t, label: 'Últimos 30 dias' };
+        case '90d': return { from: D.add(t, -89), to: t, label: 'Últimos 90 dias' };
+        case '3m': case '6m': case '12m': { const n = parseInt(s.mode, 10), end = D.month(t), start = D.shiftMonth(end, -n + 1); return { from: start + '-01', to: `${end}-${pad(D.dim(end))}`, label: `${fmt.monthCap(start)} a ${fmt.monthCap(end)}` }; }
+        case 'intervalo': { const a = s.from <= s.to ? s.from : s.to, b = s.from <= s.to ? s.to : s.from; return { from: a, to: b, label: `${fmt.date(a)} – ${fmt.date(b)}` }; }
+        default: return { from: '', to: '', label: 'Todo o período' };
+      }
+    },
+    /** A data (yyyy-MM-dd ou ISO) está no período? */
+    has(key, date, o) {
+      const r = pf.range(key, o), d = String(date || '').slice(0, 10);
+      if (!r.from && !r.to) return true;
+      if (!d) return false;
+      return (!r.from || d >= r.from) && (!r.to || d <= r.to);
+    },
+    /** Filtra linhas pela coluna de data. */
+    filter(key, rows, col = 'data', o) { return rows.filter((r) => pf.has(key, typeof col === 'function' ? col(r) : r[col], o)); },
+    /** Meses (yyyy-MM) do período; "tudo" começa em minDate. */
+    months(key, minDate, o) {
+      const r = pf.range(key, o), t = D.today();
+      let a = D.month(r.from || minDate || t), b = D.month(r.to || (o && o.maxDate > t ? o.maxDate : t));
+      const out = [];
+      for (let k = a, i = 0; k <= b && i < 240; k = D.shiftMonth(k, 1), i++) out.push(k);
+      return out;
+    },
+    /** Lista de dias do período (para gráficos); "tudo" usa minDate até hoje. */
+    days(key, minDate, o) {
+      const r = pf.range(key, o), t = D.today();
+      const a = r.from || minDate || D.add(t, -29), b = r.to && r.to < t ? r.to : (r.to ? r.to : t);
+      const out = [];
+      for (let c = a, i = 0; c <= b && i < 800; c = D.add(c, 1), i++) out.push(c);
+      return out;
+    },
+    /**
+     * Barra de período. o: {modes, def, tables, compact, extra}
+     * tables: tabelas com janela de boot (busca histórico ao voltar no tempo).
+     */
+    bar(key, o = {}) {
+      const s = pf.get(key, o), modes = o.modes || ['mes', 'ano', 'intervalo', 'tudo'];
+      REG[key] = o;
+      const step = (lbl) => h`<div class="pf-nav"><button type="button" class="btn-icon sm filled" data-act="pf.step" data-k="${key}" data-v="-1" aria-label="Anterior">${icon('chev-l', 'sm')}</button>
+        <button type="button" class="pf-label" data-act="pf.today" data-k="${key}" title="Voltar para hoje">${lbl}</button>
+        <button type="button" class="btn-icon sm filled" data-act="pf.step" data-k="${key}" data-v="1" aria-label="Próximo">${icon('chev-r', 'sm')}</button></div>`;
+      const r = pf.range(key, o);
+      let nav = '';
+      if ((o.noNav || []).includes(s.mode)) nav = '';
+      else if (['dia', 'semana', 'mes', 'ano'].includes(s.mode)) nav = step(r.label);
+      else if (s.mode === 'intervalo') nav = h`<div class="pf-nav pf-dates"><input type="date" class="input sm" value="${s.from}" data-on-change="pf.from" data-k="${key}" aria-label="De"><span class="faint">até</span><input type="date" class="input sm" value="${s.to}" data-on-change="pf.to" data-k="${key}" aria-label="Até"></div>`;
+      const loading = o.tables && hist.partial(o.tables, r.from);
+      if (loading) setTimeout(() => hist.auto(o.tables, r.from), 0);
+      return h`<div class="pf ${o.compact ? 'compact' : ''}" data-pf="${key}">
+        <div class="seg sm pf-modes" role="tablist" aria-label="Período">${modes.map((m) => h`<button type="button" role="tab" aria-selected="${m === s.mode}" class="${m === s.mode ? 'on' : ''}" data-act="pf.mode" data-k="${key}" data-v="${m}">${MODES[m]}</button>`)}</div>
+        ${nav}${loading ? h`<span class="faint pf-load">${icon('refresh', 'xs')}buscando histórico…</span>` : ''}${o.extra || ''}</div>`;
+    }
+  };
+
+  async function changed(key) {
+    const o = REG[key] || {};
+    P.router.render(true);
+    if (o.onChange) o.onChange(pf.range(key, o));
+  }
+
+  // ---------- Chips de tipo e busca ----------
+  const FV = {};
+  const flt = P.flt = {
+    get(key, k, def = '') { const v = (FV[key] || {})[k]; return v === undefined ? def : v; },
+    set(key, k, v) { (FV[key] = FV[key] || {})[k] = v; },
+    /** Chips de escolha única. opts: [[valor, rótulo, ícone?]] */
+    chips(key, k, opts, def = 'todos') {
+      const cur = flt.get(key, k, def);
+      return h`<div class="chips" role="group">${opts.map(([v, l, ic]) => h`<button type="button" class="fchip ${String(v) === String(cur) ? 'on' : ''}" aria-pressed="${String(v) === String(cur)}" data-act="flt.set" data-key="${key}" data-k="${k}" data-v="${v}">${ic ? icon(ic, 'xs') : ''}${l}</button>`)}</div>`;
+    },
+    select(key, k, opts, label, def = '') {
+      const cur = flt.get(key, k, def);
+      return h`<select class="input sm pf-select" data-on-change="flt.sel" data-key="${key}" data-k="${k}" aria-label="${label}"><option value="">${label}</option>${opts.map(([v, l]) => h`<option value="${v}" ${String(v) === String(cur) ? raw('selected') : ''}>${l}</option>`)}</select>`;
+    },
+    search(key, ph = 'Buscar…') {
+      return h`<div class="search grow">${icon('search')}<input class="input" id="flt-q-${key}" placeholder="${ph}" value="${flt.get(key, 'q', '')}" data-on-input="flt.q" data-key="${key}" aria-label="${ph}"></div>`;
+    },
+    /** Texto bate com a busca? */
+    match(key, ...parts) { const q = P.norm(flt.get(key, 'q', '')); return !q || P.norm(parts.filter(Boolean).join(' ')).includes(q); }
+  };
+  const reSearch = P.debounce((key, pos) => {
+    P.router.render(true);
+    const el = document.getElementById('flt-q-' + key);
+    if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) { /* noop */ } }
+  }, 220);
+
+  Object.assign(P.act, {
+    'pf.mode': (el) => { const k = el.dataset.k, s = pf.get(k); s.mode = el.dataset.v; if (s.mode === 'intervalo' && !s.from) { s.from = D.add(D.today(), -29); s.to = D.today(); } changed(k); },
+    'pf.step': (el) => {
+      const k = el.dataset.k, s = pf.get(k), n = +el.dataset.v;
+      if (s.mode === 'mes') s.month = D.shiftMonth(s.month, n);
+      else if (s.mode === 'ano') s.year = String(+s.year + n);
+      else if (s.mode === 'semana') s.day = D.add(s.day, 7 * n);
+      else if (s.mode === 'dia') s.day = D.add(s.day, n);
+      changed(k);
+    },
+    'pf.today': (el) => { const k = el.dataset.k, t = D.today(); pf.set(k, { day: t, month: D.month(t), year: t.slice(0, 4) }); changed(k); },
+    'pf.from': (el) => { if (!el.value) return; pf.set(el.dataset.k, { from: el.value }); changed(el.dataset.k); },
+    'pf.to': (el) => { if (!el.value) return; pf.set(el.dataset.k, { to: el.value }); changed(el.dataset.k); },
+    'flt.set': (el) => { flt.set(el.dataset.key, el.dataset.k, el.dataset.v); P.router.render(true); },
+    'flt.sel': (el) => { flt.set(el.dataset.key, el.dataset.k, el.value); P.router.render(true); },
+    'flt.q': (el) => { flt.set(el.dataset.key, 'q', el.value); reSearch(el.dataset.key, el.selectionStart || el.value.length); }
+  });
+})();
+</script>

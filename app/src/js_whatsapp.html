@@ -1,0 +1,144 @@
+<script>
+/* Prumo · Configurações › WhatsApp: número, modo de teste, envios automáticos, janela de 24 h, limites,
+   credenciais da Meta (só o dono) e histórico. Tudo passa pelas rotas wa.* do servidor; o token nunca chega aqui. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, ui } = P;
+  const st = { data: null, loading: false };
+  const TIPO_LABEL = { tarefa: 'Tarefas', rotina: 'Rotinas', evento: 'Eventos', conta: 'Contas a vencer', fatura: 'Faturas', meta: 'Metas', sistema: 'Avisos do sistema' };
+  const STATUS = { simulado: ['Simulado', 'info'], enviando: ['Enviando', ''], enviado: ['Aceito pela Meta', 'acc'], entregue: ['Entregue', 'up'], lido: ['Lido', 'up'], falhou: ['Falhou', 'down'], bloqueado: ['Não enviado', ''], recebido: ['Recebido', 'info'] };
+  const back = h`<a href="#/cfg" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Configurações</a>`;
+  const hora = (iso) => { if (!iso) return ''; const d = new Date(iso); return isNaN(d) ? '' : `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  const fone = (d) => { d = String(d || ''); if (d.startsWith('55') && d.length >= 12) return `+55 (${d.slice(2, 4)}) ${d.slice(4, -4)}-${d.slice(-4)}`; return d ? '+' + d : ''; };
+  const sw = (act, on, label, hint, disabled) => h`<div class="li"><span class="main"><span class="t">${label}</span>${hint ? h`<span class="s" style="white-space:normal">${hint}</span>` : ''}</span><label class="toggle"><input type="checkbox" data-on-change="${act}" ${on ? raw('checked') : ''} ${disabled ? raw('disabled') : ''}><span></span></label></div>`;
+
+  async function load(silent) {
+    st.loading = true;
+    try { st.data = await P.api.call('wa.status', {}); }
+    catch (e) { if (!silent) ui.toast(e.message, { error: true }); }
+    st.loading = false;
+    if (P.router.current() && P.router.current().tab === 'whatsapp') P.router.render(true);
+  }
+  async function call(route, payload, okMsg, btn) {
+    if (btn) btn.classList.add('loading');
+    try { const r = await P.api.call(route, payload || {}, { mutation: true }); st.data = r.status || r; if (okMsg) ui.toast(okMsg); return r; }
+    catch (e) { ui.toast(e.message, { error: true }); return null; }
+    finally { if (btn) btn.classList.remove('loading'); P.router.render(true); }
+  }
+
+  function render() {
+    const d = st.data;
+    if (!d) return h`<div class="page-head"><div>${back}<h1 class="mt-2">WhatsApp</h1></div></div>${ui.skeleton()}`;
+    const u = d.usuario, c = d.conta || {}, uso = d.uso;
+    const estado = !u.ativo ? ['Desligado', ''] : u.modoTeste ? ['Modo de teste (simulação)', 'info'] : !c.ativo ? ['Aguardando o dono liberar', ''] : ['Ativo', 'up'];
+    const wa = c.numeroComercial ? `https://wa.me/${c.numeroComercial}?text=hoje` : '';
+    return h`<div class="page-head"><div>${back}<h1 class="mt-2">WhatsApp</h1><p>Lembretes do Prumo no seu WhatsApp, pela API oficial da Meta.</p></div>
+        <div class="row-sm"><span class="chip ${estado[1]} lg">${estado[0]}</span></div></div>
+      <div class="dash">
+        <div class="span-6 stack">
+          <details class="card pad-lg" ${u.numero ? '' : raw('open')}><summary style="cursor:pointer;font-weight:700">${icon('info', 'sm')} Como fica de graça</summary>
+            <ul class="muted mt-3" style="font-size:13.5px;line-height:1.55;padding-left:18px">
+              <li>O WhatsApp só deixa mandar <b>mensagem de texto até 24 h depois que você escreve</b> para o número do Prumo. Mande um “oi” (ou <b>hoje</b>) uma vez por dia para receber os lembretes.</li>
+              <li>Cada número comercial tem <b>1.000 mensagens grátis por mês</b> (regra da Meta desde 01/10/2026). O Prumo para em ${fmt.num(uso.limiteMes)} por mês e junta vários avisos numa mensagem só.</li>
+              <li>Sem forma de pagamento cadastrada na Meta, ela <b>não cobra</b>: o que passar da faixa grátis simplesmente não é entregue. <b>Não cadastre cartão</b> na Meta se quiser garantir custo zero.</li>
+              <li>O Prumo <b>nunca envia modelos (templates)</b>, que são o tipo pago fora da janela.</li>
+              <li>Regras e preços são da Meta e podem mudar. Os limites e o modo de teste ficam aqui para você controlar.</li>
+            </ul></details>
+
+          <div class="card pad-lg"><div class="row"><span class="tile" style="background:var(--primary-tint);color:var(--primary-ink)">${icon('message')}</span><div class="grow"><b>Seu WhatsApp</b><p class="muted" style="font-size:13px">Para onde o Prumo manda os avisos.</p></div></div>
+            <form class="form mt-3" id="wa-num" novalidate><div class="form-row"><div class="field full"><label for="wa-n">Número com DDD</label>
+              <input id="wa-n" class="input" name="numero" inputmode="tel" autocomplete="tel" placeholder="+55 11 98765-4321" value="${u.numero ? fone(u.numero) : ''}"></div></div>
+              ${u.numero && u.waId && u.waId !== u.numero ? h`<p class="faint" style="font-size:12.5px">No WhatsApp este número é <b>+${u.waId}</b> (sem o 9 extra, regra do seu DDD). É assim que o Prumo envia e como ele deve estar na lista de destinatários da Meta.</p>` : ''}
+              <button class="btn btn-ghost btn-sm" data-act="wa.saveNum">${icon('check', 'sm')}Salvar número</button></form>
+            <div class="list mt-3">
+              ${sw('wa.toggle', u.ativo, 'Usar o WhatsApp', 'Liga a integração para você', !u.numero)}
+              ${sw('wa.teste', u.modoTeste, 'Modo de teste (simulação)', 'Nada sai para a Meta: as mensagens ficam só no histórico abaixo', !u.ativo)}
+              ${sw('wa.auto', u.automatico, 'Enviar avisos automaticamente', 'Tarefas, rotinas, eventos e contas, conferidos a cada 15 min, só com a janela aberta', !u.ativo)}
+            </div>
+            <div class="group-h mt-3">O que mandar</div>
+            <div class="chips" style="flex-wrap:wrap;margin:0;padding:0">${d.tipos.map((t) => h`<button class="chip ${u.tipos.includes(t) ? 'solid' : ''}" data-act="wa.tipo" data-t="${t}">${TIPO_LABEL[t] || t}</button>`)}</div>
+            <div class="li mt-3"><span class="main"><span class="t">Limite por dia</span><span class="s">Hoje: ${uso.hoje} de ${u.limiteDia}</span></span><span class="input-wrap" style="width:120px"><input class="input num" inputmode="numeric" value="${u.limiteDia}" data-on-change="wa.limDia" aria-label="Limite por dia"><span class="suffix">msg</span></span></div>
+          </div>
+
+          <div class="card pad-lg"><div class="row"><span class="tile" style="background:${u.janelaAberta ? 'var(--success-tint)' : 'var(--surface-2)'};color:${u.janelaAberta ? 'var(--success)' : 'var(--text-2)'}">${icon('clock')}</span>
+            <div class="grow"><b>${u.janelaAberta ? 'Janela aberta até ' + hora(u.janelaAte) : 'Janela de 24 h fechada'}</b><p class="muted" style="font-size:13px">${u.janelaAberta ? (u.janelaOrigem === 'webhook' ? 'Detectada pela sua última mensagem.' : 'Marcada por você.') : 'Mande uma mensagem para o número do Prumo para liberar os envios.'}</p></div></div>
+            <div class="row-sm mt-4" style="flex-wrap:wrap">${wa ? h`<a class="btn btn-primary" href="${wa}" target="_blank" rel="noopener">${icon('external', 'sm')}Abrir conversa</a>` : ''}<button class="btn btn-ghost" data-act="wa.janela" ${u.numero ? '' : raw('disabled')}>${icon('check', 'sm')}Já mandei a mensagem</button><button class="btn btn-ghost" data-act="wa.test" ${u.ativo ? '' : raw('disabled')}>${icon('message', 'sm')}Enviar teste</button></div>
+            ${!wa ? h`<p class="faint mt-3" style="font-size:12.5px">O número do Prumo aparece aqui depois que o dono testar a conexão com a Meta.</p>` : h`<p class="faint mt-3" style="font-size:12.5px">Número do Prumo: ${fone(c.numeroComercial)}${c.nome ? ' · ' + c.nome : ''}. Com o <b>número de teste da Meta</b>, o link não abre a conversa: ela aparece depois que a Meta manda a primeira mensagem (botão “Enviar mensagem” no API Setup). Para renovar a janela, responda nessa conversa.</p>`}
+          </div>
+        </div>
+
+        <div class="span-6 stack">
+          ${d.dono ? ownerCard(c, uso) : h`<div class="card pad-lg"><b>Conta da Meta</b><p class="muted mt-1" style="font-size:13.5px">${c.configurado ? (c.ativo ? 'Configurada e liberada pelo dono do app.' : 'Configurada, mas os envios reais estão desligados pelo dono.') : 'O dono do app ainda não conectou a conta da Meta.'} Uso do mês: ${uso.mes} de ${uso.limiteMes}.</p></div>`}
+          <div class="card pad-lg"><div class="row"><b class="grow">Histórico</b><button class="btn-icon" data-act="wa.reload" aria-label="Atualizar">${icon('refresh', 'sm')}</button></div>
+            ${d.historico.length ? h`<div class="list mt-2">${d.historico.map((m) => { const s = STATUS[m.status] || [m.status, '']; return h`<div class="li"><span class="tile sm" style="background:var(--surface-2)">${icon(m.direcao === 'entrada' ? 'down' : 'up', 'sm')}</span><span class="main"><span class="t ellipsis">${m.corpo || '—'}</span><span class="s">${hora(m.em)} · ${m.origem || ''}${m.erro ? ' · ' + m.erro : ''}</span></span><span class="chip ${s[1]}">${s[0]}</span></div>`; })}</div>` : h`<p class="faint mt-2" style="font-size:13px">Nada enviado ainda.</p>`}</div>
+        </div>
+      </div>`;
+  }
+
+  function ownerCard(c, uso) {
+    return h`<div class="card pad-lg"><div class="row"><span class="tile" style="background:var(--primary-tint);color:var(--primary-ink)">${icon('shield')}</span><div class="grow"><b>Conta da Meta</b><p class="muted" style="font-size:13px">Só você (dono) vê e altera. O token fica nas propriedades do script, nunca na planilha nem no navegador.</p></div></div>
+      <form class="form mt-3" id="wa-cfg" novalidate><div class="form-row">
+        <div class="field full"><label for="wa-pid">ID do número (Phone number ID)</label><input id="wa-pid" class="input" name="phoneId" inputmode="numeric" value="${c.phoneId || ''}" placeholder="App Dashboard › WhatsApp › API Setup"></div>
+        <div class="field full"><label for="wa-tk">Token de acesso ${c.token ? h`<span class="faint">(atual ${c.token})</span>` : ''}</label><input id="wa-tk" class="input" name="token" type="password" autocomplete="off" placeholder="${c.token ? 'Deixe em branco para manter' : 'Token de usuário do sistema (System User)'}"></div>
+        <div class="field"><label for="wa-v">Versão da API</label><input id="wa-v" class="input" name="versao" value="${c.versao || 'v26.0'}"></div>
+        <div class="field"><label for="wa-lm">Limite por mês</label><input id="wa-lm" class="input num" name="limiteMes" inputmode="numeric" value="${c.limiteMes}"></div>
+      </div><div class="row-sm" style="flex-wrap:wrap"><button class="btn btn-primary btn-sm" data-act="wa.saveCfg">${icon('check', 'sm')}Salvar</button><button class="btn btn-ghost btn-sm" data-act="wa.conn" ${c.configurado ? '' : raw('disabled')}>${icon('link', 'sm')}Testar conexão</button></div></form>
+      ${c.numeroComercial ? h`<p class="mt-3" style="font-size:13.5px">${icon('check-circle', 'sm')} Conectado: <b>${fone(c.numeroComercial)}</b>${c.nome ? ' · ' + c.nome : ''}</p>` : ''}
+      <div class="list mt-3">${sw('wa.global', c.ativo, 'Permitir envios reais', `Usados ${uso.mes} de ${c.limiteMes} neste mês (todas as pessoas). Desligado, tudo para na hora.`, !c.configurado)}</div>
+      <details class="mt-3"><summary style="cursor:pointer;font-size:13.5px;font-weight:700">Webhook (opcional)</summary>
+        <p class="muted mt-2" style="font-size:13px">Com ele, a janela de 24 h abre sozinha quando você manda mensagem, e o Prumo responde <b>hoje</b> com o resumo do dia. A Meta pode recusar o endereço do Apps Script, porque ele responde por redirecionamento. Se recusar, use o botão “Já mandei a mensagem”.</p>
+        ${c.webhookUrl ? h`<div class="field mt-2"><label>URL de retorno (Callback URL)</label><div class="row-sm"><input class="input grow" readonly value="${c.webhookUrl}"><button class="btn-icon" data-act="wa.copy" data-v="${c.webhookUrl}" aria-label="Copiar URL">${icon('copy', 'sm')}</button></div></div>
+          <div class="field mt-2"><label>Token de verificação (Verify token)</label><div class="row-sm"><input class="input grow" readonly value="${c.verifyToken}"><button class="btn-icon" data-act="wa.copy" data-v="${c.verifyToken}" aria-label="Copiar token">${icon('copy', 'sm')}</button></div></div>
+          <p class="faint mt-2" style="font-size:12.5px">Na Meta: WhatsApp › Configuration › Webhook › Edit, cole os dois e assine o campo <b>messages</b>.</p>` : h`<p class="faint mt-2" style="font-size:12.5px">Salve as credenciais para gerar a URL e o token.</p>`}
+      </details></div>`;
+  }
+
+  P.screen('cfg/whatsapp', { mod: 'cfg', tab: 'whatsapp', title: 'WhatsApp', render, mount() { if (!st.data) load(); } });
+
+  const saveUser = (payload, msg, el) => call('wa.saveUser', payload, msg, el);
+  Object.assign(P.act, {
+    'wa.reload': (el) => { el.classList.add('loading'); load(); },
+    'wa.saveNum': (el, ev) => { ev && ev.preventDefault(); const v = document.getElementById('wa-n').value.trim(); return saveUser({ numero: v }, v ? 'Número salvo' : 'Número removido', el); },
+    'wa.toggle': (el) => saveUser({ ativo: el.checked }, el.checked ? 'WhatsApp ligado (em modo de teste)' : 'WhatsApp desligado'),
+    'wa.teste': async (el) => {
+      if (!el.checked) {
+        const ok = await ui.confirm({ title: 'Enviar de verdade?', text: 'As mensagens passam a sair pela Meta. Fica dentro da faixa grátis (1.000/mês por número) e dos seus limites, e só com a janela de 24 h aberta. Sem cartão cadastrado na Meta, nada é cobrado.', ok: 'Enviar de verdade' });
+        if (!ok) { el.checked = true; return; }
+      }
+      return saveUser({ modo_teste: el.checked }, el.checked ? 'Modo de teste ligado' : 'Envios reais liberados para você');
+    },
+    'wa.auto': async (el) => {
+      if (el.checked) {
+        const ok = await ui.confirm({ title: 'Autorizar avisos automáticos?', text: 'O Prumo vai juntar os avisos novos e mandar a cada 15 minutos, só com a janela aberta e respeitando os limites. Você pode desligar quando quiser.', ok: 'Autorizar' });
+        if (!ok) { el.checked = false; return; }
+      }
+      return saveUser({ automatico: el.checked }, el.checked ? 'Avisos automáticos autorizados' : 'Avisos automáticos desligados');
+    },
+    'wa.tipo': (el) => { const cur = new Set(st.data.usuario.tipos); cur.has(el.dataset.t) ? cur.delete(el.dataset.t) : cur.add(el.dataset.t); return saveUser({ tipos: [...cur] }); },
+    'wa.limDia': (el) => { const n = Math.round(P.parseNum(el.value)); if (!(n >= 1 && n <= 100)) { ui.toast('Use um valor entre 1 e 100.', { error: true }); el.value = st.data.usuario.limiteDia; return; } return saveUser({ limiteDia: n }, 'Limite salvo'); },
+    'wa.janela': (el) => call('wa.markWindow', {}, 'Janela de 24 h aberta', el),
+    'wa.test': async (el) => { const r = await call('wa.sendTest', {}, null, el); if (r) ui.toast(r.resultado === 'simulado' ? 'Teste simulado: veja no histórico (nada foi enviado).' : 'Teste enviado. Deve chegar em instantes.', { icon: 'message' }); },
+    'wa.saveCfg': (el, ev) => {
+      ev && ev.preventDefault();
+      const f = document.getElementById('wa-cfg'), p = { phoneId: f.phoneId.value.trim(), versao: f.versao.value.trim(), limiteMes: Math.round(P.parseNum(f.limiteMes.value)) };
+      if (f.token.value.trim()) p.token = f.token.value.trim();
+      return call('wa.saveConfig', p, 'Conta da Meta salva', el);
+    },
+    'wa.conn': async (el) => {
+      el.classList.add('loading');
+      try { const r = await P.api.call('wa.testConnection', {}, { mutation: true }); ui.toast(`Conexão ok: ${r.numero}${r.nome ? ' · ' + r.nome : ''}`, { icon: 'check' }); await load(true); }
+      catch (e) { ui.toast(e.message, { error: true }); }
+      el.classList.remove('loading');
+    },
+    'wa.global': async (el) => {
+      if (el.checked) {
+        const ok = await ui.confirm({ title: 'Permitir envios reais?', text: `Vale para todas as pessoas do Prumo, até ${st.data.conta.limiteMes} mensagens por mês. Cada pessoa ainda precisa desligar o próprio modo de teste.`, ok: 'Permitir' });
+        if (!ok) { el.checked = false; return; }
+      }
+      return call('wa.saveConfig', { ativo: el.checked }, el.checked ? 'Envios reais permitidos' : 'Envios reais desligados para todos');
+    },
+    'wa.copy': (el) => { const v = el.dataset.v; try { navigator.clipboard.writeText(v).then(() => ui.toast('Copiado'), () => ui.toast(v)); } catch (e) { ui.toast(v); } }
+  });
+})();
+</script>

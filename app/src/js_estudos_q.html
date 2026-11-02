@@ -1,0 +1,803 @@
+<script>
+/* Prumo · Estudos: banco de questões, listas, treino (correção imediata) e avaliação (correção no fim),
+   simulados com cartão-resposta e importação estruturada de planilhas (XLSX/CSV). */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const E = P.est;
+  const st = { aba: 'banco', sel: new Set() };
+  const TIPO_Q = { multipla: 'Múltipla escolha', certo_errado: 'Certo ou errado', curta: 'Resposta curta', discursiva: 'Discursiva' };
+  const GSTAT = { preliminar: ['Gabarito preliminar', 'info'], definitivo: ['Gabarito definitivo', 'up'], anulada: ['Anulada', 'down'], sem_gabarito: ['Sem gabarito', ''] };
+  const RES = { certa: ['Certa', 'up'], errada: ['Errada', 'down'], branco: ['Em branco', ''], anulada: ['Anulada', ''], sem_gabarito: ['Sem gabarito', ''] };
+
+  const tentDe = (qid) => S.where('est_tentativas', (t) => t.questao_id === qid).sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+  /** Última tentativa e total por questão (a última resposta é a que vale). */
+  function lastMap() {
+    const m = {};
+    S.all('est_tentativas').forEach((t) => { const x = m[t.questao_id] || (m[t.questao_id] = { n: 0, t: null }); x.n++; if (!x.t || t.created_at > x.t.created_at) x.t = t; });
+    return m;
+  }
+  /** Tipo de concurso (área) da questão: o dela ou o do concurso. */
+  const areaDe = (q) => q.area || (q.concurso_id && (E.conc(q.concurso_id) || {}).area) || '';
+  E.areas = () => [...new Set(S.all('est_concursos').map((c) => c.area).concat(S.all('est_questoes').map((q) => q.area)).filter(Boolean).map((a) => String(a).trim()))].sort((a, b) => a.localeCompare(b));
+  function filtered(fk = 'est.q', lm = lastMap()) {
+    const sit = P.flt.get(fk, 'sit', 'todas'), banca = P.flt.get(fk, 'banca', ''), disc = P.flt.get(fk, 'disc', ''), ass = P.flt.get(fk, 'ass', ''), ano = P.flt.get(fk, 'ano', ''), dif = P.flt.get(fk, 'dif', ''), tipo = P.flt.get(fk, 'tipo', '');
+    const conc = P.flt.get(fk, 'conc', ''), area = P.flt.get(fk, 'area', ''), orig = P.flt.get(fk, 'orig', '');
+    return S.all('est_questoes').filter((q) => {
+      const x = lm[q.id], last = x ? E.res(x.t) : null;
+      return (sit === 'todas' || (sit === 'ineditas' && !x) || (sit === 'erradas' && last === 'errada') || (sit === 'acertadas' && last === 'certa') || (sit === 'favoritas' && q.favorita) || (sit === 'duvida' && q.duvida) || (sit === 'sem_gabarito' && q.gabarito_status === 'sem_gabarito') || (sit === 'anuladas' && q.gabarito_status === 'anulada') || (sit === 'revisar' && q.revisar) || (sit === 'comentadas' && q.comentario))
+        && (!banca || P.norm(q.banca) === P.norm(banca)) && (!disc || q.disciplina_id === disc) && (!ass || q.assunto_id === ass) && (!ano || String(q.ano) === String(ano)) && (!dif || String(q.dificuldade) === dif) && (!tipo || q.tipo === tipo)
+        && (!conc || (conc === '_sem' ? !q.concurso_id : q.concurso_id === conc)) && (!area || P.norm(areaDe(q)) === P.norm(area)) && (!orig || (orig === 'ia' ? q.gerada_ia : !q.gerada_ia))
+        && P.flt.match(fk, q.codigo, q.enunciado, q.banca, q.orgao, q.tags, q.cargo, q.area, q.comentario);
+    });
+  }
+  /** Assertividade × erro: última resposta de cada questão do conjunto. */
+  function accuracy(rows, lm) {
+    const o = { certas: 0, erradas: 0, outras: 0, ineditas: 0 };
+    rows.forEach((q) => { const x = lm[q.id]; if (!x) { o.ineditas++; return; } const r = E.res(x.t); if (r === 'certa') o.certas++; else if (r === 'errada') o.erradas++; else o.outras++; });
+    o.resp = o.certas + o.erradas; o.pct = o.resp ? (o.certas / o.resp) * 100 : null;
+    return o;
+  }
+
+  // ================= Banco =================
+  function questoes() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.q', all = S.all('est_questoes');
+    if (st.aba === 'listas') return listas();
+    const lm = lastMap();
+    const rows = filtered(fk, lm).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+    const bancas = [...new Set(all.map((q) => q.banca).filter(Boolean))].sort(), anos = [...new Set(all.map((q) => q.ano).filter(Boolean))].sort().reverse(), areas = E.areas();
+    const disc = P.flt.get(fk, 'disc', ''), sel = st.sel;
+    [...sel].forEach((id) => { if (!S.get('est_questoes', id)) sel.delete(id); });
+    const allSel = rows.length > 0 && rows.every((q) => sel.has(q.id));
+    const ac = accuracy(sel.size ? rows.filter((q) => sel.has(q.id)) : rows, lm), pct = (n) => (ac.resp ? fmt.num((n / ac.resp) * 100, 1) + '%' : 'sem dados');
+    return h`<div class="page-head"><div><h1>Questões</h1><p>${all.length} no banco · ${rows.length} no filtro</p></div>
+        <div class="row-sm wrap">${ui.seg([['banco', 'Banco'], ['listas', 'Listas']], st.aba, 'est.qAba', { cls: 'sm' })}<button class="btn btn-ghost btn-sm" data-act="est.import" data-tabela="questoes">${icon('upload', 'sm')}Importar</button><button class="btn btn-ghost btn-sm" data-act="est.importPdf">${icon('file', 'sm')}PDF de questões</button>${E.aiOn && E.aiOn() ? h`<a class="btn btn-ghost btn-sm" href="#/est/ia?modo=questoes">${icon('zap', 'sm')}Gerar com IA</a>` : ''}<button class="btn btn-primary btn-sm" data-act="est.qNew">${icon('plus', 'sm')}Nova</button></div></div>
+      <div class="filters mb-3">${P.flt.search(fk, 'Buscar enunciado, código, banca, etiqueta, comentário')}
+        <div class="row-f">${P.flt.chips(fk, 'sit', [['todas', 'Todas'], ['ineditas', 'Inéditas'], ['erradas', 'Erradas'], ['acertadas', 'Acertadas'], ['favoritas', 'Favoritas'], ['duvida', 'Com dúvida'], ['comentadas', 'Comentadas'], ['revisar', 'A revisar (IA)'], ['sem_gabarito', 'Sem gabarito'], ['anuladas', 'Anuladas']], 'todas')}</div>
+        <div class="row-f">${E.concursos().length ? P.flt.select(fk, 'conc', [['_sem', 'Sem concurso']].concat(E.concursos().map((c) => [c.id, c.nome])), 'Todos os concursos') : ''}${areas.length ? P.flt.select(fk, 'area', areas.map((a) => [a, a]), 'Todos os tipos de concurso') : ''}${bancas.length ? P.flt.select(fk, 'banca', bancas.map((b) => [b, b]), 'Todas as bancas') : ''}${P.flt.select(fk, 'disc', E.disciplinas().map((d) => [d.id, d.nome]), 'Todas as disciplinas')}${disc ? P.flt.select(fk, 'ass', E.assuntosDe(disc).map((a) => [a.id, a.titulo]), 'Todos os assuntos') : ''}${anos.length ? P.flt.select(fk, 'ano', anos.map((a) => [a, a]), 'Todos os anos') : ''}${P.flt.select(fk, 'dif', [1, 2, 3, 4, 5].map((n) => [String(n), 'Dificuldade ' + n]), 'Qualquer dificuldade')}${P.flt.select(fk, 'tipo', Object.entries(TIPO_Q), 'Todos os tipos')}${all.some((q) => q.gerada_ia) ? P.flt.select(fk, 'orig', [['ia', 'Geradas por IA'], ['manual', 'Cadastradas/importadas']], 'Qualquer origem') : ''}</div></div>
+      ${rows.length ? h`<div class="grid g4 mb-3" data-acc><div class="card">${ui.metric({ label: 'Assertividade', icon: 'target', value: ac.pct == null ? 'sem dados' : fmt.num(ac.pct, 1) + '%', size: 'md', sub: `${ac.resp} respondida(s)${ac.resp && ac.resp < 10 ? ' · amostra pequena' : ''}` })}${ac.pct != null ? ui.progress(ac.pct) : ''}</div>
+        <div class="card">${ui.metric({ label: 'Acertos', icon: 'check-circle', value: fmt.num(ac.certas), size: 'md', cls: 'pos', sub: pct(ac.certas) })}</div><div class="card">${ui.metric({ label: 'Erros', icon: 'alert', value: fmt.num(ac.erradas), size: 'md', sub: pct(ac.erradas) })}</div>
+        <div class="card">${ui.metric({ label: 'Não respondidas', icon: 'list', value: fmt.num(ac.ineditas), size: 'md', sub: ac.outras ? ac.outras + ' em branco/sem gabarito/anulada' : (sel.size ? 'da seleção' : 'do filtro') })}</div></div>
+        <p class="faint mb-3" style="font-size:12px">Conta a última resposta de cada questão ${sel.size ? 'selecionada' : 'do filtro'}. Assertividade = certas ÷ (certas + erradas).</p>` : ''}
+      ${rows.length ? h`<div class="card pad-lg est-hero mb-3"><label class="row-sm"><input type="checkbox" data-act="est.qSelAll" ${raw(allSel ? 'checked' : '')} aria-label="Selecionar todas do filtro"><span class="faint" style="font-size:12.5px">Todas</span></label><div class="grow"><b>${sel.size ? sel.size + ' selecionada(s)' : rows.length + ' questão(ões) no filtro'}</b><p class="muted" style="font-size:12.5px">Treino corrige na hora; avaliação corrige no fim. Simulado tem tempo e cartão-resposta.</p></div>
+        <div class="row-sm wrap"><button class="btn btn-primary btn-sm" data-act="est.qRun" data-m="treino">${icon('play', 'sm')}Treinar</button><button class="btn btn-ghost btn-sm" data-act="est.qRun" data-m="avaliacao">${icon('check-circle', 'sm')}Avaliação</button><button class="btn btn-ghost btn-sm" data-act="est.simQuick">${icon('timer', 'sm')}Simulado com tempo</button><button class="btn btn-ghost btn-sm" data-act="est.qTg">${icon('message', 'sm')}Treinar no Telegram</button><button class="btn btn-ghost btn-sm" data-act="est.listNew">${icon('list', 'sm')}Salvar como lista</button>${sel.size ? h`<button class="btn btn-ghost btn-sm" data-act="est.qDelSel" style="color:var(--danger)">${icon('trash', 'sm')}Excluir (${sel.size})</button><button class="btn btn-ghost btn-sm" data-act="est.qSelClear">Limpar seleção</button>` : ''}</div></div>` : ''}
+      ${rows.length ? h`<div class="list cardlist">${rows.slice(0, 300).map((q) => { const x = lm[q.id], last = x ? E.res(x.t) : null; return h`<div class="li"><input type="checkbox" data-on-change="est.qSel" data-id="${q.id}" ${raw(sel.has(q.id) ? 'checked' : '')} aria-label="Selecionar ${q.codigo}">
+          <span class="main tap" data-act="est.qOne" data-id="${q.id}"><span class="t">${q.codigo} · ${String(q.enunciado).slice(0, 110)}${String(q.enunciado).length > 110 ? '…' : ''}</span><span class="s">${[q.banca, q.ano, q.orgao].filter(Boolean).join(' ')}${q.concurso_id && E.conc(q.concurso_id) ? ' · ' + E.conc(q.concurso_id).nome : ''}${areaDe(q) ? ' · ' + areaDe(q) : ''}${q.disciplina_id ? ' · ' + E.discNome(q.disciplina_id) : ''}${q.assunto_id ? ' › ' + E.assNome(q.assunto_id) : ''} · ${TIPO_Q[q.tipo]} · dif. ${q.dificuldade || 3}${x ? ` · ${x.n} tentativa(s)` : ' · inédita'}${q.versao > 1 ? ' · v' + q.versao : ''}${q.comentario ? ' · comentada' : ''}</span></span>
+          ${q.gerada_ia ? h`<span class="chip info">IA${q.revisar ? ' · a revisar' : ''}</span>` : ''}${q.gabarito_status !== 'definitivo' ? h`<span class="chip ${GSTAT[q.gabarito_status][1]}">${GSTAT[q.gabarito_status][0]}</span>` : ''}${last ? h`<span class="chip ${RES[last][1]}">${RES[last][0]}</span>` : ''}<button class="btn-icon sm" data-act="est.qEdit" data-id="${q.id}" aria-label="Editar">${icon('edit', 'sm')}</button></div>`; })}</div>${rows.length > 300 ? h`<p class="faint mt-2">Mostrando 300 de ${rows.length}. Refine os filtros.</p>` : ''}`
+        : ui.empty({ ill: 'list', title: all.length ? 'Nada neste filtro' : 'Banco vazio', text: 'Cadastre questões, importe de planilha (modelo pronto) ou recorte o enunciado de um PDF no leitor. O Prumo nunca inventa gabarito.', action: { act: 'est.qNew', label: 'Nova questão' } })}`;
+  }
+
+  function listas() {
+    const ls = S.all('est_listas').sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+    return h`<div class="page-head"><div><h1>Listas de questões</h1><p>${ls.length} lista(s)</p></div><div class="row-sm">${ui.seg([['banco', 'Banco'], ['listas', 'Listas']], st.aba, 'est.qAba', { cls: 'sm' })}<button class="btn btn-primary btn-sm" data-act="est.listNew">${icon('plus', 'sm')}Nova lista</button></div></div>
+      ${ls.length ? h`<div class="list cardlist">${ls.map((l) => { const ids = listIds(l); return h`<div class="li"><span class="main"><span class="t">${l.nome}</span><span class="s">${{ manual: 'Manual', aleatoria: 'Aleatória', dificuldades: 'Dificuldades', filtro: 'Filtro salvo' }[l.tipo]} · ${ids.length} questão(ões)</span></span><button class="btn btn-ghost btn-sm" data-act="est.listRun" data-id="${l.id}" data-m="treino">${icon('play', 'sm')}Treinar</button><button class="btn btn-ghost btn-sm" data-act="est.listRun" data-id="${l.id}" data-m="avaliacao">Avaliação</button><button class="btn-icon sm" data-act="est.listDel" data-id="${l.id}" aria-label="Excluir">${icon('trash', 'sm')}</button></div>`; })}</div>`
+        : ui.empty({ ill: 'list', title: 'Nenhuma lista', text: 'Monte listas manuais (seleção), aleatórias (N questões do filtro) ou focadas nas dificuldades (o que você errou e assuntos de domínio baixo).', small: true })}`;
+  }
+  function listIds(l) {
+    if (l.tipo === 'filtro') { const f = l.filtros_json || {}; return S.all('est_questoes').filter((q) => (!f.disc || q.disciplina_id === f.disc) && (!f.banca || P.norm(q.banca) === P.norm(f.banca)) && (!f.ass || q.assunto_id === f.ass)).map((q) => q.id); }
+    return String(l.questao_ids || '').split(',').filter((id) => id && S.get('est_questoes', id));
+  }
+
+  function listNew() {
+    const filt = filtered().map((q) => q.id), sel = [...st.sel];
+    ui.editSheet({ table: 'est_listas', title: 'Nova lista', createLabel: 'Criar lista', defaults: { tipo: sel.length ? 'manual' : 'aleatoria', nome: 'Lista ' + fmt.date(D.today()), _n: 20 },
+      fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true }, { k: 'tipo', l: 'Tipo', t: 'seg', opts: [['manual', `Seleção (${sel.length})`], ['aleatoria', 'Aleatória do filtro'], ['dificuldades', 'Dificuldades'], ['filtro', 'Filtro salvo']] }, { k: '_n', l: 'Quantas questões', t: 'int', min: 1, max: 500, show: (v) => v.tipo === 'aleatoria' || v.tipo === 'dificuldades' }],
+      extra: h`<p class="faint" style="font-size:12px">Filtro atual: ${filt.length} questão(ões). "Dificuldades" junta as que você errou por último e as de assuntos com domínio baixo. "Filtro salvo" se atualiza sozinho.</p>`,
+      beforeSave: (r, sh) => {
+        const n = +(sh.$('[data-k="_n"]:not(div)') || {}).value || 20, out = { nome: r.nome, tipo: r.tipo };
+        if (r.tipo === 'manual') { if (!sel.length) { ui.toast('Selecione questões no banco primeiro.', { error: true }); return null; } out.questao_ids = sel.join(','); }
+        if (r.tipo === 'aleatoria') out.questao_ids = filt.map((x) => [Math.random(), x]).sort((a, b) => a[0] - b[0]).slice(0, n).map((x) => x[1]).join(',');
+        if (r.tipo === 'dificuldades') { const err = S.all('est_questoes').filter((q) => { const t = tentDe(q.id)[0]; return (t && E.res(t) === 'errada') || (q.assunto_id && E.mastery(q.assunto_id).nivel === 'baixo'); }); out.questao_ids = err.slice(0, n).map((q) => q.id).join(','); if (!err.length) { ui.toast('Nenhuma dificuldade registrada ainda.', { error: true }); return null; } }
+        if (r.tipo === 'filtro') out.filtros_json = { disc: P.flt.get('est.q', 'disc', ''), banca: P.flt.get('est.q', 'banca', ''), ass: P.flt.get('est.q', 'ass', '') };
+        return out;
+      },
+      afterSave: () => { st.sel = new Set(); st.aba = 'listas'; P.router.render(true); } });
+  }
+
+  // ================= Editor =================
+  function qEdit(q, defaults = {}) {
+    const isNew = !q;
+    const alts = {}; ((q && q.alternativas_json) || []).forEach((a) => { alts['_alt' + a.letra] = a.texto; });
+    const v = q ? { ...q, ...alts } : { tipo: 'multipla', dificuldade: 3, gabarito_status: 'preliminar', ...defaults };
+    ui.editSheet({ table: 'est_questoes', row: isNew ? null : v, title: isNew ? 'Nova questão' : 'Editar ' + q.codigo, size: 'full', defaults: v,
+      fields: [{ k: 'tipo', l: 'Tipo', t: 'seg', opts: Object.entries(TIPO_Q) }, { k: 'texto_base', l: 'Texto de apoio (opcional)', t: 'textarea', rows: 3, ph: 'Texto para interpretação, compartilhado por várias questões' }, { k: 'enunciado', l: 'Enunciado', t: 'textarea', rows: 6, req: true, focus: isNew }]
+        .concat(['A', 'B', 'C', 'D', 'E'].map((L) => ({ k: '_alt' + L, l: 'Alternativa ' + L, t: 'textarea', rows: 1, show: (x) => x.tipo === 'multipla' })))
+        .concat([
+          { k: 'gabarito', l: 'Gabarito', t: 'select', half: true, ph: 'Sem gabarito', opts: (x) => (x.tipo === 'certo_errado' ? [['C', 'Certo'], ['E', 'Errado']] : ['A', 'B', 'C', 'D', 'E'].map((L) => [L, L])), show: (x) => x.tipo === 'multipla' || x.tipo === 'certo_errado' },
+          { k: '_gtxt', l: 'Resposta esperada (aceite variações separando por |)', t: 'text', show: (x) => x.tipo === 'curta' },
+          { k: 'gabarito_status', l: 'Situação do gabarito', t: 'select', half: true, opts: Object.entries(GSTAT).map(([k, x]) => [k, x[0]]) },
+          { k: 'explicacao', l: 'Explicação / comentário', t: 'textarea', rows: 3 }, { k: 'banca', l: 'Banca', t: 'text', half: true }, { k: 'ano', l: 'Ano', t: 'int', half: true, min: 1950, max: 2100 }, { k: 'orgao', l: 'Órgão', t: 'text', half: true }, { k: 'cargo', l: 'Cargo', t: 'text', half: true },
+          { k: 'concurso_id', l: 'Concurso', t: 'select', half: true, ph: 'Nenhum', opts: () => E.concursos().map((c) => [c.id, c.nome]) },
+          { k: 'area', l: 'Tipo de concurso (área)', t: 'text', half: true, ph: 'Bancária, Tribunais, Fiscal…', hint: 'Vazio: usa o do concurso.' },
+          { k: 'disciplina_id', l: 'Disciplina', t: 'select', half: true, ph: 'Nenhuma', opts: () => E.disciplinas().map((d) => [d.id, d.nome]) }, { k: 'assunto_id', l: 'Assunto', t: 'select', half: true, ph: 'Nenhum', opts: (x) => (x.disciplina_id ? E.assuntosDe(x.disciplina_id) : S.all('est_assuntos')).map((a) => [a.id, a.titulo]) },
+          { k: 'dificuldade', l: 'Dificuldade', t: 'seg', opts: [[1, '1'], [2, '2'], [3, '3'], [4, '4'], [5, '5']] }, { k: 'fonte', l: 'Fonte', t: 'text', half: true }, { k: 'tags', l: 'Etiquetas', t: 'text', half: true },
+          { k: 'material_id', l: 'Material de origem', t: 'select', half: true, ph: 'Nenhum', opts: () => S.all('est_materiais').map((m) => [m.id, m.codigo + ' · ' + m.titulo]) }, { k: 'pagina', l: 'Página', t: 'int', half: true },
+          { k: 'comentario', l: 'Meu comentário', t: 'textarea', rows: 2, ph: 'Anotações suas sobre a questão ou a resposta' },
+          { k: 'favorita', l: 'Favorita', t: 'toggle' }, { k: 'duvida', l: 'Com dúvida', t: 'toggle' }, { k: 'revisar', l: 'Gerada por IA: ainda a revisar', t: 'toggle', show: (x) => !!x.gerada_ia }]),
+      extra: h`<div class="row-sm wrap"><button type="button" class="btn btn-ghost btn-sm" data-img>${icon('image', 'sm')}${q && q.imagem_arquivo_id ? 'Trocar imagem' : 'Imagem do enunciado'}</button>${!isNew ? h`<button type="button" class="btn btn-ghost btn-sm" data-ver>${icon('history', 'sm')}Versões e gabaritos</button>` : ''}</div><p class="faint mt-2" style="font-size:12px">Sem gabarito, a tentativa fica registrada como "sem gabarito" (você pode se autoavaliar). Mudar o gabarito de uma questão já respondida pede o motivo e recalcula as tentativas sem apagar o resultado original.</p>`,
+      mount(sh) {
+        sh._tipo = v.tipo;
+        sh.$('[data-img]').onclick = async () => { const f = await P.files.pick({ accept: 'image/\u002A' }); if (!f) return; try { const c = await P.files.compress(f, { max: 1600 }); const r = await P.api.call('files.upload', { nome: f.name, mime: c.mime, base64: c.dataUrl, modulo: 'estudos' }, { mutation: true }); sh._img = r.arquivo.id; ui.toast('Imagem anexada'); } catch (e) { ui.toast(e.message, { error: true }); } };
+        const vb = sh.$('[data-ver]'); if (vb) vb.onclick = () => history(q);
+        if (q && q.tipo === 'curta') { const i = sh.$('[data-k="_gtxt"]'); if (i) i.value = q.gabarito || ''; }
+      },
+      save: async (r, sh) => {
+        const out = { id: q && q.id };
+        ['tipo', 'texto_base', 'enunciado', 'gabarito_status', 'explicacao', 'banca', 'orgao', 'cargo', 'concurso_id', 'area', 'disciplina_id', 'assunto_id', 'fonte', 'tags', 'material_id', 'favorita', 'duvida', 'revisar'].forEach((k) => { if (r[k] !== undefined) out[k] = r[k] === '' ? null : r[k]; });
+        out.ano = r.ano ? +r.ano : null; out.pagina = r.pagina ? +r.pagina : null; out.dificuldade = +r.dificuldade || 3;
+        if (out.tipo === 'multipla') out.alternativas_json = ['A', 'B', 'C', 'D', 'E'].map((L) => { const el = sh.$(`[data-k="_alt${L}"]`); return { letra: L, texto: el ? el.value.trim() : '' }; }).filter((a) => a.texto);
+        const gtxt = sh.$('[data-k="_gtxt"]'), gab = out.tipo === 'curta' ? (gtxt ? gtxt.value.trim() : '') : r.gabarito || '';
+        if (sh._img) out.imagem_arquivo_id = sh._img;
+        if (out.gabarito_status === 'sem_gabarito' && gab) out.gabarito_status = 'preliminar';
+        if (!gab && out.gabarito_status !== 'anulada') out.gabarito_status = 'sem_gabarito';
+        if (q && (String(gab) !== String(q.gabarito || '') || out.gabarito_status !== q.gabarito_status) && tentDe(q.id).length) {
+          const m = await gabMotivo(q, gab, out.gabarito_status); if (!m) throw Object.assign(new Error('Alteração de gabarito cancelada.'), { code: 'CANCEL' });
+          Object.assign(out, { gabarito: gab, motivo: m.motivo, regra: m.regra });
+        } else out.gabarito = gab;
+        const res = await P.api.call('est.questionSave', out, { mutation: true });
+        let saved = res.questao;
+        const com = String(r.comentario || '').trim();
+        if (com !== String((q && q.comentario) || '').trim()) { try { saved = (await P.api.call('est.questionComment', { id: saved.id, comentario: com }, { mutation: true })).questao; } catch (e) { ui.toast('Questão salva, mas o comentário não: ' + e.message, { error: true }); } }
+        S.put('est_questoes', saved); if (q && out.regra === 'atual') E.reload().catch(() => {});
+        return saved;
+      },
+      onChange: (vals, sh) => { if (vals.tipo === sh._tipo) return; sh._tipo = vals.tipo; const f = { k: 'gabarito', l: 'Gabarito', t: 'select', half: true, ph: 'Sem gabarito', opts: (x) => (x.tipo === 'certo_errado' ? [['C', 'Certo'], ['E', 'Errado']] : ['A', 'B', 'C', 'D', 'E'].map((L) => [L, L])) }; const slot = sh.$('[data-field="gabarito"]'); if (slot) { const tmp = document.createElement('div'); tmp.innerHTML = P.toHtml(P.form.field(f, '', vals)); slot.replaceWith(tmp.firstElementChild); } },
+      onDelete: async (row) => {
+        try {
+          await P.api.call('est.questionDelete', { id: row.id }, { mutation: true }); S.drop('est_questoes', row.id); P.router.render(true);
+          ui.toast('Questão excluída', { undo: async () => { try { const r = await P.api.call('est.questionRestore', { id: row.id }, { mutation: true }); S.put('est_questoes', r.questao); P.router.render(true); } catch (e) { ui.toast(e.message, { error: true }); } } });
+        } catch (e) { ui.toast(e.message, { error: true }); }
+      } });
+  }
+  const gabMotivo = (q, gab, status) => new Promise((res) => {
+    ui.sheet({ title: 'Mudar o gabarito de ' + q.codigo, body: h`<p class="muted" style="font-size:13px">${q.gabarito || '—'} (${GSTAT[q.gabarito_status][0]}) → ${gab || '—'} (${GSTAT[status][0]}). A questão tem ${tentDe(q.id).length} tentativa(s).</p>
+      <div class="field mt-3"><label>Motivo</label><input class="input" data-m placeholder="Gabarito definitivo publicado, recurso deferido…"></div>
+      <div class="field mt-3"><label>Tentativas anteriores</label><select class="input" data-r><option value="atual">Recalcular com o gabarito novo (o resultado original fica guardado)</option><option value="original">Manter como foram registradas</option></select></div>`,
+      foot: h`<button class="btn btn-primary" data-ok>Confirmar</button>`, onClose: () => res(null),
+      onMount(sh) { sh.$('[data-ok]').onclick = () => { const m = sh.$('[data-m]').value.trim(); if (!m) { ui.toast('Escreva o motivo.', { error: true }); return; } const r = sh.$('[data-r]').value; res({ motivo: m, regra: r }); sh.close(); }; } });
+  });
+  async function history(q) {
+    let vers = [];
+    try { vers = (await P.api.call('est.noteVersions', { entidade: 'questao', id: q.id })).versoes; } catch (e) { /* sem versões */ }
+    ui.sheet({ title: 'Histórico de ' + q.codigo, body: h`<div class="group-h">Gabaritos</div><div class="list">${(q.gabarito_hist_json || []).slice().reverse().map((x) => h`<div class="li"><span class="main"><span class="t">${x.gabarito || '—'} · ${(GSTAT[x.status] || [x.status])[0]}</span><span class="s">${fmt.date(String(x.em).slice(0, 10))}${x.motivo ? ' · ' + x.motivo : ''}${x.anterior ? ' · antes ' + x.anterior : ''}</span></span></div>`)}</div>
+      <div class="group-h mt-3">Versões do enunciado</div>${vers.length ? h`<div class="list">${vers.map((x) => h`<details class="card pad-lg"><summary>Versão ${x.versao} · ${fmt.date(String(x.em).slice(0, 10))}</summary><p class="muted mt-2" style="white-space:pre-wrap;font-size:13px">${x.conteudo}</p></details>`)}</div>` : h`<p class="muted" style="font-size:13px">Só a versão atual (v${q.versao || 1}).</p>`}` });
+  }
+
+  // ================= Resolução (treino e avaliação) =================
+  function run(ids, modo, titulo) {
+    ids = ids.filter((id) => S.get('est_questoes', id));
+    if (!ids.length) { ui.toast('Nenhuma questão para resolver.'); return; }
+    const sess = E.open();
+    const R = { ids, i: 0, modo, ans: {}, res: {}, prev: {}, ia: {}, cedit: {}, t0: Date.now(), tq: Date.now() };
+    const s = ui.sheet({ title: titulo || (modo === 'treino' ? 'Treino' : 'Avaliação'), size: 'full', wide: true, body: h`<div data-q></div>`, foot: h`<div class="row-sm grow" data-nav></div>`,
+      onClose: () => { if (modo === 'avaliacao' && Object.keys(R.ans).length && !R.fim) ui.toast('Avaliação não finalizada: as respostas não foram registradas.', { error: true }); },
+      onMount(sh) {
+        const draw = () => {
+          const q = S.get('est_questoes', R.ids[R.i]), r = R.res[q.id], a = R.ans[q.id] || {};
+          if (R.fim) return drawFim(sh);
+          const choice = (L, txt) => h`<button type="button" class="alt ${a.resp === L ? 'on' : ''} ${r && r.gabarito === L ? 'ok' : ''} ${r && a.resp === L && r.tentativa.resultado === 'errada' ? 'bad' : ''}" data-alt="${L}" ${raw(r ? 'disabled' : '')}><b>${L}</b><span>${txt}</span></button>`;
+          const ant = r ? [] : tentDe(q.id);
+          const prevBlk = !ant.length ? '' : R.prev[q.id] ? h`<div class="card pad-lg mt-3"><div class="row between"><b>Resposta anterior</b><button type="button" class="btn btn-ghost btn-sm" data-prevans>${icon('eye-off', 'sm')}Ocultar</button></div>
+              <p class="mt-2" style="font-size:13.5px">${ant[0].resposta ? 'Você respondeu ' + String(ant[0].resposta).slice(0, 300) : 'Em branco'} · <span class="chip ${RES[E.res(ant[0])][1]}">${RES[E.res(ant[0])][0]}</span> · ${fmt.date(String(ant[0].created_at).slice(0, 10))}</p>
+              <p class="faint" style="font-size:12px">${ant.length} tentativa(s) registrada(s). Se você responder de novo, a nova resposta passa a valer.</p></div>`
+            : h`<button type="button" class="btn btn-ghost btn-sm mt-3" data-prevans>${icon('eye', 'sm')}Exibir resposta anterior</button>`;
+          const iaOk = !!(E.aiOn && E.aiOn()) && (!!r || (modo === 'treino' && !q.gabarito && q.gabarito_status !== 'anulada')), ir = R.ia[q.id];
+          const iaBtn = iaOk && !ir ? h`<button type="button" class="btn btn-ghost btn-sm" data-ia2>${icon('zap', 'sm')}Resposta por IA</button>` : '';
+          const iaBlk = !iaOk || !ir ? '' : ir === 'loading' ? h`<div class="card pad-lg mt-3"><span class="muted">${icon('zap', 'sm')} A IA está resolvendo…</span><div class="skel mt-2" style="height:60px"></div></div>`
+            : h`<div class="card pad-lg mt-3"><div class="row-sm wrap">${E.aiChip(ir)}${ir.concorda === true ? h`<span class="chip up">igual ao gabarito</span>` : ir.concorda === false ? h`<span class="chip down">diferente do gabarito ${ir.gabarito_cadastrado}</span>` : h`<span class="chip">sem gabarito para comparar</span>`}</div>
+              <p class="mt-2"><b>Resposta da IA: ${ir.resposta || '—'}</b> <span class="faint">· confiança ${ir.confianca}</span></p><div class="note-preview mt-2">${raw(E.md(ir.explicacao || ''))}</div>
+              <div class="row-sm wrap mt-2"><button type="button" class="btn btn-ghost btn-sm" data-iacom>${icon('comment', 'sm')}Usar como comentário</button>${!q.gabarito && (q.tipo === 'multipla' || q.tipo === 'certo_errado') && ir.resposta ? h`<button type="button" class="btn btn-ghost btn-sm" data-iagab>Usar como gabarito preliminar</button>` : ''}</div></div>`;
+          const comBlk = !r ? '' : h`<div class="card pad-lg mt-3"><div class="row between"><b>${icon('comment', 'sm')} Comentário</b>${R.cedit[q.id] ? '' : h`<button type="button" class="btn btn-ghost btn-sm" data-cedit>${q.comentario ? 'Editar' : 'Comentar'}</button>`}</div>
+              ${R.cedit[q.id] ? h`<textarea class="input mt-2" rows="3" data-ctxt aria-label="Comentário">${q.comentario || ''}</textarea><div class="row-sm mt-2"><button type="button" class="btn btn-primary btn-sm" data-csave>Salvar comentário</button><button type="button" class="btn btn-ghost btn-sm" data-ccancel>Cancelar</button></div>`
+                : q.comentario ? h`<p class="mt-2" style="white-space:pre-wrap;font-size:13.5px">${q.comentario}</p>${q.comentario_ia ? h`<span class="chip info mt-2">inclui texto da IA</span>` : ''}` : h`<p class="faint mt-2" style="font-size:12.5px">Sem comentário. Anote a pegadinha, a regra ou por que você errou.</p>`}</div>`;
+          sh.$('[data-q]').innerHTML = P.toHtml(h`<div class="row between mb-2"><span class="faint">${R.i + 1} de ${R.ids.length} · ${q.codigo}${q.banca ? ' · ' + q.banca : ''}${q.ano ? ' ' + q.ano : ''}</span><span class="row-sm">${q.gerada_ia ? h`<span class="chip info">gerada por IA${q.revisar ? ' · a revisar' : ''}</span>` : ''}<span class="chip">${TIPO_Q[q.tipo]}</span></span></div>
+            ${q.gerada_ia && q.revisar ? h`<p class="faint mb-2" style="font-size:12px">Questão e gabarito sugeridos pela IA (preliminar). <button type="button" class="link-btn" data-revok>Marcar como revisada</button></p>` : ''}
+            ${q.texto_base ? h`<details class="card pad-lg mb-3 q-texto" open><summary><b>Texto de apoio</b></summary><div class="mt-2" style="white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:46vh;overflow:auto">${q.texto_base}</div></details>` : ''}
+            <div class="q-enun">${q.enunciado}</div>${q.imagem_arquivo_id ? h`<div class="skel mt-3" style="height:200px" data-qimg="${q.imagem_arquivo_id}"></div>` : ''}
+            ${q.material_id && q.pagina && E.mat(q.material_id) ? h`<button type="button" class="btn btn-ghost btn-sm mt-2" data-act="est.matOpen" data-id="${q.material_id}" data-p="${q.pagina}">${icon('book', 'sm')}Abrir no PDF (p. ${q.pagina})</button>` : ''}
+            <div class="alts mt-3">${q.tipo === 'multipla' ? (q.alternativas_json || []).map((x) => choice(x.letra, x.texto)) : q.tipo === 'certo_errado' ? [choice('C', 'Certo'), choice('E', 'Errado')] : h`<textarea class="input" rows="${q.tipo === 'discursiva' ? 8 : 2}" data-txt ${raw(r ? 'disabled' : '')}>${a.resp || ''}</textarea>`}</div>
+            <div class="row-sm mt-3 wrap"><span class="faint" style="font-size:12.5px">Confiança:</span>${[[1, 'Baixa'], [2, 'Média'], [3, 'Alta']].map(([n, l]) => h`<button type="button" class="fchip ${a.conf === n ? 'on' : ''}" data-conf="${n}" ${raw(r ? 'disabled' : '')}>${l}</button>`)}${!r ? iaBtn : ''}</div>
+            ${prevBlk}
+            ${r ? h`<div class="card pad-lg mt-3 ${r.tentativa.resultado === 'certa' ? 'tint' : ''}"><b>${RES[r.tentativa.resultado][0]}</b>${r.gabarito && q.tipo !== 'discursiva' ? h` · gabarito ${r.gabarito} <span class="chip ${GSTAT[r.gabarito_status][1]}">${GSTAT[r.gabarito_status][0]}</span>` : ''}
+              ${r.explicacao ? h`<p class="mt-2" style="font-size:13.5px;white-space:pre-wrap">${r.explicacao}</p>` : ''}
+              <div class="row-sm mt-3 wrap">${r.tentativa.resultado === 'errada' || r.tentativa.resultado === 'sem_gabarito' ? h`<button type="button" class="btn btn-ghost btn-sm" data-erro>${icon('alert', 'sm')}Caderno de erros</button>` : ''}<button type="button" class="btn btn-ghost btn-sm" data-card>${icon('layers', 'sm')}Flashcard</button><button type="button" class="btn btn-ghost btn-sm" data-duv>${icon('info', 'sm')}${q.duvida ? 'Tirar dúvida' : 'Marcar dúvida'}</button>${iaBtn}${modo === 'treino' ? h`<button type="button" class="btn btn-ghost btn-sm" data-again>${icon('redo', 'sm')}Responder de novo</button>` : ''}</div></div>` : ''}
+            ${iaBlk}${comBlk}
+            ${(q.tipo === 'discursiva' || (q.tipo === 'curta' && !q.gabarito)) && r && r.tentativa.resultado === 'sem_gabarito' ? h`<p class="faint mt-2" style="font-size:12.5px">Sem correção automática. Compare com a explicação e registre sua autoavaliação: <button type="button" class="btn btn-ghost btn-sm" data-auto="certa">Acertei</button> <button type="button" class="btn btn-ghost btn-sm" data-auto="errada">Errei</button></p>` : ''}`);
+          P.$$('[data-qimg]', sh.el).forEach(async (el) => { try { const u = await P.files.url(el.dataset.qimg); el.outerHTML = `<img src="${P.esc(u)}" alt="Imagem do enunciado" style="max-width:100%;border-radius:10px">`; } catch (e) { el.remove(); } });
+          const last = R.i === R.ids.length - 1;
+          sh.$('[data-nav]').innerHTML = P.toHtml(h`<button class="btn btn-ghost" data-prev ${raw(R.i ? '' : 'disabled')}>${icon('chev-l', 'sm')}</button>
+            ${modo === 'treino' && !r ? h`<button class="btn btn-primary grow" data-resp>Responder</button>` : modo === 'treino' ? h`<button class="btn btn-primary grow" data-next>${last ? 'Concluir' : 'Próxima'}</button>` : h`<button class="btn btn-ghost grow" data-next ${raw(last ? 'disabled' : '')}>Próxima</button><button class="btn btn-primary" data-fim>Finalizar (${Object.keys(R.ans).filter((k) => R.ans[k].resp).length}/${R.ids.length})</button>`}
+            ${modo === 'treino' ? '' : h`<button class="btn btn-ghost" data-next2 ${raw(last ? 'disabled' : '')}>${icon('chev-r', 'sm')}</button>`}`);
+        };
+        const save = () => { const q = S.get('est_questoes', R.ids[R.i]); const t = sh.$('[data-txt]'); if (t) { R.ans[q.id] = { ...(R.ans[q.id] || {}), resp: t.value }; } const a = R.ans[q.id] = R.ans[q.id] || {}; a.t = (a.t || 0) + Math.round((Date.now() - R.tq) / 1000); R.tq = Date.now(); };
+        const answer = async (qid, auto) => {
+          const a = R.ans[qid] || {};
+          const r = await P.api.call('est.answer', { questao_id: qid, resposta: a.resp || '', tempo_s: a.t || null, confianca: a.conf || null, modo, sessao_id: sess ? sess.id : null, op_key: a.op || (a.op = P.uuid()), autoavaliacao: auto || null }, { mutation: true });
+          S.put('est_tentativas', r.tentativa); R.res[qid] = r; return r;
+        };
+        sh.el.addEventListener('click', async (e) => {
+          const q = S.get('est_questoes', R.ids[R.i]);
+          const alt = e.target.closest('[data-alt]'); if (alt) { R.ans[q.id] = { ...(R.ans[q.id] || {}), resp: alt.dataset.alt }; draw(); return; }
+          const cf = e.target.closest('[data-conf]'); if (cf) { R.ans[q.id] = { ...(R.ans[q.id] || {}), conf: +cf.dataset.conf }; draw(); return; }
+          if (e.target.closest('[data-prev]')) { save(); R.i--; draw(); return; }
+          if (e.target.closest('[data-next]') || e.target.closest('[data-next2]')) { save(); if (R.i === R.ids.length - 1) { if (modo === 'treino') { R.fim = true; draw(); } return; } R.i++; draw(); return; }
+          if (e.target.closest('[data-resp]')) { save(); const b = e.target.closest('[data-resp]'); b.classList.add('loading'); try { await answer(q.id); } catch (er) { ui.toast(er.message, { error: true }); } draw(); return; }
+          const au = e.target.closest('[data-auto]'); if (au) { try { R.ans[q.id].op = P.uuid(); await answer(q.id, au.dataset.auto); } catch (er) { ui.toast(er.message, { error: true }); } draw(); return; }
+          if (e.target.closest('[data-fim]')) {
+            save();
+            const brancos = R.ids.filter((id) => !(R.ans[id] || {}).resp).length;
+            if (brancos && !(await ui.confirm({ title: 'Finalizar a avaliação?', text: `${brancos} questão(ões) em branco. Elas contam como branco.`, ok: 'Finalizar' }))) return;
+            const btn = e.target.closest('[data-fim]'); btn.classList.add('loading');
+            for (const id of R.ids) { try { await answer(id); } catch (er) { ui.toast(er.message, { error: true }); } }
+            R.fim = true; draw(); return;
+          }
+          if (e.target.closest('[data-erro]')) { try { const r = await P.api.call('est.errorFromAttempt', { questao_id: q.id }, { mutation: true }); S.put('est_erros', r.erro); ui.toast(r.recorrente ? `Erro recorrente (${r.erro.recorrencias}x) atualizado` : 'Erro registrado no caderno'); E.erroEdit(r.erro); } catch (er) { ui.toast(er.message, { error: true }); } return; }
+          if (e.target.closest('[data-card]')) { E.cardEdit(null, { frente: q.enunciado.slice(0, 900), verso: (R.res[q.id] && R.res[q.id].gabarito ? 'Gabarito: ' + R.res[q.id].gabarito + '\n' : '') + (q.explicacao || ''), disciplina_id: q.disciplina_id, assunto_id: q.assunto_id, origem_ref: 'Questão ' + q.codigo }); return; }
+          if (e.target.closest('[data-duv]')) { try { const r = await P.api.call('est.questionSave', { id: q.id, duvida: !q.duvida }, { mutation: true }); S.put('est_questoes', r.questao); draw(); } catch (er) { ui.toast(er.message, { error: true }); } return; }
+          if (e.target.closest('[data-prevans]')) { R.prev[q.id] = !R.prev[q.id]; draw(); return; }
+          if (e.target.closest('[data-again]')) { delete R.res[q.id]; R.ans[q.id] = { conf: (R.ans[q.id] || {}).conf }; R.prev[q.id] = false; R.tq = Date.now(); draw(); return; }
+          if (e.target.closest('[data-cedit]')) { R.cedit[q.id] = true; draw(); const t = sh.$('[data-ctxt]'); if (t) t.focus(); return; }
+          if (e.target.closest('[data-ccancel]')) { R.cedit[q.id] = false; draw(); return; }
+          if (e.target.closest('[data-csave]')) { const b = e.target.closest('[data-csave]'); b.classList.add('loading'); try { const rr = await P.api.call('est.questionComment', { id: q.id, comentario: sh.$('[data-ctxt]').value.trim() }, { mutation: true }); S.put('est_questoes', rr.questao); R.cedit[q.id] = false; ui.toast('Comentário salvo'); } catch (er) { ui.toast(er.message, { error: true }); } draw(); return; }
+          if (e.target.closest('[data-revok]')) { try { const rr = await P.api.call('est.questionSave', { id: q.id, revisar: false }, { mutation: true }); S.put('est_questoes', rr.questao); ui.toast('Marcada como revisada'); } catch (er) { ui.toast(er.message, { error: true }); } draw(); return; }
+          if (e.target.closest('[data-ia2]')) { R.ia[q.id] = 'loading'; draw(); try { R.ia[q.id] = await E.ai({ acao: 'responder', questao_id: q.id }); } catch (er) { delete R.ia[q.id]; ui.toast(er.message, { error: true, duration: 9000 }); } draw(); return; }
+          if (e.target.closest('[data-iacom]')) {
+            const ir = R.ia[q.id], txt = `Resposta da IA${ir.ia ? ' (' + ir.ia.provedor + ' · ' + ir.ia.modelo + ')' : ''}: ${ir.resposta}\n${ir.explicacao || ''}`.trim();
+            const com = q.comentario ? q.comentario + '\n\n' + txt : txt;
+            try { const rr = await P.api.call('est.questionComment', { id: q.id, comentario: com, ia: true }, { mutation: true }); S.put('est_questoes', rr.questao); ui.toast(q.comentario ? 'Resposta da IA acrescentada ao comentário' : 'Resposta da IA salva como comentário'); } catch (er) { ui.toast(er.message, { error: true }); }
+            draw(); return;
+          }
+          if (e.target.closest('[data-iagab]')) {
+            const ir = R.ia[q.id];
+            if (!(await ui.confirm({ title: 'Usar ' + ir.resposta + ' como gabarito preliminar?', text: 'É uma sugestão da IA, não o gabarito oficial. A questão fica "a revisar"; troque pelo oficial quando sair.', ok: 'Usar como preliminar' }))) return;
+            const nt = tentDe(q.id).length;
+            try { const rr = await P.api.call('est.questionSave', { id: q.id, gabarito: ir.resposta, gabarito_status: 'preliminar', revisar: true, ...(nt ? { motivo: 'Gabarito sugerido pela IA' + (ir.ia ? ' (' + ir.ia.modelo + ')' : ''), regra: 'atual' } : {}) }, { mutation: true }); S.put('est_questoes', rr.questao); if (nt) E.reload().catch(() => {}); ui.toast('Gabarito preliminar salvo'); } catch (er) { ui.toast(er.message, { error: true }); }
+            draw(); return;
+          }
+        });
+        sh.el.addEventListener('keydown', (e) => { if (/TEXTAREA|INPUT/.test(e.target.tagName)) return; const q = S.get('est_questoes', R.ids[R.i]); const k = e.key.toUpperCase(); if (!R.res[q.id] && ((q.tipo === 'multipla' && /^[A-E]$/.test(k)) || (q.tipo === 'certo_errado' && /^[CE]$/.test(k)))) { R.ans[q.id] = { ...(R.ans[q.id] || {}), resp: k }; draw(); } });
+        const drawFim = (sh2) => {
+          const tents = R.ids.map((id) => R.res[id] && R.res[id].tentativa).filter(Boolean), o = E.qstats(tents);
+          sh2.$('[data-q]').innerHTML = P.toHtml(h`<h2>${modo === 'treino' ? 'Treino concluído' : 'Resultado da avaliação'}</h2>
+            <div class="grid g3 mt-3"><div class="card">${ui.metric({ label: 'Certas', value: o.certas, size: 'md', cls: 'pos' })}</div><div class="card">${ui.metric({ label: 'Erradas', value: o.erradas, size: 'md' })}</div><div class="card">${ui.metric({ label: 'Precisão', value: o.prec == null ? '—' : fmt.num(o.prec, 1) + '%', size: 'md', sub: `${o.resp} respondidas · ${o.brancos} em branco${o.sem ? ' · ' + o.sem + ' sem gabarito' : ''}` })}</div></div>
+            <div class="list mt-3">${R.ids.map((id, i) => { const q = S.get('est_questoes', id), r = R.res[id]; const res = r ? r.tentativa.resultado : 'branco'; return h`<div class="li"><span class="faint num" style="width:22px">${i + 1}</span><span class="main"><span class="t">${q.codigo} · ${String(q.enunciado).slice(0, 90)}</span><span class="s">sua resposta ${(R.ans[id] || {}).resp || '—'}${r && r.gabarito ? ' · gabarito ' + r.gabarito : ''}${r && r.explicacao ? ' · ' + String(r.explicacao).slice(0, 80) : ''}</span></span><span class="chip ${RES[res][1]}">${RES[res][0]}</span></div>`; })}</div>`);
+          sh2.$('[data-nav]').innerHTML = P.toHtml(h`<button class="btn btn-primary grow" data-close>Fechar</button>`);
+        };
+        draw();
+      } });
+    return s;
+  }
+
+  async function explain(qid) {
+    const s = ui.sheet({ title: 'Explicação (IA)', body: h`<div class="skel" style="height:160px"></div>` });
+    try { const r = await E.ai({ acao: 'explicar', questao_id: qid }); s.setBody(h`<span class="chip info">Gerado por IA · confira</span><p class="mt-3" style="white-space:pre-wrap;font-size:13.5px">${r.texto}</p>`); }
+    catch (e) { s.setBody(h`<p class="muted">${e.message}</p>`); }
+  }
+
+  async function aiCards(src) {
+    const s = ui.sheet({ title: 'Flashcards sugeridos (IA)', size: 'full', body: h`<div class="skel" style="height:200px"></div>` });
+    try {
+      const r = await E.ai({ acao: 'flashcards', ...src });
+      s.setBody(h`<p class="muted" style="font-size:13px"><span class="chip info">Rascunho gerado por IA</span> Fonte: ${r.fonte}. Marque e edite o que quiser guardar.</p><div class="stack mt-3" data-list>${r.rascunhos.map((c, i) => h`<div class="card pad-lg" data-i="${i}"><label class="row-sm"><input type="checkbox" checked> Usar</label><textarea class="input mt-2" rows="2" data-f>${c.frente}</textarea><textarea class="input mt-2" rows="2" data-v>${c.verso}</textarea></div>`)}</div>`);
+      s.setFoot(h`<button class="btn btn-primary" data-ok>Criar cartões</button>`);
+      s.$('[data-ok]').onclick = async () => {
+        const rows = Array.from(s.el.querySelectorAll('[data-i]')).filter((c) => c.querySelector('input').checked).map((c) => ({ baralho: 'IA', frente: c.querySelector('[data-f]').value.trim(), verso: c.querySelector('[data-v]').value.trim(), origem_ref: 'IA · ' + r.fonte, tags: 'gerado-ia' })).filter((x) => x.frente);
+        if (!rows.length) return;
+        await S.saveMany('est_flashcards', rows).catch(() => {}); s.close(); ui.toast(`${rows.length} cartão(ões) criados no baralho IA`);
+      };
+    } catch (e) { s.setBody(h`<p class="muted">${e.message}</p>`); }
+  }
+
+  // ================= Simulados =================
+  function simulados() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.sim', sit = P.flt.get(fk, 'sit', 'todos'), tipo = P.flt.get(fk, 'tipo', '');
+    const all = S.all('est_simulados').sort((a, b) => String(b.fim || b.updated_at).localeCompare(String(a.fim || a.updated_at)));
+    const rows = all.filter((s) => (sit === 'todos' || s.status === sit) && (!tipo || s.tipo === tipo) && P.flt.match(fk, s.titulo));
+    return h`<div class="page-head"><div><h1>Simulados</h1><p>${all.filter((s) => s.status === 'finalizado').length} finalizado(s)</p></div><div class="row-sm wrap"><button class="btn btn-ghost btn-sm" data-act="est.simQuick">${icon('timer', 'sm')}Simulado com tempo</button><button class="btn btn-primary btn-sm" data-act="est.simNew">${icon('plus', 'sm')}Montar por blocos</button></div></div>
+      <div class="filters mb-3"><div class="row-f">${P.flt.chips(fk, 'sit', [['todos', 'Todos'], ['rascunho', 'Rascunhos'], ['em_andamento', 'Em andamento'], ['finalizado', 'Finalizados']], 'todos')}${P.flt.select(fk, 'tipo', [['simulado', 'Simulados'], ['prova_real', 'Provas reais']], 'Simulados e provas')}</div></div>
+      ${rows.length ? h`<div class="list cardlist">${rows.map((s) => { const t = (s.resultado_json || {}).total; return h`<div class="li"><span class="tile sm">${icon(s.tipo === 'prova_real' ? 'trophy' : 'flag', 'sm')}</span><span class="main tap" data-act="est.simOpen" data-id="${s.id}"><span class="t">${s.titulo}</span><span class="s">${s.tipo === 'prova_real' ? 'Prova real · ' : ''}${s.status === 'finalizado' ? `${fmt.date(String(s.fim).slice(0, 10))} · nota ${fmt.num(t.nota, 2)}/${fmt.num(t.max, 2)} (${t.pct == null ? '—' : fmt.num(t.pct, 1) + '%'})` : s.status === 'em_andamento' ? 'em andamento · ' + fmt.date(String(s.inicio).slice(0, 10)) : 'rascunho'}${s.duracao_min ? ' · ' + s.duracao_min + ' min' : ''}</span></span>
+        ${s.status === 'finalizado' ? h`<button class="btn btn-ghost btn-sm" data-act="est.simDup" data-id="${s.id}">${icon('copy', 'sm')}Refazer</button>` : h`<button class="btn btn-primary btn-sm" data-act="est.simRun" data-id="${s.id}">${icon('play', 'sm')}${s.status === 'em_andamento' ? 'Continuar' : 'Iniciar'}</button>`}${s.status !== 'em_andamento' ? h`<button class="btn-icon sm" data-act="est.simEdit" data-id="${s.id}" aria-label="Editar">${icon('edit', 'sm')}</button>` : ''}</div>`; })}</div>`
+        : ui.empty({ ill: 'calendar', title: all.length ? 'Nada neste filtro' : 'Nenhum simulado', text: 'Monte provas por blocos (disciplina, assunto, banca, quantidade, peso e mínimo) ou a partir de uma lista. As regras de pontuação são suas: o Prumo não supõe penalização pela banca.', action: { act: 'est.simNew', label: 'Novo simulado' } })}`;
+  }
+
+  function simEdit(sim, base) {
+    const isNew = !sim;
+    const s0 = sim || base || { titulo: 'Simulado ' + fmt.date(D.today()), tipo: 'simulado', duracao_min: 120, regras_json: { acerto: 1, erro: 0, branco: 0, anulada: 'pontua' }, composicao_json: { blocos: [{ nome: 'Bloco 1', qtd: 10, peso: 1 }] }, concurso_id: E.ctx() || null };
+    let blocos = JSON.parse(JSON.stringify((s0.composicao_json || {}).blocos || [])), listaId = (s0.composicao_json || {}).lista_id || '';
+    const rg = s0.regras_json || {};
+    const discOpts = E.disciplinas(), listas = S.all('est_listas');
+    const drawB = () => h`${blocos.map((b, i) => h`<div class="card pad-lg" data-b="${i}"><div class="grid g3"><div class="field"><label>Nome</label><input class="input sm" data-k="nome" value="${b.nome || ''}"></div>
+      <div class="field"><label>Disciplina</label><select class="input sm" data-k="disciplina_id"><option value="">Todas</option>${discOpts.map((d) => h`<option value="${d.id}" ${d.id === b.disciplina_id ? raw('selected') : ''}>${d.nome}</option>`)}</select></div>
+      <div class="field"><label>Assunto</label><select class="input sm" data-k="assunto_id"><option value="">Todos</option>${(b.disciplina_id ? E.assuntosDe(b.disciplina_id) : []).map((a) => h`<option value="${a.id}" ${a.id === b.assunto_id ? raw('selected') : ''}>${a.titulo}</option>`)}</select></div>
+      <div class="field"><label>Banca</label><input class="input sm" data-k="banca" value="${b.banca || ''}"></div><div class="field"><label>Questões</label><input class="input sm num" data-k="qtd" value="${b.qtd || 10}"></div><div class="field"><label>Peso</label><input class="input sm num" data-k="peso" value="${b.peso || 1}"></div>
+      <div class="field"><label>Mínimo do bloco (pontos)</label><input class="input sm num" data-k="minimo" value="${b.minimo ?? ''}"></div><label class="row-sm"><input type="checkbox" data-k="ineditas" ${raw(b.ineditas ? 'checked' : '')}> Só inéditas</label>
+      <span class="faint" style="font-size:12px">${disponiveis(b)} questão(ões) com gabarito disponíveis</span></div><button type="button" class="btn btn-ghost btn-sm mt-2" data-bdel>${icon('trash', 'sm')}Remover bloco</button></div>`)}<button type="button" class="btn btn-ghost btn-sm" data-badd>${icon('plus', 'sm')}Bloco</button>`;
+    ui.sheet({ title: isNew ? 'Novo simulado' : 'Editar simulado', size: 'full', wide: true,
+      body: h`<form class="form" novalidate data-f><div class="field full"><label>Título</label><input class="input" name="titulo" value="${s0.titulo}"></div>
+        <div class="field half"><label>Tipo</label><select class="input" name="tipo"><option value="simulado" ${raw(s0.tipo === 'simulado' ? 'selected' : '')}>Simulado</option><option value="prova_real" ${raw(s0.tipo === 'prova_real' ? 'selected' : '')}>Prova real (resolver ou lançar)</option></select></div>
+        <div class="field half"><label>Concurso</label><select class="input" name="concurso_id"><option value="">Nenhum</option>${E.concursos().map((c) => h`<option value="${c.id}" ${raw(c.id === s0.concurso_id ? 'selected' : '')}>${c.nome}</option>`)}</select></div>
+        <div class="field half"><label>Duração (min)</label><input class="input num" name="duracao_min" value="${s0.duracao_min || ''}"></div>
+        <div class="field full"><span class="label">Regras de pontuação (informadas por você)</span><div class="grid g4"><div class="field"><label>Acerto</label><input class="input num" name="acerto" value="${rg.acerto ?? 1}"></div><div class="field"><label>Erro</label><input class="input num" name="erro" value="${rg.erro ?? 0}"></div><div class="field"><label>Branco</label><input class="input num" name="branco" value="${rg.branco ?? 0}"></div><div class="field"><label>Mínimo total</label><input class="input num" name="minimo_total" value="${rg.minimo_total ?? ''}"></div></div>
+          <div class="field mt-2"><label>Questão anulada</label><select class="input" name="anulada"><option value="pontua" ${raw(rg.anulada === 'pontua' ? 'selected' : '')}>Pontua para todos</option><option value="desconsidera" ${raw(rg.anulada === 'desconsidera' ? 'selected' : '')}>É desconsiderada (sai da nota máxima)</option><option value="zero" ${raw(rg.anulada === 'zero' ? 'selected' : '')}>Vale zero</option></select></div>
+          <span class="hint">Ex.: CEBRASPE costuma usar erro = −1 anulando um acerto, mas confira no seu edital: o Prumo não supõe pela banca.</span></div>
+        <div class="field full"><span class="label">Composição</span><select class="input" name="lista"><option value="">Por blocos</option>${listas.map((l) => h`<option value="${l.id}" ${raw(l.id === listaId ? 'selected' : '')}>Lista: ${l.nome} (${listIds(l).length})</option>`)}</select></div>
+        <div class="field full stack" data-blocos ${raw(listaId ? 'hidden' : '')}>${drawB()}</div></form>`,
+      foot: h`<button class="btn btn-primary" data-save>Salvar</button>`,
+      onMount(sh) {
+        const f = sh.$('[data-f]'), box = sh.$('[data-blocos]');
+        const sync = () => { box.querySelectorAll('[data-b]').forEach((c) => { const b = blocos[+c.dataset.b]; c.querySelectorAll('[data-k]').forEach((i) => { b[i.dataset.k] = i.type === 'checkbox' ? i.checked : ['qtd', 'peso', 'minimo'].includes(i.dataset.k) ? (i.value === '' ? null : P.parseNum(i.value)) : i.value || null; }); }); };
+        box.addEventListener('change', (e) => { sync(); if (e.target.dataset.k === 'disciplina_id' || e.target.dataset.k === 'banca' || e.target.dataset.k === 'ineditas') box.innerHTML = P.toHtml(drawB()); });
+        box.addEventListener('click', (e) => { if (e.target.closest('[data-badd]')) { sync(); blocos.push({ nome: 'Bloco ' + (blocos.length + 1), qtd: 10, peso: 1 }); box.innerHTML = P.toHtml(drawB()); } const d = e.target.closest('[data-bdel]'); if (d) { sync(); blocos.splice(+d.closest('[data-b]').dataset.b, 1); box.innerHTML = P.toHtml(drawB()); } });
+        f.lista.addEventListener('change', () => { listaId = f.lista.value; box.hidden = !!listaId; });
+        sh.$('[data-save]').onclick = async () => {
+          sync();
+          const num = (v, d) => (v === '' || v == null ? d : P.parseNum(v));
+          const row = { id: sim && sim.id, titulo: f.titulo.value.trim() || 'Simulado', tipo: f.tipo.value, concurso_id: f.concurso_id.value || null, duracao_min: +f.duracao_min.value || null, status: 'rascunho', equivalente_a: (base && (base.equivalente_a || base.id)) || (sim && sim.equivalente_a) || null,
+            regras_json: { acerto: num(f.acerto.value, 1), erro: num(f.erro.value, 0), branco: num(f.branco.value, 0), anulada: f.anulada.value, minimo_total: f.minimo_total.value === '' ? null : num(f.minimo_total.value, null) },
+            composicao_json: listaId ? { lista_id: listaId, questao_ids: listIds(S.get('est_listas', listaId)), bloco: 'Lista' } : { blocos: blocos.filter((b) => +b.qtd > 0) } };
+          if (!listaId && !row.composicao_json.blocos.length) { ui.toast('Adicione um bloco com questões.', { error: true }); return; }
+          await S.save('est_simulados', row, { toast: 'Simulado salvo' }).catch(() => {}); sh.close();
+        };
+      } });
+  }
+  const disponiveis = (b) => { const feitas = new Set(S.all('est_tentativas').map((t) => t.questao_id)); return S.all('est_questoes').filter((q) => (q.tipo === 'multipla' || q.tipo === 'certo_errado') && (q.gabarito || q.gabarito_status === 'anulada') && (!b.disciplina_id || q.disciplina_id === b.disciplina_id) && (!b.assunto_id || q.assunto_id === b.assunto_id) && (!b.banca || P.norm(q.banca) === P.norm(b.banca)) && (!b.ineditas || !feitas.has(q.id))).length; };
+
+  /** Simulado rápido com tempo: quantidade, minutos, origem (aleatórias, filtro, erradas, inéditas), concurso, área, disciplinas e tipo. */
+  function simQuick() {
+    const lm = lastMap(), filt = filtered('est.q', lm).filter((q) => (q.tipo === 'multipla' || q.tipo === 'certo_errado') && (q.gabarito || q.gabarito_status === 'anulada'));
+    const areas = E.areas(), discs = E.disciplinas();
+    const v = { titulo: 'Simulado ' + fmt.date(D.today()) + ' ' + D.time(), qtd: Math.min(20, Math.max(5, filt.length || 20)), min: 30, origem: st.sel.size ? 'selecao' : 'aleatorias', conc: '', area: '', tipo: '', discs: new Set(), acerto: 1, erro: 0, branco: 0 };
+    const pool = () => {
+      if (v.origem === 'selecao') return [...st.sel].map((id) => S.get('est_questoes', id)).filter((q) => q && (q.tipo === 'multipla' || q.tipo === 'certo_errado') && (q.gabarito || q.gabarito_status === 'anulada'));
+      if (v.origem === 'filtro') return filt;
+      return S.all('est_questoes').filter((q) => (q.tipo === 'multipla' || q.tipo === 'certo_errado') && (q.gabarito || q.gabarito_status === 'anulada')
+        && (!v.conc || q.concurso_id === v.conc) && (!v.area || P.norm(areaDe(q)) === P.norm(v.area)) && (!v.tipo || q.tipo === v.tipo) && (!v.discs.size || v.discs.has(q.disciplina_id))
+        && (v.origem !== 'erradas' || (lm[q.id] && E.res(lm[q.id].t) === 'errada')) && (v.origem !== 'ineditas' || !lm[q.id]));
+    };
+    const body = () => h`<form class="form" novalidate data-f>
+      <div class="field full"><label>Título</label><input class="input" data-k="titulo" value="${v.titulo}"></div>
+      <div class="field half"><label>Quantas questões</label><input class="input num" data-k="qtd" inputmode="numeric" value="${v.qtd}"></div>
+      <div class="field half"><label>Tempo (minutos)</label><input class="input num" data-k="min" inputmode="numeric" value="${v.min}"><span class="hint">0 = sem limite (cronômetro corre)</span></div>
+      <div class="field full"><label>Quais questões</label><select class="input" data-k="origem">${[['aleatorias', 'Aleatórias do banco'], ['erradas', 'Só as que errei (última resposta)'], ['ineditas', 'Só inéditas'], ['filtro', `Do filtro atual da tela (${filt.length})`]].concat(st.sel.size ? [['selecao', `As selecionadas (${st.sel.size})`]] : []).map(([k, l]) => h`<option value="${k}" ${raw(k === v.origem ? 'selected' : '')}>${l}</option>`)}</select></div>
+      ${v.origem === 'filtro' || v.origem === 'selecao' ? '' : h`<div class="field half"><label>Concurso</label><select class="input" data-k="conc"><option value="">Qualquer</option>${E.concursos().map((c) => h`<option value="${c.id}" ${raw(c.id === v.conc ? 'selected' : '')}>${c.nome}</option>`)}</select></div>
+        <div class="field half"><label>Tipo de concurso (área)</label><select class="input" data-k="area"><option value="">Qualquer</option>${areas.map((a) => h`<option ${raw(a === v.area ? 'selected' : '')}>${a}</option>`)}</select></div>
+        <div class="field full"><label>Tipo de questão</label><select class="input" data-k="tipo"><option value="">Múltipla escolha e certo/errado</option><option value="multipla" ${raw(v.tipo === 'multipla' ? 'selected' : '')}>Só múltipla escolha</option><option value="certo_errado" ${raw(v.tipo === 'certo_errado' ? 'selected' : '')}>Só certo ou errado</option></select></div>
+        ${discs.length ? h`<div class="field full"><span class="label">Disciplinas (nenhuma marcada = todas)</span><div class="row-sm wrap">${discs.map((d) => h`<button type="button" class="fchip ${v.discs.has(d.id) ? 'on' : ''}" data-disc="${d.id}">${d.nome}</button>`)}</div></div>` : ''}`}
+      <div class="field full"><span class="label">Pontuação (do seu edital)</span><div class="grid g3"><div class="field"><label>Acerto</label><input class="input num" data-k="acerto" value="${v.acerto}"></div><div class="field"><label>Erro</label><input class="input num" data-k="erro" value="${v.erro}"></div><div class="field"><label>Branco</label><input class="input num" data-k="branco" value="${v.branco}"></div></div><span class="hint">O Prumo não supõe penalização pela banca: confira no edital.</span></div>
+      <p class="full ${pool().length < (+v.qtd || 0) ? '' : 'faint'}" style="font-size:12.5px" data-disp>${pool().length} questão(ões) com gabarito disponíveis${pool().length < (+v.qtd || 0) ? ': o simulado sai com menos questões' : ''}.</p></form>`;
+    ui.sheet({ title: 'Simulado com tempo', size: 'full', body: h`<div data-b>${body()}</div>`, foot: h`<button class="btn btn-primary grow" data-go>${icon('play', 'sm')}Começar</button>`,
+      onMount(sh) {
+        const box = sh.$('[data-b]');
+        const sync = () => { P.$$('[data-k]', box).forEach((i) => { const k = i.dataset.k; v[k] = ['qtd', 'min', 'acerto', 'erro', 'branco'].includes(k) ? (i.value === '' ? '' : P.parseNum(i.value)) : i.value; }); };
+        const redraw = () => { box.innerHTML = P.toHtml(body()); };
+        box.addEventListener('change', (e) => { sync(); if (e.target.matches('select')) redraw(); else { const el = sh.$('[data-disp]'); const n = pool().length; el.textContent = `${n} questão(ões) com gabarito disponíveis${n < (+v.qtd || 0) ? ': o simulado sai com menos questões' : ''}.`; } });
+        box.addEventListener('click', (e) => { const d = e.target.closest('[data-disc]'); if (!d) return; sync(); v.discs.has(d.dataset.disc) ? v.discs.delete(d.dataset.disc) : v.discs.add(d.dataset.disc); redraw(); });
+        sh.$('[data-go]').onclick = async (ev) => {
+          sync();
+          const n = Math.round(+v.qtd || 0), list = pool();
+          if (!(n >= 1 && n <= 300)) { ui.toast('Escolha de 1 a 300 questões.', { error: true }); return; }
+          if (!list.length) { ui.toast('Nenhuma questão com gabarito nesse filtro.', { error: true }); return; }
+          const regras = { acerto: v.acerto === '' ? 1 : v.acerto, erro: v.erro === '' ? 0 : v.erro, branco: v.branco === '' ? 0 : v.branco, anulada: 'pontua' };
+          const comp = v.origem === 'filtro' || v.origem === 'selecao'
+            ? { questao_ids: list.map((q) => [Math.random(), q.id]).sort((a, b) => a[0] - b[0]).slice(0, n).map((x) => x[1]), bloco: v.origem === 'filtro' ? 'Filtro' : 'Seleção' }
+            : { blocos: [{ nome: 'Simulado', qtd: Math.min(n, list.length), peso: 1, concurso_id: v.conc || null, area: v.area || null, tipo_questao: v.tipo || null, disciplinas: [...v.discs], erradas: v.origem === 'erradas', ineditas: v.origem === 'ineditas' }] };
+          ev.currentTarget.classList.add('loading');
+          try {
+            const sim = await S.save('est_simulados', { titulo: String(v.titulo || '').trim() || 'Simulado', tipo: 'simulado', concurso_id: v.conc || E.ctx() || null, duracao_min: Math.round(+v.min || 0) || null, status: 'rascunho', regras_json: regras, composicao_json: comp });
+            sh.close(); simRun(sim.id);
+          } catch (e) { ev.currentTarget && ev.currentTarget.classList.remove('loading'); }
+        };
+      } });
+  }
+
+  /** Resolução do simulado: cartão-resposta, marcação para revisar, cronômetro, salvamento progressivo e retomada. */
+  async function simRun(id) {
+    let data;
+    try { data = await P.api.call('est.simStart', { simulado_id: id }, { mutation: true, timeout: 120000 }); }
+    catch (e) { if (/pediu \d+ questões/.test(e.message) && await ui.confirm({ title: 'Faltam questões', text: e.message + ' Montar com as disponíveis?', ok: 'Montar assim' })) { try { data = await P.api.call('est.simStart', { simulado_id: id, aceitar_menos: true }, { mutation: true, timeout: 120000 }); } catch (e2) { ui.toast(e2.message, { error: true }); return; } } else { ui.toast(e.message, { error: true }); return; } }
+    S.put('est_simulados', data.simulado); data.itens.forEach((x) => S.put('est_simulado_itens', x));
+    const sim = data.simulado, itens = data.itens.sort((a, b) => a.ordem - b.ordem), qs = Object.fromEntries(data.questoes.map((q) => [q.id, q]));
+    const R = { i: 0, resp: Object.fromEntries(itens.map((x) => [x.id, { resposta: x.resposta || '', marcada: !!x.marcada, tempo_s: +x.tempo_s || 0 }])), dirty: new Set(), tq: Date.now(), timer: null, saveT: null, salvando: false };
+    const lim = sim.duracao_min ? new Date(sim.inicio).getTime() + sim.duracao_min * 60000 : null;
+    let flush = () => {};
+    const s = ui.sheet({ title: sim.titulo, size: 'full', wide: true, headExtra: h`<span class="num chip" data-clock></span><span class="faint" data-saved style="font-size:12px"></span>`,
+      body: h`<div class="sim-grid" data-grid></div><div class="mt-3" data-q></div>`, foot: h`<button class="btn btn-ghost" data-prev>${icon('chev-l', 'sm')}</button><button class="btn btn-ghost" data-mark>${icon('flag', 'sm')}Marcar</button><button class="btn btn-ghost grow" data-next>Próxima</button><button class="btn btn-primary" data-fim>Finalizar</button>`,
+      onClose: () => { clearInterval(R.timer); clearInterval(R.saveT); R.fechado = true; if (R.dirty.size) { flush(); ui.toast('Simulado pausado. Suas respostas ficam salvas; continue pela lista de simulados.'); } },
+      onMount(sh) {
+        const cur = () => itens[R.i];
+        const tick = () => { const now = Date.now(); const el = sh.$('[data-clock]'); if (!el) return; if (lim) { const left = Math.max(0, Math.round((lim - now) / 1000)); el.textContent = 'restam ' + clk(left); el.classList.toggle('down', left < 600); if (!left && !R.avisado) { R.avisado = true; ui.toast('Tempo esgotado. Finalize quando quiser (o tempo extra fica registrado).', { error: true, duration: 9000 }); } } else el.textContent = clk(Math.round((now - new Date(sim.inicio).getTime()) / 1000)); };
+        const acc = () => { const it = cur(); R.resp[it.id].tempo_s += Math.round((Date.now() - R.tq) / 1000); R.tq = Date.now(); R.dirty.add(it.id); };
+        const drawGrid = () => { sh.$('[data-grid]').innerHTML = P.toHtml(itens.map((it, i) => { const r = R.resp[it.id]; return h`<button type="button" class="sg ${i === R.i ? 'cur' : ''} ${r.resposta ? 'ans' : ''} ${r.marcada ? 'mark' : ''}" data-go="${i}" aria-label="Questão ${i + 1}${r.resposta ? ', respondida ' + r.resposta : ''}${r.marcada ? ', marcada' : ''}">${i + 1}${r.resposta ? h`<small>${r.resposta}</small>` : ''}</button>`; })); };
+        const drawQ = () => {
+          const it = cur(), q = qs[it.questao_id] || {}, r = R.resp[it.id];
+          const opt = (L, t) => h`<button type="button" class="alt ${r.resposta === L ? 'on' : ''}" data-alt="${L}"><b>${L}</b><span>${t}</span></button>`;
+          sh.$('[data-q]').innerHTML = P.toHtml(h`<div class="row between mb-2"><span class="faint">${R.i + 1} de ${itens.length} · ${it.bloco}${+it.peso !== 1 ? ' · peso ' + fmt.num(it.peso, 1) : ''}</span>${r.marcada ? h`<span class="chip info">marcada para revisar</span>` : ''}</div>${q.texto_base ? h`<details class="card pad-lg mb-3" open><summary><b>Texto de apoio</b></summary><div class="mt-2" style="white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:46vh;overflow:auto">${q.texto_base}</div></details>` : ''}<div class="q-enun">${q.enunciado || ''}</div>${q.imagem_arquivo_id ? h`<div class="skel mt-3" style="height:200px" data-qimg="${q.imagem_arquivo_id}"></div>` : ''}
+            <div class="alts mt-3">${q.tipo === 'certo_errado' ? [opt('C', 'Certo'), opt('E', 'Errado')] : (q.alternativas_json || []).map((a) => opt(a.letra, a.texto))}</div>${r.resposta ? h`<button type="button" class="btn btn-ghost btn-sm mt-2" data-clear>Deixar em branco</button>` : ''}`);
+          sh.$('[data-mark]').classList.toggle('on', r.marcada); sh.$('[data-prev]').disabled = R.i === 0; sh.$('[data-next]').disabled = R.i === itens.length - 1;
+          drawGrid();
+          P.$$('[data-qimg]', sh.el).forEach(async (el) => { try { const u = await P.files.url(el.dataset.qimg); el.outerHTML = `<img src="${P.esc(u)}" alt="Imagem da questão" style="max-width:100%;border-radius:10px">`; } catch (e) { el.remove(); } });
+        };
+        const flushNow = async () => { if (!R.dirty.size || R.salvando) return; R.salvando = true; const ids = [...R.dirty]; R.dirty.clear(); const respostas = Object.fromEntries(ids.map((k) => [k, R.resp[k]])); const lab = (t) => { const el = sh.$('[data-saved]'); if (el) el.textContent = t; }; lab('salvando…'); try { await P.api.call('est.simSave', { simulado_id: sim.id, respostas }, { mutation: true }); lab('salvo ' + D.time()); } catch (e) { ids.forEach((k) => R.dirty.add(k)); lab('falha ao salvar: tentando de novo'); if (R.fechado) ui.toast('Não consegui salvar as últimas respostas do simulado: ' + e.message, { error: true }); } R.salvando = false; };
+        flush = flushNow;
+        R.timer = setInterval(() => { tick(); }, 1000); tick();
+        R.saveT = setInterval(() => { acc(); flushNow(); }, 20000);
+        sh.el.addEventListener('click', async (e) => {
+          const it = cur();
+          const a = e.target.closest('[data-alt]'); if (a) { R.resp[it.id].resposta = a.dataset.alt; R.dirty.add(it.id); drawQ(); return; }
+          if (e.target.closest('[data-clear]')) { R.resp[it.id].resposta = ''; R.dirty.add(it.id); drawQ(); return; }
+          const go = e.target.closest('[data-go]'); if (go) { acc(); R.i = +go.dataset.go; drawQ(); return; }
+          if (e.target.closest('[data-prev]')) { acc(); R.i--; drawQ(); flushNow(); return; }
+          if (e.target.closest('[data-next]')) { acc(); R.i++; drawQ(); flushNow(); return; }
+          if (e.target.closest('[data-mark]')) { R.resp[it.id].marcada = !R.resp[it.id].marcada; R.dirty.add(it.id); drawQ(); return; }
+          if (e.target.closest('[data-fim]')) {
+            acc();
+            const br = itens.filter((x) => !R.resp[x.id].resposta).length, mk = itens.filter((x) => R.resp[x.id].marcada).length;
+            if (!(await ui.confirm({ title: 'Finalizar o simulado?', text: `${br} em branco · ${mk} marcada(s) para revisar. Depois de finalizar, a prova não muda mais.`, ok: 'Finalizar' }))) return;
+            const btn = e.target.closest('[data-fim]'); btn.classList.add('loading');
+            try {
+              const respostas = Object.fromEntries(itens.map((x) => [x.id, R.resp[x.id]]));
+              const r = await P.api.call('est.simFinish', { simulado_id: sim.id, respostas }, { mutation: true, timeout: 120000 });
+              S.put('est_simulados', r.simulado); r.itens.forEach((x) => S.put('est_simulado_itens', x)); clearInterval(R.timer); clearInterval(R.saveT); R.dirty.clear();
+              st.gab = r.gabaritos; sh.close(); E.reload().catch(() => {}); P.router.go('est/simulado/' + sim.id);
+            } catch (er) { btn.classList.remove('loading'); ui.toast(er.message, { error: true }); }
+          }
+        });
+        sh.el.addEventListener('keydown', (e) => { if (/INPUT|TEXTAREA/.test(e.target.tagName)) return; const k = e.key.toUpperCase(); if (/^[A-E]$/.test(k)) { R.resp[cur().id].resposta = k; R.dirty.add(cur().id); drawQ(); } if (e.key === 'ArrowRight' && R.i < itens.length - 1) { acc(); R.i++; drawQ(); } if (e.key === 'ArrowLeft' && R.i > 0) { acc(); R.i--; drawQ(); } });
+        drawQ();
+      } });
+    return s;
+  }
+  const clk = (sec) => `${Math.floor(sec / 3600)}:${String(Math.floor((sec % 3600) / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`;
+
+  function simResult(ctx) {
+    const g = E.gate(); if (g) return g;
+    const sim = S.get('est_simulados', ctx.params.id);
+    if (!sim) return ui.empty({ ill: 'search', title: 'Simulado não encontrado' });
+    if (sim.status !== 'finalizado') return h`<div class="page-head"><div><a href="#/est/simulados" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Simulados</a><h1 class="mt-2">${sim.titulo}</h1></div></div><button class="btn btn-primary" data-act="est.simRun" data-id="${sim.id}">${icon('play', 'sm')}${sim.status === 'em_andamento' ? 'Continuar' : 'Iniciar'}</button>`;
+    const rj = sim.resultado_json || {}, t = rj.total || {}, rg = rj.regras || {};
+    const itens = S.where('est_simulado_itens', (x) => x.simulado_id === sim.id).sort((a, b) => a.ordem - b.ordem);
+    const eq = S.where('est_simulados', (x) => x.status === 'finalizado' && x.id !== sim.id && ((sim.equivalente_a && (x.id === sim.equivalente_a || x.equivalente_a === sim.equivalente_a)) || x.equivalente_a === sim.id)).concat([sim]).sort((a, b) => (a.fim < b.fim ? -1 : 1));
+    const pct = (v) => (v == null ? '—' : fmt.num(v, 1) + '%');
+    return h`<div class="page-head"><div><a href="#/est/simulados" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Simulados</a><h1 class="mt-2">${sim.titulo}</h1><p>${sim.tipo === 'prova_real' ? 'Prova real · ' : ''}${fmt.date(String(sim.fim).slice(0, 10))} · ${clk(sim.tempo_s || 0)} de prova</p></div><button class="btn btn-ghost btn-sm" data-act="est.simDup" data-id="${sim.id}">${icon('copy', 'sm')}Refazer</button></div>
+      <div class="grid g4"><div class="card">${ui.metric({ label: 'Nota', value: `${fmt.num(t.nota, 2)} / ${fmt.num(t.max, 2)}`, size: 'md', sub: pct(t.pct) + ' do máximo' })}</div><div class="card">${ui.metric({ label: 'Certas · erradas · brancos', value: `${t.acertos} · ${t.erros} · ${t.brancos}`, size: 'md', sub: t.anuladas ? t.anuladas + ' anulada(s)' : 'nenhuma anulada' })}</div>
+        <div class="card">${ui.metric({ label: 'Precisão nas respondidas', value: pct(t.precisao), size: 'md', sub: `${t.respondidas} respondidas` })}</div><div class="card">${ui.metric({ label: 'Mínimos', value: t.aprovado_criterios ? 'Atingidos' : 'Não atingidos', size: 'md', cls: t.aprovado_criterios ? 'pos' : '', sub: t.minimo_total != null ? `mínimo total ${fmt.num(t.minimo_total, 2)}` : 'sem mínimo total' })}</div></div>
+      <p class="faint mt-2" style="font-size:12px">Regras: acerto ${rg.acerto}, erro ${rg.erro}, branco ${rg.branco}, anulada ${({ pontua: 'pontua para todos', desconsidera: 'desconsiderada', zero: 'vale zero' })[rg.anulada]}. Tempo médio ${t.tempo_medio_s || 0} s por questão. A correção usa o gabarito congelado no início da prova.</p>
+      <div class="card mt-3"><div class="ed-table"><table class="table"><thead><tr><th>Bloco</th><th class="r">Nota</th><th class="r">Certas</th><th class="r">Erradas</th><th class="r">Brancos</th><th class="r">Mínimo</th></tr></thead><tbody>${(rj.blocos || []).map((b) => h`<tr><td>${b.bloco}</td><td class="r num">${fmt.num(b.nota, 2)} / ${fmt.num(b.max, 2)}</td><td class="r num">${b.acertos}</td><td class="r num">${b.erros}</td><td class="r num">${b.brancos}</td><td class="r">${b.minimo == null ? '—' : h`<span class="chip ${b.atingiu_minimo ? 'up' : 'down'}">${fmt.num(b.minimo, 2)}</span>`}</td></tr>`)}</tbody></table></div></div>
+      ${eq.length > 1 ? h`<div class="card pad-lg mt-3"><b>Comparação com simulados equivalentes</b><div class="list mt-2">${eq.map((x) => h`<a class="li tap" href="#/est/simulado/${x.id}"><span class="main"><span class="t">${x.titulo}${x.id === sim.id ? ' (este)' : ''}</span><span class="s">${fmt.date(String(x.fim).slice(0, 10))}</span></span><span class="v num">${pct(((x.resultado_json || {}).total || {}).pct)}</span></a>`)}</div></div>` : ''}
+      <div class="section-title"><h2>Correção</h2></div>
+      <div class="list cardlist">${itens.map((it, i) => { const q = S.getAny('est_questoes', it.questao_id) || {}, gnow = q.gabarito, mudou = q.gabarito_status === 'anulada' && it.status_snapshot !== 'anulada' ? 'A questão foi anulada depois da prova.' : gnow && gnow !== it.gabarito_snapshot ? `O gabarito mudou depois da prova: hoje é ${gnow} (${(GSTAT[q.gabarito_status] || [''])[0]}).` : ''; return h`<details class="li" style="display:block"><summary class="row-sm" style="cursor:pointer"><span class="faint num" style="width:22px">${i + 1}</span><span class="grow">${q.codigo || ''} · ${String(q.enunciado || '').slice(0, 90)}</span><span class="chip ${RES[it.resultado] ? RES[it.resultado][1] : ''}">${RES[it.resultado] ? RES[it.resultado][0] : it.resultado}</span></summary>
+        <div class="mt-2" style="font-size:13.5px"><p style="white-space:pre-wrap">${q.enunciado || ''}</p><p class="mt-2">Sua resposta: <b>${it.resposta || '—'}</b> · gabarito usado: <b>${it.gabarito_snapshot || '—'}</b> (versão ${it.questao_versao})${it.tempo_s ? ' · ' + it.tempo_s + ' s' : ''}</p>${mudou ? h`<p class="chip info mt-2" style="white-space:normal;height:auto;padding:6px 10px">${mudou} O resultado desta prova não muda.</p>` : ''}${q.explicacao ? h`<p class="muted mt-2" style="white-space:pre-wrap">${q.explicacao}</p>` : ''}
+        ${it.resultado === 'errada' ? h`<button class="btn btn-ghost btn-sm mt-2" data-act="est.qErro" data-id="${q.id}">${icon('alert', 'sm')}Caderno de erros</button>` : ''}</div></details>`; })}</div>`;
+  }
+
+  // ================= Importação (XLSX/CSV) =================
+  const CAMPOS = {
+    questoes: [['codigo', 'Código'], ['tipo', 'Tipo (multipla, C/E, curta, discursiva)'], ['enunciado', 'Enunciado *'], ['a', 'A'], ['b', 'B'], ['c', 'C'], ['d', 'D'], ['e', 'E'], ['gabarito', 'Gabarito'], ['gabarito_status', 'Situação do gabarito'], ['explicacao', 'Explicação'], ['banca', 'Banca'], ['orgao', 'Órgão'], ['cargo', 'Cargo'], ['ano', 'Ano'], ['disciplina', 'Disciplina'], ['assunto', 'Assunto'], ['dificuldade', 'Dificuldade'], ['fonte', 'Fonte'], ['tags', 'Etiquetas'], ['concurso', 'Concurso (nome)'], ['area', 'Tipo de concurso (área)'], ['texto_base', 'Texto de apoio'], ['pagina', 'Página']],
+    flashcards: [['baralho', 'Baralho'], ['frente', 'Frente *'], ['verso', 'Verso'], ['disciplina', 'Disciplina'], ['assunto', 'Assunto'], ['tags', 'Etiquetas']],
+    assuntos: [['disciplina', 'Disciplina *'], ['assunto', 'Assunto *'], ['subassunto', 'Subassunto'], ['item_ref', 'Item do edital'], ['pagina', 'Página'], ['peso', 'Peso'], ['qtd_questoes', 'Questões na prova'], ['descricao', 'Descrição']]
+  };
+  const EXEMPLO = {
+    questoes: [{ codigo: 'FCC-2024-001', tipo: 'multipla', enunciado: 'Assinale a alternativa com uso correto da crase.', a: 'Vou à praia.', b: 'Vou à pé.', c: 'Refiro-me à você.', d: 'Fiquei à esperar.', e: 'Cheguei à uma conclusão.', gabarito: 'A', gabarito_status: 'definitivo', explicacao: 'Crase antes de palavra feminina com artigo.', banca: 'FCC', orgao: 'TRT', cargo: 'Analista', ano: 2024, disciplina: 'Língua Portuguesa', assunto: 'Crase', dificuldade: 2, fonte: 'Prova TRT 2024', tags: 'crase', area: 'Tribunais' },
+      { codigo: 'CEB-2023-010', tipo: 'C/E', enunciado: 'A administração pública direta inclui as autarquias.', gabarito: 'E', gabarito_status: 'definitivo', banca: 'CEBRASPE', ano: 2023, disciplina: 'Direito Administrativo', assunto: 'Organização administrativa' }],
+    flashcards: [{ baralho: 'Português', frente: 'Crase antes de palavra masculina?', verso: 'Em regra, não.', disciplina: 'Língua Portuguesa', assunto: 'Crase', tags: 'regra geral' }],
+    assuntos: [{ disciplina: 'Língua Portuguesa', assunto: 'Crase', item_ref: '1.3', peso: 1 }, { disciplina: 'Direito Constitucional', assunto: 'Direitos fundamentais', subassunto: 'Direitos individuais', item_ref: '2.1', peso: 2, qtd_questoes: 6 }]
+  };
+
+  async function importer(tabela, o = {}) {
+    await E.ensure();
+    let X;
+    try { X = await E.lib('xlsx'); } catch (e) { ui.toast(e.message, { error: true }); return; }
+    const st2 = { tabela: tabela || 'questoes', wb: null, aba: null, rows: [], head: [], map: {}, conc: o.concurso || E.ctx() || '', qconc: o.concurso || '', qarea: '', nome: '', file: null };
+    const s = ui.sheet({ title: 'Importar planilha', size: 'full', wide: true, body: h`<div data-step></div>`, foot: h`<div class="row-sm grow" data-foot></div>`,
+      onMount(sh) {
+        const step = sh.$('[data-step]'), foot = sh.$('[data-foot]');
+        const guess = () => { st2.map = {}; CAMPOS[st2.tabela].forEach(([k, l]) => { const nl = P.norm(l.replace(/\s*\*$/, '')); const hit = st2.head.find((x) => P.norm(x) === k || P.norm(x) === nl || P.norm(x).startsWith(k)); if (hit) st2.map[k] = hit; }); };
+        const read = (sheetName) => { st2.aba = sheetName; const ws = st2.wb.Sheets[sheetName]; const aoa = X.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false }); st2.head = (aoa[0] || []).map((x) => String(x).trim()); st2.rows = aoa.slice(1).filter((r) => r.some((c) => String(c).trim() !== '')); guess(); };
+        const mapped = () => st2.rows.map((r) => { const o2 = {}; Object.entries(st2.map).forEach(([k, col]) => { const i = st2.head.indexOf(col); if (i >= 0) o2[k] = String(r[i] ?? '').trim(); }); return o2; });
+        const step1 = () => {
+          step.innerHTML = P.toHtml(h`<div class="stack"><div class="field"><label>O que importar</label>${ui.seg([['questoes', 'Questões'], ['flashcards', 'Flashcards'], ['assuntos', 'Edital (assuntos)']], st2.tabela, 'est.impTab', { cls: 'sm' })}</div>
+            ${st2.tabela === 'questoes' ? h`<div class="grid g2"><div class="field"><label>Concurso das questões</label><select class="input" data-qconc><option value="">Nenhum (ou a coluna Concurso)</option>${E.concursos().map((c) => h`<option value="${c.id}" ${raw(c.id === st2.qconc ? 'selected' : '')}>${c.nome}</option>`)}</select></div>
+              <div class="field"><label>Tipo de concurso (área)</label><input class="input" data-qarea list="imp-areas" value="${st2.qarea}" placeholder="Bancária, Tribunais…"><datalist id="imp-areas">${E.areas().map((a) => h`<option value="${a}">`)}</datalist></div></div>
+              <p class="faint" style="font-size:12px">Vale para as linhas sem as colunas Concurso/Área. Concurso pelo nome precisa estar cadastrado.</p>` : ''}
+            ${st2.tabela === 'assuntos' ? h`<div class="field"><label>Concurso do edital</label><select class="input" data-conc><option value="">Escolha…</option>${E.concursos().map((c) => h`<option value="${c.id}" ${raw(c.id === st2.conc ? 'selected' : '')}>${c.nome}</option>`)}</select></div>` : ''}
+            <div class="card pad-lg"><b>Modelo</b><p class="muted mt-2" style="font-size:13px">Primeira linha com os nomes das colunas. Colunas: ${CAMPOS[st2.tabela].map((c) => c[1]).join(', ')}. Reimportar o mesmo arquivo atualiza só os registros identificados (${st2.tabela === 'questoes' ? 'pelo código' : st2.tabela === 'flashcards' ? 'pelo baralho + frente' : 'pela disciplina + assunto'}), mantendo o histórico.</p><button type="button" class="btn btn-ghost btn-sm mt-2" data-modelo>${icon('download', 'sm')}Gerar modelo no meu Drive</button></div>
+            <div class="row-sm wrap"><button type="button" class="btn btn-primary" data-pick>${icon('upload', 'sm')}Escolher arquivo (XLSX ou CSV)</button>${st2.tabela === 'questoes' ? h`<button type="button" class="btn btn-ghost" data-qpdf>${icon('file', 'sm')}Ler PDF de questões</button>` : ''}${o.materialId ? h`<button type="button" class="btn btn-ghost" data-mat>${icon('book', 'sm')}Usar a planilha ${(E.mat(o.materialId) || {}).codigo || ''}</button>` : ''}</div>
+            <label class="row-sm"><input type="checkbox" data-guardar> Também guardar a planilha na biblioteca</label></div>`);
+          foot.innerHTML = '';
+          const cs = sh.$('[data-conc]'); if (cs) cs.onchange = () => { st2.conc = cs.value; };
+          const qp = sh.$('[data-qpdf]'); if (qp) qp.onclick = () => { sh.close(); qpdfFlow({ concurso: st2.qconc }); };
+          const qc = sh.$('[data-qconc]'); if (qc) qc.onchange = () => { st2.qconc = qc.value; };
+          const qa = sh.$('[data-qarea]'); if (qa) qa.oninput = () => { st2.qarea = qa.value.trim(); };
+          sh.$('[data-modelo]').onclick = async (ev) => {
+            const b = ev.currentTarget; b.classList.add('loading');
+            try { const ws = X.utils.json_to_sheet(EXEMPLO[st2.tabela], { header: CAMPOS[st2.tabela].map((c) => c[0]) }); const wb = X.utils.book_new(); X.utils.book_append_sheet(wb, ws, st2.tabela); const out = X.write(wb, { bookType: 'xlsx', type: 'array' }); const file = new File([out], `modelo_${st2.tabela}.xlsx`, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }); const r = await E.upload(file, { destino: 'exportacoes' }); if (r.arquivo) E.openDrive(r.arquivo.id); else if (r.duplicado && r.arquivo) E.openDrive(r.arquivo.id); ui.toast('Modelo salvo em exportações no seu Drive'); }
+            catch (e) { ui.toast(e.message, { error: true }); } b.classList.remove('loading');
+          };
+          const load = async (buf, name) => { try { st2.wb = X.read(buf, { type: 'array' }); st2.nome = name; read(st2.wb.SheetNames[0]); step2(); } catch (e) { ui.toast('Não consegui ler a planilha: ' + e.message, { error: true }); } };
+          sh.$('[data-pick]').onclick = async () => { const f = await P.files.pick({ accept: '.xlsx,.xls,.csv' }); if (!f) return; st2.file = f; load(await f.arrayBuffer(), f.name); };
+          const mb = sh.$('[data-mat]'); if (mb) mb.onclick = async () => { const m = E.mat(o.materialId); try { const bytes = await P.estPdf.fetchBytes(m.arquivo_id); load(bytes.buffer, m.titulo); } catch (e) { ui.toast(e.message, { error: true }); } };
+        };
+        const step2 = () => {
+          const prev = mapped().slice(0, 6), campos = CAMPOS[st2.tabela];
+          step.innerHTML = P.toHtml(h`<div class="stack"><p class="muted" style="font-size:13px">${st2.nome} · ${st2.rows.length} linha(s)</p>
+            ${st2.wb.SheetNames.length > 1 ? h`<div class="field"><label>Aba</label><select class="input" data-aba>${st2.wb.SheetNames.map((n) => h`<option ${raw(n === st2.aba ? 'selected' : '')}>${n}</option>`)}</select></div>` : ''}
+            <div class="card pad-lg"><b>Colunas</b><div class="grid g3 mt-2">${campos.map(([k, l]) => h`<div class="field"><label>${l}</label><select class="input sm" data-map="${k}"><option value="">—</option>${st2.head.map((c) => h`<option ${raw(st2.map[k] === c ? 'selected' : '')}>${c}</option>`)}</select></div>`)}</div></div>
+            <div class="ed-table"><table class="table"><thead><tr>${campos.filter(([k]) => st2.map[k]).map(([, l]) => h`<th>${l}</th>`)}</tr></thead><tbody>${prev.map((r) => h`<tr>${campos.filter(([k]) => st2.map[k]).map(([k]) => h`<td>${String(r[k] || '').slice(0, 60)}</td>`)}</tr>`)}</tbody></table></div><div data-res></div></div>`);
+          foot.innerHTML = P.toHtml(h`<button class="btn btn-ghost" data-back>${icon('chev-l', 'sm')}Voltar</button><button class="btn btn-ghost grow" data-dry>${icon('eye', 'sm')}Conferir</button><button class="btn btn-primary" data-go disabled>Importar</button>`);
+          const ab = sh.$('[data-aba]'); if (ab) ab.onchange = () => { read(ab.value); step2(); };
+          sh.$$('[data-map]').forEach((sel) => { sel.onchange = () => { st2.map[sel.dataset.map] = sel.value || undefined; step2(); }; });
+          sh.$('[data-back]').onclick = step1;
+          const call = async (dry, ignorar) => {
+            if (st2.tabela === 'assuntos' && !st2.conc) { ui.toast('Escolha o concurso do edital (volte um passo).', { error: true }); return null; }
+            const b = sh.$(dry ? '[data-dry]' : '[data-go]'); b.classList.add('loading');
+            try { return await P.api.call('est.importRows', { tabela: st2.tabela, rows: mapped(), dry, ignorar_erros: !!ignorar, concurso_id: (st2.tabela === 'assuntos' ? st2.conc : st2.tabela === 'questoes' ? st2.qconc : '') || null, area: st2.tabela === 'questoes' ? st2.qarea || null : null, linha_inicial: 2 }, { mutation: !dry, timeout: 180000 }); }
+            catch (e) { ui.toast(e.message, { error: true }); return null; } finally { b.classList.remove('loading'); }
+          };
+          sh.$('[data-dry]').onclick = async () => {
+            const r = await call(true); if (!r) return; const p = r.previa;
+            sh.$('[data-res]').innerHTML = P.toHtml(st2.tabela === 'assuntos' ? h`<div class="card pad-lg tint"><b>Prévia do edital v${p.versao}</b><p class="muted mt-2" style="font-size:13px">${p.novos_assuntos} assunto(s) novo(s), ${p.reaproveitados} reaproveitado(s), ${p.adicionados} adicionado(s), ${p.alterados} alterado(s), ${p.retirados} retirado(s).</p></div>`
+              : h`<div class="card pad-lg tint"><b>Prévia</b><p class="muted mt-2" style="font-size:13px">${p.novos} novo(s) · ${p.atualizados} atualizado(s) · ${p.total_erros} linha(s) com erro${p.novas_disciplinas.length ? ' · disciplinas novas: ' + p.novas_disciplinas.join(', ') : ''}</p>
+                ${p.erros.length ? h`<div class="list mt-2">${p.erros.slice(0, 50).map((e) => h`<div class="li" style="min-height:36px"><span class="chip down">linha ${e.linha}</span><span class="main"><span class="t">${e.mensagem}</span></span></div>`)}</div>${p.total_erros ? h`<label class="row-sm mt-2"><input type="checkbox" data-ign> Importar só as linhas válidas</label>` : ''}` : ''}</div>`);
+            sh.$('[data-go]').disabled = false;
+          };
+          sh.$('[data-go]').onclick = async () => {
+            const ign = sh.$('[data-ign]'), r = await call(false, ign && ign.checked); if (!r) return;
+            if (st2.file && sh._guardar) await E.uploadToLibrary([st2.file], { tags: 'importada', categoria: st2.tabela === 'assuntos' ? 'outros' : st2.tabela, semOferta: true }).catch(() => {});
+            await E.reload().catch(() => {});
+            step.innerHTML = P.toHtml(h`<div class="card pad-lg tint"><b>Importação concluída</b><p class="muted mt-2" style="font-size:13px">${st2.tabela === 'assuntos' ? `Edital v${r.edital ? r.edital.versao : ''} gravado com ${r.itens} itens.` : `${r.inseridos} novo(s), ${r.atualizados} atualizado(s), ${r.previa.total_erros} linha(s) com erro ${r.previa.total_erros ? 'ignorada(s)' : ''}.`}</p></div>`);
+            foot.innerHTML = P.toHtml(h`<button class="btn btn-primary grow" data-close>Fechar</button>`);
+          };
+        };
+        sh.el.addEventListener('change', (e) => { if (e.target.matches('[data-guardar]')) sh._guardar = e.target.checked; });
+        P.act['est.impTab'] = (el) => { st2.tabela = el.dataset.v; step1(); };
+        step1();
+      } });
+    return s;
+  }
+
+  // ================= Importar questões de PDF =================
+  const QPDF_COLS = CAMPOS.questoes.map((c) => c[0]);
+  const prefixoDe = (nome) => { const w = P.norm(String(nome || '').replace(/\.[^.]+$/, '')).split(/[^a-z0-9]+/).filter(Boolean); const out = w.filter((x) => !['de', 'da', 'do', 'das', 'dos', 'e', 'para', 'o', 'a', 'em'].includes(x)).map((x) => (/^\d+$/.test(x) ? x : x[0])).join('').toUpperCase(); return (out || 'PDF').slice(0, 10); };
+  /** Recorta a área da questão nas páginas (imagem/fórmula/tabela) e junta numa imagem só. */
+  async function cropQuestion(doc, crop, cache) {
+    const scale = 2, parts = [];
+    for (const g of crop.partes) {
+      let pc = cache.get(g.page);
+      if (!pc) {
+        const pg = await doc.getPage(g.page), vp = pg.getViewport({ scale });
+        const cv = document.createElement('canvas'); cv.width = Math.ceil(vp.width); cv.height = Math.ceil(vp.height);
+        await pg.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+        pc = { cv, h: pg.getViewport({ scale: 1 }).height, vb: vp.viewBox || [0, 0] };
+        if (cache.size > 3) cache.delete(cache.keys().next().value);
+        cache.set(g.page, pc);
+      }
+      const x = Math.max(0, (g.x0 - 2) * scale), y = Math.max(0, (pc.h - g.y1 - 4) * scale), w = Math.min(pc.cv.width - x, (g.x1 - g.x0 + 4) * scale), hh = Math.min(pc.cv.height - y, (g.y1 - g.y0 + 8) * scale);
+      if (w > 4 && hh > 4) parts.push({ cv: pc.cv, x, y, w, h: hh });
+    }
+    if (!parts.length) return null;
+    const W = Math.max(...parts.map((p) => p.w)), H = parts.reduce((a, p) => a + p.h + 8, 0);
+    const k = Math.min(1, 1400 / W), out = document.createElement('canvas'); out.width = Math.round(W * k); out.height = Math.round(H * k);
+    const cx = out.getContext('2d'); cx.fillStyle = '#fff'; cx.fillRect(0, 0, out.width, out.height);
+    let yy = 0; parts.forEach((p) => { cx.drawImage(p.cv, p.x, p.y, p.w, p.h, 0, yy, p.w * k, p.h * k); yy += (p.h + 8) * k; });
+    return out.toDataURL('image/jpeg', 0.85);
+  }
+  function downloadBlob(blob, nome) { const u = URL.createObjectURL(blob), a = document.createElement('a'); a.href = u; a.download = nome; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(u); a.remove(); }, 1500); }
+
+  async function qpdfFlow(o = {}) {
+    await E.ensure();
+    const Q = P.estQPdf;
+    const S3 = { res: null, rows: [], doc: null, file: null, matId: o.materialId || null, nome: '', filtro: 'todas', busca: '', ver: 120,
+      op: { prefixo: '', banca: '', orgao: '', cargo: '', area: '', concurso: o.concurso || '', status: 'definitivo', tags: '', guardar: true, recortes: true } };
+    const code = (r) => S3.op.prefixo.toUpperCase().replace(/[^A-Z0-9]/g, '') + '-' + r._suf;
+    const finalRows = () => S3.rows.filter((r) => !r._skip).map((r) => {
+      const x = {}; QPDF_COLS.forEach((k) => { x[k] = r[k] ?? ''; });
+      x.codigo = code(r); x.banca = r.banca || S3.op.banca; x.orgao = r.orgao || S3.op.orgao; x.cargo = r.cargo || S3.op.cargo; x.area = S3.op.area || r.area || ''; x.concurso = '';
+      x.tags = [r.tags, S3.op.tags].filter(Boolean).join(' ');
+      if (x.gabarito && r.gabarito_status !== 'anulada') x.gabarito_status = S3.op.status;
+      x.texto_base = r.texto_base || ''; x.pagina = r.pagina || ''; if (r._img) x.imagem_arquivo_id = r._img;
+      return x;
+    });
+    const s = ui.sheet({ title: 'Importar questões de PDF', size: 'full', wide: true, body: h`<div data-b></div>`, foot: h`<div class="row-sm grow wrap" data-f></div>`,
+      onMount(sh) {
+        const B = sh.$('[data-b]'), F = sh.$('[data-f]');
+        const pdfs = S.all('est_materiais').filter((m) => m.tipo === 'pdf' && m.arquivo_id && m.situacao !== 'arquivado');
+        const step1 = () => {
+          B.innerHTML = P.toHtml(h`<div class="stack"><p class="muted" style="font-size:13.5px">O Prumo lê o PDF da prova ou do caderno de questões e monta as linhas no formato do modelo de planilha: número, banca, ano, órgão, cargo, disciplina, assunto, <b>enunciado completo</b>, <b>texto de apoio</b> ("Leia o texto…", "Texto I"), alternativas A–E ou A–D, certo/errado, <b>gabarito</b> (tabela de gabarito ou "Gabarito: B") e comentário. Figuras, fórmulas e tabelas vão também como imagem recortada da questão. Você confere tudo antes de importar.</p>
+            <div class="row-sm wrap"><button type="button" class="btn btn-primary" data-pick>${icon('upload', 'sm')}Escolher PDF do computador</button></div>
+            ${pdfs.length ? h`<div class="field"><label>Ou um PDF da biblioteca</label><div class="row-sm"><select class="input" data-mat>${pdfs.map((m) => h`<option value="${m.id}" ${raw(m.id === S3.matId ? 'selected' : '')}>${m.codigo} · ${m.titulo}</option>`)}</select><button type="button" class="btn btn-ghost" data-lermat>Ler</button></div></div>` : ''}
+            <p class="faint" style="font-size:12px">PDF digitalizado (só imagem): o Prumo oferece ler com OCR, página por página. Arquivos grandes podem levar alguns minutos.</p><div data-prog></div></div>`);
+          F.innerHTML = '';
+          sh.$('[data-pick]').onclick = async () => { const f = await P.files.pick({ accept: 'application/pdf' }); if (!f) return; S3.file = f; S3.matId = null; S3.nome = f.name; ler(async () => new Uint8Array(await f.arrayBuffer())); };
+          const lm = sh.$('[data-lermat]'); if (lm) lm.onclick = () => { const m = E.mat(sh.$('[data-mat]').value); S3.matId = m.id; S3.file = null; S3.nome = m.titulo; ler(() => P.estPdf.fetchBytes(m.arquivo_id)); };
+          if (o.materialId && lm) setTimeout(() => lm.click(), 150);
+        };
+        const ler = async (getBytes) => {
+          const prog = (t) => { const el = sh.$('[data-prog]'); if (el) el.innerHTML = P.toHtml(h`<div class="card pad-lg mt-2"><b>${t}</b><div class="skel mt-2" style="height:8px"></div></div>`); };
+          prog('Carregando o leitor de PDF…');
+          try {
+            const pdfjs = await P.estPdf.loadLib(); const bytes = await getBytes();
+            prog('Abrindo o PDF…');
+            S3.doc = await pdfjs.getDocument({ data: bytes }).promise;
+            let pages = await Q.readPdf(S3.doc, pdfjs.OPS, { onProgress: (i, n) => { if (i % 4 === 0 || i === n) prog(`Lendo página ${i} de ${n}…`); } });
+            if (!pages.some((p) => p.lines.some((l) => !l.img && l.text))) {
+              prog('');
+              if (!await ui.confirm({ title: 'PDF digitalizado', text: `Este PDF não tem texto (é imagem). Ler com OCR? Leva cerca de 10 a 15 segundos por página (${S3.doc.numPages} página(s)). Confira as questões com atenção: o OCR pode trocar letras e números.`, ok: 'Ler com OCR' })) return;
+              const R = await P.estOcr.forDoc({ material: S3.matId ? E.mat(S3.matId) : null, signal: S3 });
+              S3.parado = false;
+              pages = await Q.readPdf(S3.doc, pdfjs.OPS, { imagens: false, ocr: R.fn, onProgress: (i, n) => prog(`OCR da página ${i} de ${n}…`) });
+              await R.save(S3.doc.numPages); S3.ocr = true;
+              if (!pages.some((p) => p.lines.some((l) => !l.img && l.text))) { prog(''); ui.toast('O OCR não encontrou texto neste PDF.', { error: true }); return; }
+            }
+            S3.op.prefixo = prefixoDe(S3.nome);
+            S3.res = Q.parse(pages, { prefixo: 'X', fonte: String(S3.nome).replace(/\.pdf$/i, '') });
+            if (!S3.res.rows.length) { prog(''); ui.toast('Nenhuma questão reconhecida neste PDF. Confira se as questões são numeradas (ex.: "1. (Banca – 2020)" ou "Questão 1").', { error: true, duration: 9000 }); return; }
+            S3.rows = S3.res.rows.map((r) => ({ ...r, _suf: r.codigo.split('-').slice(1).join('-') }));
+            const bancas = [...new Set(S3.rows.map((r) => r.banca).filter(Boolean))];
+            if (bancas.length === 1) S3.op.banca = bancas[0];
+            step2();
+          } catch (e) { prog(''); ui.toast('Não consegui ler o PDF: ' + (e.message || e), { error: true }); }
+        };
+        const rowView = (r, i) => { const av = r._avisos.length; return h`<div class="li ${r._skip ? 'done' : ''}" data-i="${i}"><input type="checkbox" data-use="${i}" ${raw(r._skip ? '' : 'checked')} aria-label="Importar ${r._suf}">
+          <span class="main tap" data-edit="${i}"><span class="t">${code(r)} · ${String(r.enunciado).slice(0, 110)}${String(r.enunciado).length > 110 ? '…' : ''}</span><span class="s">p. ${r.pagina} · ${[r.banca, r.ano].filter(Boolean).join(' ')}${r.disciplina ? ' · ' + r.disciplina : ''}${r.assunto ? ' › ' + r.assunto.slice(0, 60) : ''} · ${r.tipo === 'C/E' ? 'certo/errado' : r.tipo === 'multipla' ? r._alts + ' alternativas' : r.tipo}</span></span>
+          ${r.texto_base ? h`<span class="chip">texto</span>` : ''}${r._crop ? h`<span class="chip info">${r._crop.motivo === 'imagem' ? 'imagem' : 'recorte'}</span>` : ''}${r.gabarito ? h`<span class="chip up">${r.gabarito}</span>` : r.gabarito_status === 'anulada' ? h`<span class="chip">anulada</span>` : h`<span class="chip down">sem gabarito</span>`}${av ? h`<span class="chip down" title="${r._avisos.join('; ')}">${icon('alert', 'xs')}${av}</span>` : ''}</div>`; };
+        const vis = () => S3.rows.map((r, i) => [r, i]).filter(([r]) => (S3.filtro === 'todas' || (S3.filtro === 'avisos' && r._avisos.length) || (S3.filtro === 'semgab' && !r.gabarito && r.gabarito_status !== 'anulada') || (S3.filtro === 'texto' && r.texto_base) || (S3.filtro === 'imagem' && r._crop)) && (!S3.busca || P.norm(r.enunciado + ' ' + r._suf + ' ' + r.assunto).includes(P.norm(S3.busca))));
+        const step2 = () => {
+          const R = S3.res.resumo, cb = S3.res.cobertura, rows = vis(), op = S3.op, discs = {};
+          S3.rows.forEach((r) => { discs[r.disciplina || 'Sem disciplina'] = (discs[r.disciplina || 'Sem disciplina'] || 0) + 1; });
+          const n = S3.rows.filter((r) => !r._skip).length;
+          B.innerHTML = P.toHtml(h`<div class="stack">
+            <div class="grid g4"><div class="card">${ui.metric({ label: 'Questões lidas', value: fmt.num(R.questoes), size: 'md', sub: `${R.multipla} múltipla escolha · ${R.certo_errado} certo/errado${R.outras ? ' · ' + R.outras + ' outras' : ''}` })}</div>
+              <div class="card">${ui.metric({ label: 'Com gabarito', value: fmt.num(R.com_gabarito), size: 'md', cls: R.com_gabarito === R.questoes ? 'pos' : '', sub: `${R.gabaritos} tabela(s) de gabarito lida(s)` })}</div>
+              <div class="card">${ui.metric({ label: 'Com texto de apoio', value: fmt.num(R.com_texto), size: 'md', sub: `${R.com_recorte} com imagem/recorte da questão` })}</div>
+              <div class="card">${ui.metric({ label: 'Texto do PDF aproveitado', value: cb.linhas ? fmt.num((cb.aproveitadas / cb.linhas) * 100, 2) + '%' : 'sem dados', size: 'md', sub: `${fmt.num(cb.aproveitadas)} de ${fmt.num(cb.linhas)} linhas depois da 1ª questão` })}</div></div>
+            <div class="row-sm wrap">${Object.entries(discs).map(([d, k]) => h`<span class="chip">${d}: ${k}</span>`)}</div>
+            ${S3.res.avisos.length || cb.total_faltando ? h`<details class="card pad-lg" ${raw(S3.res.avisos.length < 12 ? 'open' : '')}><summary><b>${S3.res.avisos.length} aviso(s) para conferir</b>${cb.total_faltando ? ` · ${cb.total_faltando} linha(s) do PDF fora das questões` : ''}</summary>
+              <div class="list mt-2">${S3.res.avisos.map((a) => h`<div class="li" style="min-height:36px"><span class="chip">p. ${a.pagina}</span><span class="main"><span class="t" style="white-space:normal">${a.msg}</span>${a.trecho ? h`<span class="s" style="white-space:normal">${a.trecho}</span>` : ''}</span></div>`)}
+              ${cb.faltando.map((f) => h`<div class="li" style="min-height:36px"><span class="chip down">p. ${f.pagina}</span><span class="main"><span class="t" style="white-space:normal">Não aproveitado: "${f.texto}"</span></span></div>`)}</div></details>` : h`<p class="muted" style="font-size:13px">${icon('check', 'sm')} Nenhum aviso: todas as linhas depois da 1ª questão foram para algum campo.</p>`}
+            <div class="card pad-lg"><b>Dados da importação</b><div class="grid g3 mt-2">
+              <div class="field"><label>Prefixo do código</label><input class="input" data-op="prefixo" value="${op.prefixo}" maxlength="10"><span class="hint">Ex.: ${code(S3.rows[0])}. Reimportar com o mesmo código atualiza, sem duplicar.</span></div>
+              <div class="field"><label>Banca (quando a questão não traz)</label><input class="input" data-op="banca" value="${op.banca}"></div>
+              <div class="field"><label>Órgão</label><input class="input" data-op="orgao" value="${op.orgao}" placeholder="Ex.: Banco do Brasil"></div>
+              <div class="field"><label>Cargo</label><input class="input" data-op="cargo" value="${op.cargo}"></div>
+              <div class="field"><label>Concurso</label><select class="input" data-op="concurso"><option value="">Nenhum</option>${E.concursos().map((c) => h`<option value="${c.id}" ${raw(c.id === op.concurso ? 'selected' : '')}>${c.nome}</option>`)}</select></div>
+              <div class="field"><label>Tipo de concurso (área)</label><input class="input" data-op="area" list="qpdf-areas" value="${op.area}" placeholder="Bancária, Tribunais…"><datalist id="qpdf-areas">${E.areas().map((a) => h`<option value="${a}">`)}</datalist></div>
+              <div class="field"><label>Gabarito lido do PDF é</label><select class="input" data-op="status"><option value="definitivo" ${raw(op.status === 'definitivo' ? 'selected' : '')}>Definitivo (oficial)</option><option value="preliminar" ${raw(op.status === 'preliminar' ? 'selected' : '')}>Preliminar</option></select></div>
+              <div class="field"><label>Etiquetas</label><input class="input" data-op="tags" value="${op.tags}" placeholder="caderno, revisão…"></div></div>
+              ${S3.file ? h`<label class="row-sm mt-2"><input type="checkbox" data-op="guardar" ${raw(op.guardar ? 'checked' : '')}> Guardar o PDF na biblioteca e ligar cada questão à página dela</label>` : h`<p class="faint mt-2" style="font-size:12px">Cada questão fica ligada à página do PDF da biblioteca ("Abrir no PDF").</p>`}
+              ${R.com_recorte ? h`<label class="row-sm mt-2"><input type="checkbox" data-op="recortes" ${raw(op.recortes ? 'checked' : '')}> Anexar a imagem recortada das ${R.com_recorte} questão(ões) com figura, fórmula ou tabela</label>` : ''}</div>
+            <div class="row between wrap"><b>${n} de ${S3.rows.length} marcada(s) para importar</b><div class="row-sm wrap">${ui.seg([['todas', 'Todas'], ['avisos', 'Com aviso'], ['semgab', 'Sem gabarito'], ['texto', 'Com texto'], ['imagem', 'Com imagem']], S3.filtro, 'est.qpdfF', { cls: 'sm' })}<input class="input sm" data-busca placeholder="Buscar" value="${S3.busca}" style="max-width:180px"></div></div>
+            <div class="list cardlist">${rows.slice(0, S3.ver).map(([r, i]) => rowView(r, i))}</div>
+            ${rows.length > S3.ver ? h`<button type="button" class="btn btn-ghost btn-sm" data-mais>Mostrar mais (${rows.length - S3.ver})</button>` : ''}<div data-res></div></div>`);
+          F.innerHTML = P.toHtml(h`<button class="btn btn-ghost" data-back>${icon('chev-l', 'sm')}Outro PDF</button><button class="btn btn-ghost" data-xlsx>${icon('download', 'sm')}Baixar XLSX</button><button class="btn btn-ghost" data-xdrive>Salvar XLSX no Drive</button><button class="btn btn-primary grow" data-go>Importar ${n}</button>`);
+        };
+        P.act['est.qpdfF'] = (el) => { S3.filtro = el.dataset.v; S3.ver = 120; step2(); };
+        sh.el.addEventListener('change', (e) => {
+          const t = e.target;
+          if (t.dataset.op) { S3.op[t.dataset.op] = t.type === 'checkbox' ? t.checked : t.value.trim(); if (t.dataset.op === 'prefixo') { clearTimeout(S3.tm); S3.tm = setTimeout(step2, 0); } return; }
+          if (t.dataset.use) { S3.rows[+t.dataset.use]._skip = !t.checked; const g = sh.$('[data-go]'); if (g) g.textContent = `Importar ${S3.rows.filter((r) => !r._skip).length}`; }
+        });
+        sh.el.addEventListener('input', P.debounce((e) => { if (e.target.matches('[data-busca]')) { S3.busca = e.target.value; S3.ver = 120; step2(); const b = sh.$('[data-busca]'); if (b) { b.focus(); b.setSelectionRange(b.value.length, b.value.length); } } }, 350));
+        sh.el.addEventListener('click', async (e) => {
+          const t = e.target.closest('button,[data-edit]'); if (!t) return;
+          if (t.hasAttribute('data-back')) { S3.res = null; S3.rows = []; step1(); return; }
+          if (t.hasAttribute('data-mais')) { S3.ver += 200; step2(); return; }
+          if (t.dataset.edit) { rowEdit(+t.dataset.edit); return; }
+          if (t.hasAttribute('data-xlsx') || t.hasAttribute('data-xdrive')) {
+            t.classList.add('loading');
+            try {
+              const X = await E.lib('xlsx'), rows = finalRows();
+              const ws = X.utils.json_to_sheet(rows.map((r) => { const x = { ...r }; delete x.imagem_arquivo_id; return x; }), { header: QPDF_COLS });
+              const wb = X.utils.book_new(); X.utils.book_append_sheet(wb, ws, 'questoes');
+              const out = X.write(wb, { bookType: 'xlsx', type: 'array' }), nome = 'questoes_' + S3.op.prefixo + '.xlsx';
+              const blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+              if (t.hasAttribute('data-xlsx')) { downloadBlob(blob, nome); ui.toast(`${rows.length} questão(ões) na planilha ${nome}`); }
+              else { const r = await E.upload(new File([blob], nome, { type: blob.type }), { destino: 'exportacoes' }); ui.toast('Planilha salva em exportações no seu Drive', r.arquivo ? { action: { label: 'Abrir', fn: () => E.openDrive(r.arquivo.id) }, duration: 9000 } : {}); }
+            } catch (er) { ui.toast(er.message, { error: true }); }
+            t.classList.remove('loading'); return;
+          }
+          if (t.hasAttribute('data-go')) { importar(t); }
+        });
+        const rowEdit = (i) => {
+          const r = S3.rows[i];
+          ui.sheet({ title: 'Conferir ' + code(r), size: 'full', body: h`<form class="form" novalidate data-ef>
+            ${r._avisos.length ? h`<p class="chip down full" style="height:auto;white-space:normal;padding:6px 10px">${r._avisos.join(' · ')}</p>` : ''}
+            <div class="field half"><label>Tipo</label><select class="input" name="tipo">${[['multipla', 'Múltipla escolha'], ['C/E', 'Certo ou errado'], ['curta', 'Resposta curta'], ['discursiva', 'Discursiva']].map(([v, l]) => h`<option value="${v}" ${raw(v === r.tipo ? 'selected' : '')}>${l}</option>`)}</select></div>
+            <div class="field half"><label>Gabarito</label><input class="input" name="gabarito" value="${r.gabarito}" maxlength="40"></div>
+            <div class="field half"><label>Disciplina</label><input class="input" name="disciplina" value="${r.disciplina}"></div><div class="field half"><label>Assunto</label><input class="input" name="assunto" value="${r.assunto}"></div>
+            <div class="field half"><label>Banca</label><input class="input" name="banca" value="${r.banca}"></div><div class="field half"><label>Ano</label><input class="input" name="ano" value="${r.ano}"></div>
+            <div class="field full"><label>Texto de apoio</label><textarea class="input" name="texto_base" rows="${r.texto_base ? 8 : 2}">${r.texto_base}</textarea></div>
+            <div class="field full"><label>Enunciado</label><textarea class="input" name="enunciado" rows="6">${r.enunciado}</textarea></div>
+            ${['a', 'b', 'c', 'd', 'e'].map((k) => h`<div class="field full"><label>Alternativa ${k.toUpperCase()}</label><textarea class="input" name="${k}" rows="2">${r[k]}</textarea></div>`)}
+            <div class="field full"><label>Comentário / explicação</label><textarea class="input" name="explicacao" rows="2">${r.explicacao}</textarea></div>
+            ${S3.doc ? h`<div class="full"><button type="button" class="btn btn-ghost btn-sm" data-ver>${icon('eye', 'sm')}Ver a página ${r.pagina} do PDF</button><div data-pv class="mt-2"></div></div>` : ''}</form>`,
+            foot: h`<button class="btn btn-primary grow" data-ok>Salvar alterações</button>`,
+            onMount(sh2) {
+              const f = sh2.$('[data-ef]');
+              const v = sh2.$('[data-ver]'); if (v) v.onclick = async () => { v.classList.add('loading'); try { const url = await cropQuestion(S3.doc, { partes: [{ page: r.pagina, x0: 0, x1: 9999, y0: 0, y1: 9999 }] }, new Map()); sh2.$('[data-pv]').innerHTML = `<img src="${url}" alt="Página ${r.pagina}" style="max-width:100%;border-radius:8px;border:1px solid var(--border)">`; } catch (er) { ui.toast(er.message, { error: true }); } v.classList.remove('loading'); };
+              sh2.$('[data-ok]').onclick = () => { ['tipo', 'gabarito', 'disciplina', 'assunto', 'banca', 'ano', 'texto_base', 'enunciado', 'a', 'b', 'c', 'd', 'e', 'explicacao'].forEach((k) => { r[k] = f[k].value.trim(); }); r.gabarito = r.gabarito.toUpperCase(); r._alts = ['a', 'b', 'c', 'd', 'e'].filter((k) => r[k]).length; r._avisos = r._avisos.filter((a) => !/gabarito|alternativa/.test(a) || (a === 'sem gabarito' && !r.gabarito)); sh2.close(); step2(); };
+            } });
+        };
+        const importar = async (btn) => {
+          const res = sh.$('[data-res]'), log = (t) => { res.innerHTML = P.toHtml(h`<div class="card pad-lg tint mt-2"><b>${t}</b><div class="skel mt-2" style="height:8px"></div></div>`); };
+          const marcadas = S3.rows.filter((r) => !r._skip);
+          if (!marcadas.length) { ui.toast('Marque ao menos uma questão.', { error: true }); return; }
+          if (!S3.op.prefixo) { ui.toast('Informe o prefixo do código.', { error: true }); return; }
+          btn.disabled = true;
+          try {
+            // 1) conferência no servidor (sem gravar), em blocos
+            const lotes = (arr, n) => { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; };
+            let rows = finalRows(), erros = [], k = 0;
+            for (const lote of lotes(rows, 150)) { log(`Conferindo ${Math.min(k + lote.length, rows.length)} de ${rows.length}…`); const r = await P.api.call('est.importRows', { tabela: 'questoes', rows: lote, dry: true, concurso_id: S3.op.concurso || null, area: S3.op.area || null, linha_inicial: k + 2 }, { timeout: 180000 }); erros = erros.concat(r.previa.erros.map((x) => ({ ...x, codigo: rows[x.linha - 2] && rows[x.linha - 2].codigo }))); k += lote.length; }
+            if (erros.length && !(await ui.confirm({ title: `${erros.length} questão(ões) com problema`, text: erros.slice(0, 6).map((x) => `${x.codigo}: ${x.mensagem}`).join(' · ') + (erros.length > 6 ? ' …' : '') + '. Importar só as válidas? (as outras você corrige em "Conferir")', ok: 'Importar as válidas' }))) { res.innerHTML = ''; btn.disabled = false; return; }
+            // 2) PDF na biblioteca (vínculo questão → página)
+            let matId = S3.matId;
+            if (!matId && S3.file && S3.op.guardar) { log('Guardando o PDF na biblioteca…'); const ms = await E.uploadToLibrary([S3.file], { tags: 'questões', categoria: 'questoes', concurso_ids: S3.op.concurso || '' }); if (ms[0]) { matId = ms[0].id; S3.matId = matId; } }
+            // 3) recortes (figura, fórmula, tabela)
+            if (S3.op.recortes && S3.doc) {
+              const alvo = marcadas.filter((r) => r._crop && !r._img), cache = new Map(); let j = 0;
+              for (const r of alvo) {
+                j++; log(`Recortando e enviando as imagens: ${j} de ${alvo.length}…`);
+                try { const url = await cropQuestion(S3.doc, r._crop, cache); if (url) { const up = await P.api.call('files.upload', { nome: code(r) + '.jpg', mime: 'image/jpeg', base64: url, modulo: 'estudos', tipo: 'outro' }, { mutation: true, timeout: 120000 }); r._img = up.arquivo.id; } }
+                catch (er) { r._avisos.push('imagem não enviada: ' + er.message); }
+              }
+            }
+            // 4) gravação em blocos
+            rows = finalRows().map((x) => ({ ...x, material_id: matId || undefined }));
+            let ins = 0, upd = 0, err = 0; k = 0;
+            for (const lote of lotes(rows, 100)) { log(`Gravando ${Math.min(k + lote.length, rows.length)} de ${rows.length}…`); const r = await P.api.call('est.importRows', { tabela: 'questoes', rows: lote, dry: false, ignorar_erros: true, concurso_id: S3.op.concurso || null, area: S3.op.area || null, linha_inicial: k + 2 }, { mutation: true, timeout: 300000 }); ins += r.inseridos; upd += r.atualizados; err += r.previa.total_erros; k += lote.length; }
+            await E.reload().catch(() => {});
+            res.innerHTML = P.toHtml(h`<div class="card pad-lg tint mt-2"><b>${icon('check', 'sm')} Importação concluída</b><p class="muted mt-2" style="font-size:13px">${ins} nova(s), ${upd} atualizada(s)${err ? `, ${err} com erro (não importadas)` : ''}. ${matId ? 'Cada questão abre a página do PDF pelo botão "Abrir no PDF".' : ''}</p>
+              <div class="row-sm wrap mt-2"><button type="button" class="btn btn-primary btn-sm" data-close>Fechar</button></div></div>`);
+            btn.textContent = 'Importado'; ui.toast(`${ins + upd} questão(ões) importada(s)`);
+          } catch (er) { res.innerHTML = ''; btn.disabled = false; ui.toast(er.message, { error: true, duration: 9000 }); }
+        };
+        step1();
+      } });
+    return s;
+  }
+
+  // ================= Rotas e ações =================
+  P.estQ = { edit: (q, d) => qEdit(q, d), runOne: (id) => { E.ensure().then(() => run([id], 'treino', 'Questão')); }, run, importer, aiCards, explain, simQuick, lastMap, accuracy, importPdf: qpdfFlow };
+  P.screen('est/questoes', { mod: 'est', tab: 'questoes', title: 'Questões', deps: E.T, render: questoes });
+  P.screen('est/simulados', { mod: 'est', tab: 'simulados', title: 'Simulados', deps: E.T, render: simulados });
+  P.screen('est/simulado/:id', { mod: 'est', tab: 'simulados', title: 'Resultado do simulado', deps: E.T, render: simResult });
+
+  Object.assign(P.act, {
+    'est.qAba': (el) => { st.aba = el.dataset.v; P.router.render(true); },
+    'est.qNew': () => qEdit(null, { disciplina_id: P.flt.get('est.q', 'disc', '') || null, assunto_id: P.flt.get('est.q', 'ass', '') || null }),
+    'est.qEdit': (el) => qEdit(S.get('est_questoes', el.dataset.id)),
+    'est.qOne': (el) => { if (el.dataset.id) P.estQ.runOne(el.dataset.id); },
+    'est.qSel': (el) => { el.checked ? st.sel.add(el.dataset.id) : st.sel.delete(el.dataset.id); P.router.render(true); },
+    'est.qSelClear': () => { st.sel = new Set(); P.router.render(true); },
+    'est.qSelAll': () => { const ids = filtered().map((q) => q.id); const all = ids.length && ids.every((id) => st.sel.has(id)); if (all) ids.forEach((id) => st.sel.delete(id)); else ids.slice(0, 2000).forEach((id) => st.sel.add(id)); P.router.render(true); },
+    'est.qDelSel': async (el) => {
+      const ids = [...st.sel].filter((id) => S.get('est_questoes', id)); if (!ids.length) return;
+      if (!(await ui.confirm({ title: `Excluir ${ids.length} questão(ões)?`, text: 'As tentativas e simulados já feitos continuam no histórico. Dá para desfazer logo em seguida.', ok: 'Excluir', danger: true }))) return;
+      el.classList.add('loading');
+      try {
+        const r = await P.api.call('est.questionDelete', { ids }, { mutation: true, timeout: 120000 });
+        ids.forEach((id) => S.drop('est_questoes', id)); st.sel = new Set(); P.router.render(true);
+        ui.toast(`${r.removidas} questão(ões) excluída(s)`, { undo: async () => { try { const rr = await P.api.call('est.questionRestore', { ids }, { mutation: true, timeout: 120000 }); rr.questoes.forEach((q) => S.put('est_questoes', q)); P.router.render(true); ui.toast('Exclusão desfeita'); } catch (e) { ui.toast(e.message, { error: true }); } } });
+      } catch (e) { ui.toast(e.message, { error: true }); el.classList.remove('loading'); }
+    },
+    'est.qTg': (el) => { if (!E.tg()) { ui.toast('Conecte o Telegram em Configurações › Telegram.', { error: true }); return; } const ids = (st.sel.size ? [...st.sel] : filtered().map((q) => q.id)).filter((id) => { const q = S.get('est_questoes', id); return q && (q.tipo === 'multipla' || q.tipo === 'certo_errado'); }); if (!ids.length) { ui.toast('Escolha questões de múltipla escolha ou certo/errado.', { error: true }); return; } const pick = ids.map((id) => [Math.random(), id]).sort((a, b) => a[0] - b[0]).slice(0, 10).map((x) => x[1]); E.sendTg({ tipo: 'quiz', ids: pick }, el).then((j) => { if (j) ui.toast(`Série de ${pick.length} questão(ões) no Telegram: responda com a letra.`); }); },
+    'est.simQuick': () => E.ensure().then(() => simQuick()),
+    'est.qRun': (el) => { const ids = st.sel.size ? [...st.sel] : filtered().map((q) => q.id).slice(0, 200); run(ids, el.dataset.m); },
+    'est.qErro': async (el) => { try { const r = await P.api.call('est.errorFromAttempt', { questao_id: el.dataset.id }, { mutation: true }); S.put('est_erros', r.erro); E.erroEdit(r.erro); } catch (e) { ui.toast(e.message, { error: true }); } },
+    'est.treinar': (el) => { E.ensure().then(() => { const ass = el.dataset.ass, disc = el.dataset.disc; P.flt.set('est.q', 'disc', disc || (ass ? (E.ass(ass) || {}).disciplina_id : '') || ''); P.flt.set('est.q', 'ass', ass || ''); st.aba = 'banco'; ui.closeAll(); P.router.go('est/questoes'); }); },
+    'est.listNew': () => listNew(),
+    'est.listRun': (el) => { const l = S.get('est_listas', el.dataset.id); run(listIds(l), el.dataset.m, l.nome); },
+    'est.listDel': (el) => S.remove('est_listas', el.dataset.id, { label: 'Lista excluída' }),
+    'est.simNew': () => simEdit(null),
+    'est.simEdit': (el) => simEdit(S.get('est_simulados', el.dataset.id)),
+    'est.simDup': (el) => { const s = S.get('est_simulados', el.dataset.id); simEdit(null, { ...s, id: undefined, titulo: s.titulo + ' (refazer)', equivalente_a: s.equivalente_a || s.id }); },
+    'est.simRun': (el) => simRun(el.dataset.id),
+    'est.simOpen': (el) => { const s = S.get('est_simulados', el.dataset.id); if (s && s.status === 'finalizado') P.router.go('est/simulado/' + s.id); else if (s) simRun(s.id); },
+    'est.import': (el) => importer(el.dataset.tabela, { concurso: el.dataset.conc }),
+    'est.importPdf': (el) => qpdfFlow({ materialId: el && el.dataset && el.dataset.id }).catch((e) => ui.toast(e.message, { error: true }))
+  });
+})();
+</script>

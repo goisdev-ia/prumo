@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="pt-BR" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>Prumo</title>
+  <script>
+    (function () {
+      var t = 'dark';
+      try { t = JSON.parse(localStorage.getItem('prumo.theme')) || 'dark'; } catch (e) { t = 'dark'; }
+      if (t === 'auto') t = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <?!= include('css_tokens') ?>
+  <?!= include('css_base') ?>
+  <?!= include('css_components') ?>
+  <?!= include('css_modules') ?>
+  <?!= include('css_estudos') ?>
+</head>
+<body>
+  <?!= include('icons') ?>
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar" aria-label="Menu principal"></aside>
+    <div class="main">
+      <header class="topbar" id="topbar"></header>
+      <main class="view" id="view" tabindex="-1">
+        <div class="stack" aria-busy="true" style="padding-top:12px">
+          <div class="skel" style="height:28px;width:45%"></div><div class="skel" style="height:64px"></div>
+          <div class="skel" style="height:150px"></div><div class="skel" style="height:110px"></div>
+        </div>
+      </main>
+    </div>
+    <nav class="bottomnav" id="bottomnav" aria-label="Navegação"></nav>
+  </div>
+  <div id="layers"></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <?!= include('js_core') ?>
+  <?!= include('js_ui') ?>
+  <?!= include('js_filters') ?>
+  <?!= include('js_login') ?>
+  <?!= include('js_pwa') ?>
+  <?!= include('js_charts') ?>
+  <?!= include('js_reports') ?>
+  <?!= include('js_calc') ?>
+  <?!= include('js_home') ?>
+  <?!= include('js_finance') ?>
+  <?!= include('js_fitness') ?>
+  <?!= include('js_nutrition') ?>
+  <?!= include('js_tasks') ?>
+  <?!= include('js_goals') ?>
+  <?!= include('js_routines') ?>
+  <?!= include('js_estudos_edital') ?>
+  <?!= include('js_estudos_qpdf') ?>
+  <?!= include('js_estudos') ?>
+  <?!= include('js_estudos_b') ?>
+  <?!= include('js_estudos_q') ?>
+  <?!= include('js_estudos_ia') ?>
+  <?!= include('js_estudos_resumo') ?>
+  <?!= include('js_estudos_disc') ?>
+  <?!= include('js_estudos_pdf') ?>
+  <?!= include('js_estudos_ocr') ?>
+  <?!= include('js_settings') ?>
+  <?!= include('js_reports_screens') ?>
+  <?!= include('js_whatsapp') ?>
+  <?!= include('js_telegram') ?>
+  <?!= include('js_alarms') ?>
+  <script>
+    (function () {
+      'use strict';
+      var P = window.Prumo;
+      P.boot = async function () {
+        P.theme.init();
+        if (!P.auth.token()) { P.login.show(); P.pwa.hello(); return; }
+        P.shell.init();
+        try {
+          var data = await P.api.call('boot', {}, { timeout: 150000, retries: 1 });
+          P.me = data.profile || {};
+          P.settings.map = data.settings || {};
+          P.bootInfo = data;
+          P.store.load(data.tables);
+          if (data.profile && data.profile.tema && data.profile.tema !== P.theme.mode) P.theme.apply(data.profile.tema);
+          P.store.on(function (tables) {
+            P.router.refresh(tables);
+            if (tables.some(function (t) { return /^(notificacoes|fin_lancamentos|tar_tarefas|fin_faturas)$/.test(t); })) P.shell.renderTop(P.router.current() || {});
+          });
+          var startRouter = function () { P.router.start(); P.pwa.hello(); if (P.me.tem_pin) P.ui.lock(); if (P.alarms) P.alarms.start(); };
+          if (!location.hash && window.google && google.script && google.script.url) {
+            google.script.url.getLocation(function (loc) { if (loc && loc.hash) location.hash = loc.hash; startRouter(); });
+          } else startRouter();
+        } catch (e) {
+          if (e.code === 'AUTH') return;
+          var hint = /aba|setup/i.test(e.message) ? 'Rode a função setup() no editor do Apps Script e recarregue.' : 'Verifique a conexão e tente de novo.';
+          document.getElementById('view').innerHTML = P.toHtml(P.h`<div class="error-box" style="margin-top:40px">
+            <h2>Não foi possível abrir o Prumo</h2><p class="muted mt-2">${e.message}</p><p class="muted mt-2">${hint}</p>
+            <button class="btn btn-primary mt-4" data-act="ui.reload">Tentar novamente</button></div>`);
+          P.reportError(e, 'boot');
+        }
+      };
+      P.boot();
+    })();
+  </script>
+</body>
+</html>

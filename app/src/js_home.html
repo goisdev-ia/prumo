@@ -1,0 +1,193 @@
+<script>
+/* Prumo · Início (painel unificado), central de notificações e busca global. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const st = { day: D.today() };
+
+  /** Dias seguidos com ao menos um treino, cardio ou rotina feita. */
+  function streak() {
+    const days = new Set(S.where('rot_execucoes', (e) => e.status === 'feito').map((e) => e.data).concat(S.all('fit_sessoes').map((s) => s.data), S.all('fit_cardio').map((c) => c.data)));
+    let d = D.today(), n = 0; if (!days.has(d)) d = D.add(d, -1);
+    while (days.has(d) && n < 999) { n++; d = D.add(d, -1); }
+    return n;
+  }
+  P.homeStreak = streak;
+
+  /** Itens da agenda do dia, misturando módulos, ordenados por hora. */
+  function agenda(date) {
+    const out = [];
+    if (P.rot) P.rot.forDate(date).forEach((r) => out.push({ kind: 'rot', time: r.hora_inicio, r }));
+    S.where('tar_tarefas', (t) => !t.pai_id && t.data_vencimento === date && t.status !== 'cancelada').forEach((t) => out.push({ kind: 'tar', time: t.hora, t }));
+    if (P.tar) P.tar.events(date).forEach((e) => out.push({ kind: 'ev', time: e.dia_inteiro ? '00:00' : fmt.time(e.inicio), e }));
+    if (P.fit) P.fit.plannedToday(date).filter((t) => !P.rot || !P.rot.forDate(date).some((r) => r.vinculo_id === t.id)).forEach((t) => out.push({ kind: 'fit', time: null, t, done: S.all('fit_sessoes').some((s) => s.data === date && s.treino_id === t.id) }));
+    if (P.fin) S.where('fin_lancamentos', (l) => l.status !== 'pago' && l.tipo !== 'transferencia' && l.data === date).forEach((l) => out.push({ kind: 'fin', time: null, l }));
+    if (P.est && P.est.loaded) {
+      const today = D.today(), rev = S.where('est_revisoes', (r) => r.status === 'pendente' && (date === today ? r.vencimento <= date : r.vencimento === date));
+      if (rev.length) out.push({ kind: 'estrev', time: null, n: rev.length, late: rev.filter((r) => r.vencimento < today).length });
+      S.where('est_etapas', (e) => e.data === date && e.status === 'pendente' && !e.evento_id).forEach((e) => out.push({ kind: 'estetapa', time: e.hora || null, e }));
+    }
+    return out.sort((a, b) => String(a.time || '99').localeCompare(String(b.time || '99')));
+  }
+
+  function agendaRow(it, date) {
+    if (it.kind === 'rot') { const r = it.r, e = P.rot.exec(r.id, date); return h`<div class="li ${e && e.status === 'feito' ? 'done' : ''}">${P.rot.check(r, date)}<span class="main tap" data-act="ui.go" data-to="rot"><span class="t">${r.titulo}</span><span class="s">${r.hora_inicio ? r.hora_inicio + (r.hora_fim ? '–' + r.hora_fim : '') + ' · ' : ''}Rotina</span></span><span class="dot" style="background:${P.rot.color(r)}"></span></div>`; }
+    if (it.kind === 'tar') { const t = it.t; return h`<div class="li ${t.status === 'feito' ? 'done' : ''}"><button class="check ${t.status === 'feito' ? 'on' : ''}" data-act="tar.toggle" data-id="${t.id}" aria-label="Concluir">${icon('check')}</button><span class="main tap" data-act="tar.edit" data-id="${t.id}"><span class="t">${t.titulo}</span><span class="s">${t.hora ? t.hora + ' · ' : ''}Tarefa${t.prioridade === 1 ? ' · urgente' : ''}</span></span></div>`; }
+    if (it.kind === 'ev') { const e = it.e; return h`<div class="li tap" data-act="tar.editEvent" data-id="${e.id}"><span class="tile sm" style="background:${e.cor || 'var(--c6)'};color:#1A1A1A">${icon('calendar', 'sm')}</span><span class="main"><span class="t">${e.titulo}</span><span class="s">${e.dia_inteiro ? 'Dia inteiro' : fmt.time(e.inicio)}${e.local ? ' · ' + e.local : ''}</span></span></div>`; }
+    if (it.kind === 'fit') return h`<div class="li"><span class="tile sm" style="background:${it.t.cor || 'var(--primary)'};color:#1A1A1A">${icon('dumbbell', 'sm')}</span><span class="main"><span class="t">${it.t.nome}</span><span class="s">Treino planejado${it.done ? ' · feito' : ''}</span></span>${it.done ? h`<span class="chip up">${icon('check', 'xs')}feito</span>` : h`<button class="btn btn-primary btn-sm" data-act="fit.start" data-id="${it.t.id}">${icon('play', 'sm')}Iniciar</button>`}</div>`;
+    if (it.kind === 'estrev') return h`<a class="li tap" href="#/est/revisoes"><span class="tile sm">${icon('refresh', 'sm')}</span><span class="main"><span class="t">${it.n} revisão(ões) de estudo</span><span class="s">Estudos${it.late ? ' · ' + it.late + ' atrasada(s)' : ''}</span></span>${icon('chev-r', 'sm faint')}</a>`;
+    if (it.kind === 'estetapa') { const e = it.e, c = P.est.conc(e.concurso_id); return h`<a class="li tap" href="#/est/concurso/${e.concurso_id}"><span class="tile sm" style="background:${(c && c.cor) || 'var(--primary)'};color:#1A1A1A">${icon('flag', 'sm')}</span><span class="main"><span class="t">${e.titulo}</span><span class="s">${e.hora ? e.hora + ' · ' : ''}${c ? c.nome : 'Concurso'}${e.data_status && e.data_status !== 'confirmada' ? ' · data ' + e.data_status : ''}</span></span></a>`; }
+    const l = it.l;
+    return h`<div class="li"><button class="check" data-act="fin.pay" data-id="${l.id}" aria-label="Marcar pago">${icon('check')}</button><span class="main tap" data-act="fin.openTx" data-id="${l.id}"><span class="t">${l.descricao}</span><span class="s">${l.tipo === 'receita' ? 'A receber' : 'Conta a pagar'}</span></span><span class="v ${l.tipo === 'receita' ? 'pos' : ''}">${fmt.money(l.valor)}</span></div>`;
+  }
+
+  function insights() {
+    const out = [];
+    const key = D.month(D.today());
+    if (P.fin) P.fin.insights(key).slice(0, 2).forEach((i) => out.push({ ...i, mod: 'fin' }));
+    if (P.fit) { const n = P.fit.weekSessions().length, g = P.fit.goalWeek(); out.push({ icon: 'dumbbell', tone: n >= g ? 'up' : 'acc', text: `${n} ${n === 1 ? 'treino' : 'treinos'} nesta semana, meta ${g}`, sub: n >= g ? 'Meta da semana batida' : `Faltam ${g - n}`, mod: 'fit' }); }
+    if (P.nut) {
+      const g = P.nut.goal(), days = Array.from({ length: 7 }, (_, i) => D.add(D.today(), -i - 1)).map((d) => P.nut.totals(P.nut.entries(d)).kcal).filter((k) => k > 0);
+      if (g && days.length >= 3) { const avg = P.sum(days) / days.length, diff = ((avg - g.kcal) / g.kcal) * 100; out.push({ icon: 'apple', tone: Math.abs(diff) <= 10 ? 'up' : 'acc', text: `Média de ${fmt.num(avg)} kcal nos últimos dias`, sub: `${diff >= 0 ? '+' : ''}${fmt.pct(diff)} da meta`, mod: 'nut' }); }
+    }
+    if (P.tar) { const late = P.tar.overdue().length; if (late) out.push({ icon: 'alert', tone: 'down', text: `${late} ${late === 1 ? 'tarefa atrasada' : 'tarefas atrasadas'}`, sub: 'Reagende ou conclua', mod: 'tar', to: 'tar/pendencias' }); }
+    if (P.rot) { const a = P.rot.adherence(D.add(D.today(), -6), D.today()); if (a.due) out.push({ icon: 'repeat', tone: a.pct >= 75 ? 'up' : 'acc', text: `Rotinas: ${fmt.pct(a.pct)} de aderência na semana`, sub: `${Math.round(a.done)} de ${a.due} cumpridas`, mod: 'rot' }); }
+    if (P.met) { const risk = P.met.active().filter((m) => P.met.pace(m).key === 'atrasada'); if (risk.length) out.push({ icon: 'target', tone: 'down', text: `Meta atrasada: ${risk[0].titulo}`, sub: `${fmt.pct(P.met.pct(risk[0]))} concluído`, mod: 'met', to: 'met/meta/' + risk[0].id }); }
+    return out;
+  }
+
+  P.screen('', {
+    mod: 'home', title: 'Início',
+    render() {
+      const day = st.day, today = D.today(), isToday = day === today;
+      const items = agenda(day);
+      const sk = streak();
+      const fin = P.fin ? P.fin.monthStats(D.month(today)) : null, prevFin = P.fin ? P.fin.monthStats(D.shiftMonth(D.month(today), -1)) : null;
+      const daily = Array.from({ length: 7 }, (_, i) => D.add(today, i - 6)).map((d) => P.sum(S.where('fin_lancamentos', (l) => l.tipo === 'despesa' && l.data === d), (l) => +l.valor));
+      const ng = P.nut ? P.nut.goal(day) : null, nt = P.nut ? P.nut.totals(P.nut.entries(day)) : { kcal: 0 }, ex = P.nut ? P.nut.exerciseKcal(day) : 0;
+      const kLeft = ng ? ng.kcal - nt.kcal + ex : null;
+      const rotList = P.rot ? P.rot.forDate(day) : [], rotDone = rotList.filter((r) => { const e = P.rot.exec(r.id, day); return e && e.status === 'feito'; }).length;
+      const water = P.nut ? P.nut.water(day) : 0, wGoal = P.nut ? P.nut.waterGoal() : 2500;
+      const featured = P.met ? P.met.active().filter((m) => m.status === 'ativa').sort((a, b) => (a.prioridade || 2) - (b.prioridade || 2))[0] : null;
+      const ins = insights();
+      const empty = !S.all('fin_lancamentos').length && !S.all('tar_tarefas').length && !S.all('rot_rotinas').length && !S.all('fit_sessoes').length;
+      const tpl = (P.fit ? P.fit.TEMPLATES.slice(0, 3).map((t) => ({ ...t, act: 'fit.useTpl' })) : []).concat(S.all('rot_modelos').slice(0, 3).map((m, i) => ({ id: m.id, nome: m.nome, blurb: m.descricao, cor: P.PALETTE[(i + 3) % 6], act: 'rot.useModel' })));
+      const modCard = (id, ic, title, value, sub, to) => h`<a class="card link mod-card" href="#/${to}"><span class="tile sm" style="background:var(--primary-tint);color:var(--primary-ink)">${icon(ic, 'sm')}</span><span class="muted" style="font-size:12.5px;font-weight:600">${title}</span><b class="num">${value}</b><span class="faint" style="font-size:12px">${sub}</span></a>`;
+      return h`<div class="home-head"><div><p class="muted">${fmt.dayLong(today)}</p><h1 class="hide-m">${ui.greeting()}${P.me.nome ? ', ' + String(P.me.nome).split(' ')[0] : ''}</h1></div><span class="streak" title="Dias seguidos com treino ou rotina cumprida">${icon('flame')}${sk}</span></div>
+        ${ui.datestrip(day, 'home.day')}
+        ${empty ? h`<div class="card tint pad-lg mb-3 onboard"><span class="logo-tile" style="width:46px;height:46px">${P.logo({ tile: true })}</span><div><b>Comece pelo que mais importa agora</b><p class="muted mt-2" style="font-size:13px">Registre um gasto, crie uma tarefa ou monte sua rotina. Para explorar antes, carregue dados de exemplo e remova quando quiser.</p></div><div class="row-sm wrap"><button class="btn btn-primary btn-sm" data-act="ui.plus">${icon('plus', 'sm')}Adicionar algo</button><button class="btn btn-ghost btn-sm" data-act="cfg.demo">Carregar exemplo</button></div></div>` : ''}
+        <div class="dash">
+          <div class="card span-7"><div class="card-head">${icon('calendar')}<h3>${isToday ? 'Seu dia' : fmt.day(day)}</h3><span class="muted num" style="font-size:12.5px">${items.length} ${items.length === 1 ? 'item' : 'itens'}</span></div>
+            ${items.length ? h`<div class="list">${items.map((it) => agendaRow(it, day))}</div>` : ui.empty({ ill: 'calendar', title: isToday ? 'Agenda livre hoje' : 'Nada neste dia', text: 'Rotinas, tarefas, eventos, treinos e contas do dia aparecem aqui.', small: true, action: { label: 'Nova tarefa', act: 'tar.new' } })}</div>
+          <div class="span-5 grid g2" style="align-content:start">
+            <a class="card link" href="#/nut"><div class="card-head">${icon('flame')}<h3>Calorias</h3></div><div class="row between">${ui.metric({ label: kLeft === null ? 'sem meta' : kLeft >= 0 ? 'restantes' : 'acima', value: kLeft === null ? fmt.num(nt.kcal) : fmt.num(Math.abs(kLeft)), unit: 'kcal', size: 'md' })}${ui.ring(ng ? (nt.kcal / ((ng.kcal + ex) || 1)) * 100 : 0, { size: 54, stroke: 6, color: kLeft !== null && kLeft < 0 ? 'var(--danger)' : 'var(--c4)', icon: 'flame' })}</div></a>
+            <a class="card link" href="#/rot"><div class="card-head">${icon('repeat')}<h3>Rotinas</h3></div><div class="row between">${ui.metric({ label: 'feitas', value: `${rotDone}/${rotList.length}`, size: 'md' })}${ui.ring(rotList.length ? (rotDone / rotList.length) * 100 : 0, { size: 54, stroke: 6, color: 'var(--c6)', icon: 'check' })}</div></a>
+            <div class="card tap" data-act="nut.water" data-v="250"><div class="card-head">${icon('droplet')}<h3>Água</h3><span class="chip acc" style="height:24px">+250</span></div>${ui.metric({ label: `de ${fmt.num(wGoal / 1000, 1)} L`, value: fmt.num(water / 1000, 2), unit: 'L', size: 'md' })}<div class="mt-2">${ui.progress((water / wGoal) * 100, { color: 'var(--c5)', size: 'thin' })}</div></div>
+            <a class="card link" href="#/fit"><div class="card-head">${icon('dumbbell')}<h3>Treinos</h3></div>${ui.metric({ label: 'na semana', value: P.fit ? `${P.fit.weekSessions().length}/${P.fit.goalWeek()}` : '—', size: 'md' })}<div class="mt-2">${ui.progress(P.fit ? (P.fit.weekSessions().length / P.fit.goalWeek()) * 100 : 0, { size: 'thin' })}</div></a>
+          </div>
+          ${fin ? h`<a class="card link pad-lg span-7" href="#/fin"><div class="card-head">${icon('wallet')}<h3>Finanças do mês</h3>${icon('chev-r', 'sm go')}</div>
+            <div class="row between wrap" style="align-items:flex-end;gap:16px"><div>${ui.metric({ label: 'Resultado', value: fmt.money(fin.saldo), cls: fin.saldo >= 0 ? 'pos' : 'neg', count: fin.saldo, fmt: 'money', sub: h`<span>Saldo em contas ${fmt.moneyShort(P.fin.totalBalance())}</span>${ui.delta(fin.desp, prevFin.desp, { invert: true })}` })}</div>
+            <div style="flex:1;max-width:260px;min-width:180px">${ui.bars(daily, { hi: 6, height: 74, labels: Array.from({ length: 7 }, (_, i) => fmt.WD[D.dow(D.add(today, i - 6))][0]) })}</div></div></a>` : ''}
+          ${featured ? h`<a class="card link span-5" href="#/met/meta/${featured.id}"><div class="card-head">${icon('target')}<h3>Meta em destaque</h3><span class="chip ${P.met.pace(featured).cls}">${P.met.pace(featured).label}</span></div><b>${featured.titulo}</b>
+            <div class="row between mt-3" style="font-size:13px"><span class="muted">${P.met.unitFmt(featured, P.met.value(featured))} de ${P.met.unitFmt(featured, featured.valor_alvo)}</span><b class="num">${fmt.pct(P.met.pct(featured))}</b></div><div class="mt-2">${ui.progress(P.met.pct(featured), { size: 'thick', color: featured.cor })}</div>
+            ${featured.prazo ? h`<p class="faint mt-3" style="font-size:12px">${icon('flag', 'xs')} até ${fmt.date(featured.prazo)}</p>` : ''}</a>`
+            : h`<div class="card span-5">${ui.empty({ ill: 'target', title: 'Defina uma meta', text: 'Uma meta clara puxa o resto do sistema.', small: true, action: { label: 'Nova meta', act: 'met.edit' } })}</div>`}
+        </div>
+        <div class="section-title"><h2>Seus módulos</h2></div>
+        <div class="mod-grid">
+          ${P.fin ? modCard('fin', 'wallet', 'Finanças', fmt.moneyShort(fin.desp), 'gastos no mês', 'fin') : ''}
+          ${P.fit ? modCard('fit', 'dumbbell', 'Fitness', P.fit.latestWeight() ? fmt.num(P.fit.latestWeight(), 1) + ' kg' : `${P.fit.weekSessions().length} treinos`, P.fit.latestWeight() ? 'peso atual' : 'na semana', 'fit') : ''}
+          ${P.nut ? modCard('nut', 'apple', 'Alimentação', fmt.num(nt.kcal) + ' kcal', ng ? `meta ${fmt.num(ng.kcal)}` : 'hoje', 'nut') : ''}
+          ${P.tar ? modCard('tar', 'tasks', 'Tarefas', `${P.tar.today().length} hoje`, `${P.tar.overdue().length} atrasada(s)`, 'tar') : ''}
+          ${P.met ? modCard('met', 'target', 'Metas', `${P.met.active().length} ativas`, P.met.active().length ? `${fmt.pct(P.sum(P.met.active(), P.met.pct) / P.met.active().length)} em média` : 'nenhuma ainda', 'met') : ''}
+          ${P.rot ? modCard('rot', 'repeat', 'Rotinas', fmt.pct(P.rot.adherence(D.add(today, -6), today).pct), 'aderência 7 dias', 'rot') : ''}
+        </div>
+        ${ins.length ? h`<div class="section-title"><h2>Insights</h2></div><div class="ins-row">${ins.map((i) => h`<a class="card link insight" href="#/${i.to || i.mod}"><span class="tile sm chip ${i.tone}" style="height:34px;padding:0;justify-content:center">${icon(i.icon, 'sm')}</span><div class="grow"><b>${i.text}</b><div class="muted" style="font-size:12.5px">${i.sub}</div></div></a>`)}</div>` : ''}
+        ${tpl.length ? h`<div class="section-title"><h2>Planos em destaque</h2></div><div class="carousel">${tpl.map((t) => h`<div class="plan-card" style="--pc:${t.cor}">${P.fit ? P.fit.pattern(t.id, t.cor) : ''}<div class="plan-body"><b>${t.nome}</b><span>${t.blurb || ''}</span></div><button class="btn btn-primary btn-sm plan-cta" data-act="${t.act}" data-id="${t.id}">Usar</button></div>`)}</div>` : ''}`;
+    },
+    mount(root) { ui.countUp(root); }
+  });
+  P.act['home.day'] = (el) => { st.day = el.dataset.v; P.router.render(true); };
+
+  // ================= Notificações =================
+  P.notify = {
+    computed() {
+      const out = [], today = D.today();
+      if (P.fin) P.fin.upcoming(2).forEach((u) => out.push({ key: (u.kind === 'tx' ? 'tx:' : 'fat:') + u.ref.id, icon: u.kind === 'fatura' ? 'card' : 'wallet', title: (u.date < today ? 'Vencida: ' : u.date === today ? 'Vence hoje: ' : 'Vence amanhã: ') + u.title, sub: fmt.money(u.valor), run: () => (u.kind === 'tx' ? P.fin.openTx(u.ref) : P.fin.openInvoice(u.ref.id)) }));
+      if (P.tar) { const late = P.tar.overdue(); if (late.length) out.push({ key: 'tar:late', icon: 'alert', title: `${late.length} tarefa(s) atrasada(s)`, sub: late.slice(0, 2).map((t) => t.titulo).join(' · '), run: () => P.router.go('tar/pendencias') }); }
+      if (P.met) P.met.active().filter((m) => P.met.pace(m).key === 'atrasada').forEach((m) => out.push({ key: 'met:' + m.id, icon: 'target', title: 'Meta atrasada: ' + m.titulo, sub: fmt.pct(P.met.pct(m)) + ' concluído', run: () => P.router.go('met/meta/' + m.id) }));
+      if (P.nut && P.settings.get('nut.lembrete_agua', true) && new Date().getHours() >= 15 && P.nut.water(today) < P.nut.waterGoal() * 0.5) out.push({ key: 'agua:' + today, icon: 'droplet', title: 'Bora beber água', sub: `${fmt.num(P.nut.water(today) / 1000, 1)} L de ${fmt.num(P.nut.waterGoal() / 1000, 1)} L hoje`, run: () => P.act['nut.water']({ dataset: { v: 250 } }) });
+      const dis = new Set(P.ls.get('notif.dismissed.' + today, []));
+      return out.filter((n) => !dis.has(n.key));
+    },
+    stored: () => S.where('notificacoes', (n) => !n.lida).sort((a, b) => ((a.created_at || '') < (b.created_at || '') ? 1 : -1)),
+    count() { try { return this.computed().length + this.stored().length; } catch (e) { return 0; } },
+    open() {
+      const draw = () => {
+        const c = this.computed(), s = this.stored();
+        return c.length || s.length ? h`<div class="list">${c.map((n, i) => h`<div class="li tap" data-c="${i}"><span class="tile sm">${icon(n.icon, 'sm')}</span><span class="main"><span class="t">${n.title}</span><span class="s">${n.sub}</span></span>${icon('chev-r', 'sm faint')}</div>`)}
+          ${s.map((n) => h`<div class="li tap" data-s="${n.id}"><span class="tile sm">${icon({ conta: 'wallet', fatura: 'card', tarefa: 'tasks', meta: 'target', alarme: 'alarm', rotina: 'repeat', evento: 'calendar' }[n.tipo] || 'bell', 'sm')}</span><span class="main"><span class="t">${n.titulo}</span><span class="s">${n.corpo || ''} · ${fmt.rel(n.created_at)}</span></span></div>`)}</div>`
+          : ui.empty({ ill: 'check', title: 'Tudo em dia', text: 'Avisos de contas, tarefas, metas e água aparecem aqui.', small: true });
+      };
+      const sh = ui.sheet({ title: 'Notificações', body: draw(), foot: h`<button class="btn btn-ghost" data-all>${icon('check', 'sm')}Marcar tudo como lido</button>`,
+        onMount: (s) => {
+          s.body.addEventListener('click', (e) => {
+            const c = e.target.closest('[data-c]'), st2 = e.target.closest('[data-s]');
+            if (c) { const n = this.computed()[+c.dataset.c]; s.close(); setTimeout(() => n.run(), 260); }
+            if (st2) { const n = S.get('notificacoes', st2.dataset.s); S.save('notificacoes', { id: n.id, lida: true }).catch(() => {}); s.close(); if (n.link) setTimeout(() => { location.hash = n.link; }, 260); }
+          });
+          s.$('[data-all]').onclick = async () => {
+            const today = D.today();
+            P.ls.set('notif.dismissed.' + today, this.computed().map((n) => n.key).concat(P.ls.get('notif.dismissed.' + today, [])));
+            const ids = this.stored().map((n) => ({ id: n.id, lida: true }));
+            if (ids.length) await S.saveMany('notificacoes', ids).catch(() => {});
+            s.setBody(draw()); P.shell.renderTop(P.router.current() || {});
+          };
+        } });
+      return sh;
+    }
+  };
+
+  // ================= Busca global =================
+  P.search = {
+    actions() {
+      const A = (title, ic, run, kind = 'Ação') => ({ title, icon: ic, run, kind });
+      const out = [
+        A('Novo lançamento', 'wallet', () => P.fin.openTx()), A('Escanear comprovante', 'receipt', () => P.fin.scan()), A('Iniciar treino', 'play', () => P.act['fit.pickStart']()),
+        A('Registrar peso', 'scale', () => P.act['fit.addMedida']()), A('Adicionar alimento', 'apple', () => P.nut.add()), A('Registrar 250 ml de água', 'droplet', () => P.act['nut.water']({ dataset: { v: 250 } })),
+        A('Nova tarefa', 'tasks', () => P.act['tar.new']()), A('Novo evento', 'calendar', () => P.act['tar.editEvent']()), A('Nova meta', 'target', () => P.met.edit(null)), A('Nova rotina', 'repeat', () => P.rot.edit(null)),
+        A('Alternar tema', 'moon', () => P.act['ui.toggleTheme']())];
+      if (P.est) out.push(A('Iniciar sessão de estudo', 'play', () => P.act['est.start']({ dataset: {} })), A('Nova questão', 'list', () => P.est.ensure().then(() => P.estQ.edit(null))), A('Revisões de hoje', 'refresh', () => P.router.go('est/revisoes')), A('Enviar PDF para a biblioteca', 'upload', () => P.router.go('est/biblioteca')));
+      P.moduleOrder.forEach((id) => { const m = P.modules[id]; m.tabs.filter((t) => !t.more).concat(m.more || []).forEach((t) => out.push({ title: `${m.name} › ${t.label}`, icon: t.icon, kind: 'Ir para', run: () => P.router.go(t.route) })); });
+      [['Configurações', 'cfg'], ['Perfil', 'cfg/perfil'], ['Logs', 'cfg/logs'], ['Arquivos', 'cfg/arquivos']].forEach(([l, r]) => out.push({ title: l, icon: 'settings', kind: 'Ir para', run: () => P.router.go(r) }));
+      return out;
+    },
+    query(q) {
+      const n = P.norm(q);
+      const acts = this.actions();
+      if (!n) return acts.slice(0, 12);
+      const hit = (s) => P.norm(s).includes(n);
+      const out = acts.filter((a) => hit(a.title)).slice(0, 6);
+      const push = (rows, mapFn, max) => rows.slice(0, max).forEach((r) => out.push(mapFn(r)));
+      push(S.where('fin_lancamentos', (l) => hit(l.descricao) || hit(l.estabelecimento || '')).sort((a, b) => (a.data < b.data ? 1 : -1)), (l) => ({ title: l.descricao, sub: `${fmt.money(l.valor)} · ${fmt.date(l.data)}`, icon: 'wallet', kind: 'Lançamento', run: () => P.fin.openTx(l) }), 6);
+      push(S.where('tar_tarefas', (t) => hit(t.titulo)), (t) => ({ title: t.titulo, sub: t.data_vencimento ? fmt.day(t.data_vencimento) : (t.status === 'feito' ? 'concluída' : 'sem data'), icon: 'tasks', kind: 'Tarefa', run: () => P.tar.edit(t) }), 6);
+      push(S.where('met_metas', (m) => hit(m.titulo)), (m) => ({ title: m.titulo, sub: fmt.pct(P.met.pct(m)), icon: 'target', kind: 'Meta', run: () => P.router.go('met/meta/' + m.id) }), 4);
+      push(S.where('rot_rotinas', (r) => hit(r.titulo)), (r) => ({ title: r.titulo, sub: r.hora_inicio || '', icon: 'repeat', kind: 'Rotina', run: () => P.rot.edit(r) }), 4);
+      push(S.where('nut_alimentos', (f) => hit(f.nome)), (f) => ({ title: f.nome, sub: `${fmt.num(f.kcal)} kcal/100 g`, icon: 'apple', kind: 'Alimento', run: () => P.nut.portion(f, P.nut.mealNow()) }), 5);
+      push(S.where('fit_exercicios', (e) => hit(e.nome)), (e) => ({ title: e.nome, icon: 'dumbbell', kind: 'Exercício', run: () => P.act['fit.openEx']({ dataset: { id: e.id } }) }), 4);
+      if (P.est && P.est.loaded) {
+        const E = P.est;
+        push(S.where('est_materiais', (m) => hit(m.titulo) || hit(m.codigo || '') || hit(m.tags || '')), (m) => ({ title: `${m.codigo} · ${m.titulo}`, sub: m.tipo.toUpperCase(), icon: 'book', kind: 'Material', run: () => E.matOpen(m) }), 5);
+        push(S.where('est_assuntos', (a) => hit(a.titulo)), (a) => ({ title: a.titulo, sub: E.discNome(a.disciplina_id), icon: 'list', kind: 'Assunto', run: () => P.act['est.treinar']({ dataset: { ass: a.id } }) }), 4);
+        push(S.where('est_anotacoes', (n) => hit(n.titulo) || hit(n.conteudo || '')), (n) => ({ title: n.titulo, sub: n.tipo, icon: 'edit', kind: 'Anotação', run: () => E.noteEdit(n) }), 4);
+        push(S.where('est_questoes', (q) => hit(q.codigo || '') || hit(q.enunciado)), (q) => ({ title: `${q.codigo} · ${String(q.enunciado).slice(0, 70)}`, sub: [q.banca, q.ano].filter(Boolean).join(' '), icon: 'list', kind: 'Questão', run: () => P.estQ.runOne(q.id) }), 4);
+        push(S.where('est_concursos', (c) => hit(c.nome) || hit(c.orgao || '') || hit(c.banca || '')), (c) => ({ title: c.nome, sub: [c.orgao, c.banca].filter(Boolean).join(' · '), icon: 'flag', kind: 'Concurso', run: () => P.router.go('est/concurso/' + c.id) }), 3);
+      }
+      push(S.where('fit_treinos', (t) => hit(t.nome)), (t) => ({ title: t.nome, sub: 'iniciar treino', icon: 'play', kind: 'Treino', run: () => P.fit.start(t.id) }), 3);
+      if (q.trim().length > 2) out.push({ title: `Criar tarefa: "${q.trim()}"`, icon: 'plus', kind: 'Ação', run: () => { const p = P.tar.parse(q); S.save('tar_tarefas', { titulo: p.titulo || q.trim(), data_vencimento: p.data_vencimento, hora: p.hora, prioridade: p.prioridade, status: 'a_fazer' }, { toast: 'Tarefa criada' }); } });
+      return out;
+    }
+  };
+})();
+</script>

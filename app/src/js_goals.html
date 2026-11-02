@@ -1,0 +1,309 @@
+<script>
+/* Prumo · Metas: visão por horizonte, detalhe com marcos/check-ins/vínculos, medição automática integrada,
+   roda da vida, linha do tempo e revisão semanal guiada. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const AREAS = [['financeira', 'Financeira', 'wallet'], ['saude', 'Saúde', 'heart'], ['fitness', 'Fitness', 'dumbbell'], ['alimentacao', 'Alimentação', 'apple'], ['carreira', 'Carreira', 'briefcase'], ['estudos', 'Estudos', 'book'], ['pessoal', 'Pessoal', 'user'], ['relacionamentos', 'Relacionamentos', 'heart'], ['lazer', 'Lazer', 'ticket']];
+  const AL = Object.fromEntries(AREAS.map((a) => [a[0], a[1]])), AI = Object.fromEntries(AREAS.map((a) => [a[0], a[2]]));
+  const HZ = { curto: 'Curto prazo', medio: 'Médio prazo', longo: 'Longo prazo' };
+  const ORIG = [['fin_reserva', 'Saldo de uma reserva (Finanças)'], ['fit_peso', 'Peso mais recente (Fitness)'], ['tarefas', 'Tarefas vinculadas concluídas'], ['rotina', 'Dias com o hábito feito (Rotinas)'], ['nut_agua', 'Água de hoje (Alimentação)'],
+    ['est_horas', 'Horas líquidas de estudo (Estudos)'], ['est_questoes', 'Questões resolvidas (Estudos)'], ['est_precisao', 'Precisão nas questões, % (Estudos)'], ['est_revisoes', 'Revisões feitas (Estudos)'], ['est_redacoes', 'Discursivas escritas (Estudos)'], ['est_cobertura', 'Cobertura do edital, % (Estudos)']];
+  const st = { hz: 'todas' };
+
+  const G = P.met = {
+    active: () => S.where('met_metas', (m) => m.status === 'ativa' || m.status === 'pausada'),
+    value: (m) => P.goalValue(m),
+    pct: (m) => P.calc.goalProgress(m, P.goalValue(m)),
+    pace: (m) => P.goalPace(m, P.goalValue(m)),
+    unitFmt(m, v) { if (v === null || v === undefined) return '—'; return m.unidade === 'R$' ? fmt.money(v) : `${fmt.numSmart(v, 1)}${m.unidade ? ' ' + m.unidade : ''}`; },
+    /** Série histórica de medição para o gráfico do detalhe. */
+    history(m) {
+      if (m.medicao === 'automatica' && (m.origem_metrica === 'fit_peso' || m.origem_metrica === 'nut_peso')) return (P.fit ? P.fit.weights() : []).filter((w) => !m.data_inicio || w.data >= m.data_inicio).map((w) => ({ date: w.data, v: +w.peso_kg }));
+      if (m.medicao === 'automatica' && m.origem_metrica === 'fin_reserva') {
+        const rid = m.origem_id || (S.where('fin_reservas', (r) => r.meta_id === m.id)[0] || {}).id;
+        const r = S.get('fin_reservas', rid); if (!r) return [];
+        const tx = S.where('fin_lancamentos', (l) => l.reserva_id === rid).sort((a, b) => (a.data < b.data ? -1 : 1));
+        let cur = +r.saldo_atual - P.sum(tx, (l) => (l.conta_destino_id ? -1 : 1) * +l.valor);
+        const pts = [{ date: m.data_inicio || (tx[0] || {}).data || D.today(), v: P.round(cur) }];
+        tx.forEach((l) => { cur += (l.conta_destino_id ? -1 : 1) * +l.valor; pts.push({ date: l.data, v: P.round(cur) }); });
+        return pts;
+      }
+      if (m.medicao === 'automatica' && m.origem_metrica === 'rotina') {
+        let n = 0; return S.where('rot_execucoes', (e) => (!m.origem_id || e.rotina_id === m.origem_id) && e.status === 'feito' && (!m.data_inicio || e.data >= m.data_inicio)).sort((a, b) => (a.data < b.data ? -1 : 1)).map((e) => ({ date: e.data, v: ++n }));
+      }
+      const pts = S.where('met_checkins', (c) => c.meta_id === m.id && c.valor !== null).sort((a, b) => (a.data < b.data ? -1 : 1)).map((c) => ({ date: c.data, v: +c.valor }));
+      if (m.data_inicio) pts.unshift({ date: m.data_inicio, v: +m.valor_inicial || 0 });
+      return pts;
+    },
+    /** Ritmo necessário x ritmo real (por semana). */
+    rates(m) {
+      const atual = G.value(m), alvo = +m.valor_alvo, hist = G.history(m);
+      const weeksLeft = m.prazo ? Math.max(0.1, D.diff(D.today(), m.prazo) / 7) : null;
+      const need = weeksLeft ? (alvo - atual) / weeksLeft : null;
+      const recent = hist.filter((p) => p.date >= D.add(D.today(), -28));
+      const real = recent.length >= 2 ? ((recent[recent.length - 1].v - recent[0].v) / Math.max(1, D.diff(recent[0].date, recent[recent.length - 1].date))) * 7 : null;
+      const proj = hist.length >= 3 ? P.calc.projectDate(hist.slice(-12), alvo) : null;
+      return { need, real, proj, weeksLeft };
+    },
+    /** Notas 0–10 por área: progresso real das metas + sinais dos módulos. */
+    wheel() {
+      const out = {};
+      AREAS.forEach(([a]) => {
+        const ms = S.where('met_metas', (m) => m.area === a && m.status === 'ativa');
+        let score = ms.length ? P.sum(ms, (m) => G.pct(m)) / ms.length / 10 : null;
+        if (score === null) {
+          if (a === 'fitness' && P.fit) score = Math.min(10, (P.fit.weekSessions().length / P.fit.goalWeek()) * 10);
+          if (a === 'financeira' && P.fin) { const s = P.fin.monthStats(D.month(D.today())); score = s.rec ? P.clamp(s.economia / 2, 0, 10) : null; }
+          if (a === 'alimentacao' && P.nut) { const g = P.nut.goal(); const days = Array.from({ length: 7 }, (_, i) => D.add(D.today(), -i - 1)).map((d) => P.nut.totals(P.nut.entries(d)).kcal).filter((k) => k > 0); score = g && days.length ? (days.filter((k) => Math.abs(k - g.kcal) <= g.kcal * 0.1).length / 7) * 10 : null; }
+          if (a === 'saude') { const ex = S.where('rot_execucoes', (e) => e.data >= D.add(D.today(), -14)); const rs = S.where('rot_rotinas', (r) => r.categoria === 'saude' && r.ativa); if (rs.length) { const due = rs.reduce((n, r) => n + D.range(D.add(D.today(), -14), D.add(D.today(), -1)).filter((d) => P.rotDue(r, d)).length, 0); const done = ex.filter((e) => rs.some((r) => r.id === e.rotina_id) && e.status === 'feito').length; score = due ? Math.min(10, (done / due) * 10) : null; } }
+          if (a === 'estudos') { const rs = S.where('rot_rotinas', (r) => r.categoria === 'estudo' && r.ativa); if (rs.length) { const due = rs.reduce((n, r) => n + D.range(D.add(D.today(), -14), D.add(D.today(), -1)).filter((d) => P.rotDue(r, d)).length, 0); const done = S.where('rot_execucoes', (e) => e.data >= D.add(D.today(), -14) && rs.some((r) => r.id === e.rotina_id) && e.status === 'feito').length; score = due ? Math.min(10, (done / due) * 10) : null; } }
+        }
+        out[a] = score === null ? null : Math.round(score * 10) / 10;
+      });
+      return out;
+    }
+  };
+
+  const goalCard = (m) => {
+    const v = G.value(m), pace = G.pace(m);
+    return h`<a class="card link goal-card" href="#/met/meta/${m.id}" style="--gc:${m.cor || 'var(--primary)'}">
+      <div class="row" style="align-items:flex-start">${ui.ring(pace.pct, { size: 64, stroke: 7, label: fmt.pct(pace.pct), labelSize: 14, color: m.cor || 'var(--primary)' })}
+      <div class="grow" style="min-width:0"><b class="ellipsis" style="display:block">${m.titulo}</b><div class="muted" style="font-size:12.5px;margin-top:2px">${G.unitFmt(m, v)} de ${G.unitFmt(m, m.valor_alvo)}</div>
+      <div class="row-sm wrap mt-2"><span class="chip ${pace.cls}">${pace.label}</span><span class="chip">${icon(AI[m.area] || 'target', 'xs')}${AL[m.area]}</span>${m.status === 'pausada' ? h`<span class="chip">pausada</span>` : ''}${m.medicao === 'automatica' ? h`<span class="chip info">${icon('zap', 'xs')}auto</span>` : ''}</div></div></div>
+      ${m.prazo ? h`<div class="muted mt-3" style="font-size:12px">${icon('flag', 'xs')} até ${fmt.date(m.prazo)} · ${D.diff(D.today(), m.prazo) >= 0 ? P.fmt.plural(D.diff(D.today(), m.prazo), 'dia', 'dias') + ' restantes' : 'prazo vencido'}</div>` : ''}</a>`;
+  };
+  G.card = goalCard;
+
+  // ================= Telas =================
+  const deps = ['met_metas', 'met_marcos', 'met_checkins', 'met_vinculos', 'fin_reservas', 'fin_lancamentos', 'fit_medidas', 'rot_execucoes', 'tar_tarefas', 'nut_agua'];
+
+  P.screen('met', {
+    mod: 'met', tab: 'visao', title: 'Metas', deps,
+    render() {
+      const all = G.active().sort((a, b) => (a.prioridade || 2) - (b.prioridade || 2) || String(a.prazo || '9').localeCompare(String(b.prazo || '9')));
+      const fk = 'met.visao', area = P.flt.get(fk, 'area', '');
+      const rows = (st.hz === 'todas' ? all : all.filter((m) => m.horizonte === st.hz)).filter((m) => (!area || m.area === area) && P.flt.match(fk, m.titulo, m.descricao, m.motivo));
+      const paces = all.map(G.pace);
+      const groups = st.hz === 'todas' ? ['curto', 'medio', 'longo'] : [st.hz];
+      return h`<div class="page-head"><div><h1>Metas</h1><p>${all.length} ativas</p></div><div class="row-sm">${P.rep.button('met')}<button class="btn btn-primary btn-sm" data-act="met.edit">${icon('plus', 'sm')}Nova meta</button></div></div>
+        ${all.length ? h`<div class="grid g3 mb-3"><div class="card">${ui.metric({ label: 'No ritmo', value: paces.filter((p) => p.key === 'no_ritmo' || p.key === 'concluida').length, size: 'md', cls: 'pos' })}</div><div class="card">${ui.metric({ label: 'Atenção', value: paces.filter((p) => p.key === 'atencao').length, size: 'md' })}</div><div class="card">${ui.metric({ label: 'Atrasadas', value: paces.filter((p) => p.key === 'atrasada').length, size: 'md', cls: paces.some((p) => p.key === 'atrasada') ? 'neg' : '' })}</div></div>` : ''}
+        <div class="filters mb-3"><div class="row-f">${ui.seg([['todas', 'Todas'], ['curto', 'Curto'], ['medio', 'Médio'], ['longo', 'Longo']], st.hz, 'met.hz', { cls: 'sm' })}${P.flt.select(fk, 'area', Object.entries(AL), 'Todas as áreas')}</div>${all.length > 4 ? P.flt.search(fk, 'Buscar meta') : ''}</div>
+        ${rows.length ? groups.map((g) => { const r = rows.filter((m) => m.horizonte === g); return r.length ? h`<div class="section-title"><h2>${HZ[g]}</h2><span class="faint" style="font-size:12.5px">${g === 'curto' ? 'até 3 meses' : g === 'medio' ? '3 a 12 meses' : 'mais de 1 ano'}</span></div><div class="grid acc-grid">${r.map(goalCard)}</div>` : ''; })
+          : ui.empty({ ill: 'target', title: all.length ? 'Nenhuma meta neste horizonte' : 'Nenhuma meta ainda', text: 'Metas podem medir sozinhas: saldo de uma reserva, seu peso, tarefas feitas ou dias de um hábito.', action: { label: 'Criar meta', act: 'met.edit' } })}`;
+    }
+  });
+
+  P.screen('met/meta/:id', {
+    mod: 'met', tab: 'visao', title: (c) => ((S.get('met_metas', c.params && c.params.id) || {}).titulo || 'Meta'), deps,
+    render(ctx) {
+      const m = S.get('met_metas', ctx.params.id);
+      if (!m) return ui.empty({ ill: 'search', title: 'Meta não encontrada', action: { label: 'Voltar', act: 'ui.go', data: { to: 'met' } } });
+      const v = G.value(m), pace = G.pace(m), r = G.rates(m);
+      const marcos = S.where('met_marcos', (x) => x.meta_id === m.id).sort((a, b) => (a.ordem || 0) - (b.ordem || 0));
+      const checks = S.where('met_checkins', (x) => x.meta_id === m.id).sort((a, b) => (a.data < b.data ? 1 : -1));
+      const reserva = S.where('fin_reservas', (x) => x.meta_id === m.id)[0] || (m.origem_metrica === 'fin_reserva' ? S.get('fin_reservas', m.origem_id) : null);
+      const tarefas = S.where('tar_tarefas', (t) => t.meta_id === m.id);
+      const rotina = m.origem_metrica === 'rotina' ? S.get('rot_rotinas', m.origem_id) : S.where('rot_rotinas', (x) => x.meta_id === m.id)[0];
+      const lanc = S.where('fin_lancamentos', (l) => l.meta_id === m.id && !l.reserva_id);
+      const unitRate = (x) => (x === null ? '—' : (x > 0 ? '+' : '') + G.unitFmt(m, P.round(x, 2)) + '/sem');
+      return h`<div class="page-head"><div><a href="#/met" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Metas</a><h1 class="mt-2">${m.titulo}</h1>
+        <div class="row-sm wrap mt-2"><span class="chip">${icon(AI[m.area], 'xs')}${AL[m.area]}</span><span class="chip">${HZ[m.horizonte]}</span><span class="chip ${pace.cls}">${pace.label}</span>${m.status !== 'ativa' ? h`<span class="chip">${m.status}</span>` : ''}</div></div>
+        <div class="row-sm"><button class="btn btn-ghost btn-sm" data-act="met.edit" data-id="${m.id}">${icon('edit', 'sm')}Editar</button><button class="btn-icon filled sm" data-act="met.menu" data-id="${m.id}" aria-label="Mais ações">${icon('dots', 'sm')}</button></div></div>
+        <div class="dash"><div class="card pad-lg span-5"><div class="row" style="gap:20px">${ui.ring(pace.pct, { size: 128, stroke: 12, label: fmt.pct(pace.pct), sub: 'concluído', color: m.cor || 'var(--primary)' })}
+          <div class="grow"><div class="kv"><span>Atual</span><b>${G.unitFmt(m, v)}</b></div><div class="kv"><span>Alvo</span><b>${G.unitFmt(m, m.valor_alvo)}</b></div><div class="kv"><span>Início</span><b>${G.unitFmt(m, m.valor_inicial)}</b></div>${m.prazo ? h`<div class="kv"><span>Prazo</span><b>${fmt.date(m.prazo)}</b></div>` : ''}</div></div>
+          ${pace.esperado !== undefined ? h`<div class="mt-4"><div class="row between muted" style="font-size:12.5px;margin-bottom:6px"><span>Progresso</span><span>esperado hoje: ${fmt.pct(pace.esperado)}</span></div><div class="progress thick" style="position:relative"><i style="width:${pace.pct}%;background:${m.cor || 'var(--primary)'}"></i><span style="position:absolute;top:-3px;bottom:-3px;left:${pace.esperado}%;width:2px;background:var(--text)"></span></div></div>` : ''}
+          ${m.medicao === 'automatica' ? h`<p class="muted mt-3" style="font-size:12.5px">${icon('zap', 'xs')} Medida automaticamente: ${(ORIG.find((o) => o[0] === m.origem_metrica) || [, ''])[1]}.</p>` : ''}
+          ${m.medicao !== 'automatica' ? h`<button class="btn btn-primary btn-block mt-4" data-act="met.checkin" data-id="${m.id}">${icon('plus', 'sm')}Registrar progresso</button>` : ''}</div>
+        <div class="card span-7"><div class="card-head">${icon('trending')}<h3>Evolução</h3></div><div id="met-hist"></div>
+          <div class="grid g3 mt-3"><div>${ui.metric({ label: 'Ritmo necessário', value: unitRate(r.need), size: 'md' })}</div><div>${ui.metric({ label: 'Ritmo atual (4 sem.)', value: unitRate(r.real), size: 'md' })}</div><div>${ui.metric({ label: 'Previsão', value: r.proj ? fmt.date(r.proj) : '—', size: 'md', sub: r.proj && m.prazo ? (r.proj <= m.prazo ? 'dentro do prazo' : 'depois do prazo') : '' })}</div></div></div>
+        ${m.motivo || m.descricao ? h`<div class="card span-12">${m.motivo ? h`<p class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;font-weight:700">Por que importa</p><p class="mt-2" style="font-size:16px">${m.motivo}</p>` : ''}${m.descricao ? h`<p class="muted mt-3">${m.descricao}</p>` : ''}</div>` : ''}
+        <div class="card span-6"><div class="card-head">${icon('flag')}<h3>Marcos</h3><button class="btn btn-quiet btn-sm" data-act="met.marco" data-meta="${m.id}">${icon('plus', 'sm')}Marco</button></div>
+          ${marcos.length ? h`<div class="list">${marcos.map((x) => h`<div class="li" style="min-height:52px"><button class="check ${x.concluido ? 'on' : ''}" data-act="met.marcoToggle" data-id="${x.id}" aria-label="Concluir marco">${icon('check')}</button><span class="main tap" data-act="met.marco" data-id="${x.id}" data-meta="${m.id}"><span class="t" style="${x.concluido ? 'text-decoration:line-through;color:var(--text-3)' : ''}">${x.titulo}</span><span class="s">${x.data_prevista ? 'previsto ' + fmt.date(x.data_prevista) : ''}${x.concluido_em ? ' · feito ' + fmt.date(String(x.concluido_em).slice(0, 10)) : ''}</span></span></div>`)}</div>` : h`<p class="faint" style="font-size:13px">Divida em etapas menores para enxergar o caminho.</p>`}</div>
+        <div class="card span-6"><div class="card-head">${icon('link')}<h3>Vínculos</h3></div>
+          ${reserva ? h`<a class="li tap" href="#/fin/reservas">${P.tile(reserva.cor || 'var(--c1)', 'piggy', true)}<span class="main"><span class="t">${reserva.nome}</span><span class="s">Reserva · ${fmt.money(reserva.saldo_atual)}</span></span><button class="btn btn-primary btn-sm" data-act="fin.aporte" data-id="${reserva.id}" data-v="1">Aportar</button></a>` : ''}
+          ${rotina ? h`<a class="li tap" href="#/rot/habitos">${P.tile(rotina.cor || 'var(--c6)', rotina.icone || 'repeat', true)}<span class="main"><span class="t">${rotina.titulo}</span><span class="s">Rotina · sequência ${P.rotStreak(rotina, S.all('rot_execucoes')).atual} dias</span></span></a>` : ''}
+          ${tarefas.map((t) => h`<div class="li tap" data-act="tar.edit" data-id="${t.id}"><span class="check ${t.status === 'feito' ? 'on' : ''}" style="width:22px;height:22px">${icon('check')}</span><span class="main"><span class="t">${t.titulo}</span><span class="s">Tarefa${t.data_vencimento ? ' · ' + fmt.day(t.data_vencimento) : ''}</span></span></div>`)}
+          ${lanc.length ? h`<div class="li"><span class="tile sm">${icon('wallet', 'sm')}</span><span class="main"><span class="t">${lanc.length} lançamento(s)</span><span class="s">${fmt.money(P.sum(lanc, (l) => +l.valor))} vinculados</span></span></div>` : ''}
+          ${!reserva && !rotina && !tarefas.length && !lanc.length ? h`<p class="faint" style="font-size:13px">Vincule tarefas, rotinas ou uma reserva para a meta andar sozinha.</p>` : ''}
+          <div class="row-sm wrap mt-3"><button class="btn btn-ghost btn-sm" data-act="met.newTask" data-id="${m.id}">${icon('tasks', 'sm')}Tarefa</button>${m.area === 'financeira' && !reserva ? h`<button class="btn btn-ghost btn-sm" data-act="met.newReserva" data-id="${m.id}">${icon('piggy', 'sm')}Reserva</button>` : ''}</div></div>
+        <div class="card span-12"><div class="card-head">${icon('history')}<h3>Check-ins</h3></div>
+          ${checks.length ? h`<div class="list">${checks.slice(0, 20).map((c) => h`<div class="li tap" data-act="met.checkin" data-id="${m.id}" data-ck="${c.id}"><span class="main"><span class="t">${c.valor !== null && c.valor !== undefined ? G.unitFmt(m, c.valor) : 'Anotação'}</span><span class="s">${fmt.day(c.data)}${c.nota ? ' · ' + c.nota : ''}</span></span>${c.humor >= 1 && c.humor <= 5 ? h`<span class="chip">${['Difícil', 'Puxado', 'Ok', 'Bem', 'Ótimo'][c.humor - 1]}</span>` : ''}</div>`)}</div>` : h`<p class="faint" style="font-size:13px">Nenhum check-in ainda.</p>`}</div></div>`;
+    },
+    mount(root, ctx) {
+      const m = S.get('met_metas', ctx.params.id); if (!m) return;
+      const hist = G.history(m);
+      P.charts.mount('#met-hist', { type: 'line', labels: hist.map((p) => fmt.dm(p.date)), series: [{ label: m.unidade || 'Valor', data: hist.map((p) => p.v), fill: true, color: m.cor && /^#/.test(m.cor) ? m.cor : undefined }], goal: +m.valor_alvo, zero: false, fmt: (v) => G.unitFmt(m, v), height: 200, empty: 'Sem histórico ainda' });
+    }
+  });
+
+  P.screen('met/roda', {
+    mod: 'met', tab: 'roda', title: 'Roda da vida', deps: deps.concat(['fit_sessoes', 'nut_diario', 'rot_rotinas']),
+    render() {
+      const real = G.wheel(), mine = P.settings.get('met.roda', {}) || {};
+      return h`<div class="page-head"><div><h1>Roda da vida</h1><p>Sua nota x o que os dados mostram</p></div></div>
+        <div class="dash"><div class="card span-7"><div id="wheel"></div></div>
+        <div class="card span-5"><div class="card-head">${icon('sliders')}<h3>Sua nota por área</h3></div>
+          ${AREAS.map(([a, l, ic]) => h`<div class="wheel-row"><span class="row-sm">${icon(ic, 'sm')}${l}</span><input type="range" min="0" max="10" step="1" value="${mine[a] ?? 5}" data-on-change="met.rate" data-area="${a}" aria-label="Nota ${l}"><b class="num">${mine[a] ?? 5}</b><span class="faint num" title="Medido">${real[a] === null ? '—' : fmt.num(real[a], 1)}</span></div>`)}
+          <p class="faint mt-3" style="font-size:12px">A coluna da direita é calculada pelo progresso das metas da área ou, sem meta, por sinais dos módulos (treinos, economia, aderência à dieta e às rotinas).</p></div></div>`;
+    },
+    mount() {
+      const real = G.wheel(), mine = P.settings.get('met.roda', {}) || {};
+      P.charts.mount('#wheel', { type: 'radar', labels: AREAS.map((a) => a[1]), series: [{ label: 'Sua nota', data: AREAS.map(([a]) => mine[a] ?? 5) }, { label: 'Medido', data: AREAS.map(([a]) => real[a] ?? 0), color: '#8FA3B8' }], legend: true, max: 10, height: 360, noScales: true });
+    }
+  });
+
+  P.screen('met/linha', {
+    mod: 'met', tab: 'linha', title: 'Linha do tempo', deps,
+    render() {
+      const fk = 'met.linha', fo = { def: 'tudo', modes: ['ano', 'intervalo', 'tudo'] }, area = P.flt.get(fk, 'area', ''), stt = P.flt.get(fk, 'status', 'todas');
+      const ms = P.pf.filter(fk, S.where('met_metas', (m) => m.prazo && m.status !== 'abandonada' && (!area || m.area === area) && (stt === 'todas' || (stt === 'ativas' ? m.status !== 'concluida' : m.status === 'concluida'))), 'prazo', fo).sort((a, b) => (a.prazo < b.prazo ? -1 : 1));
+      const today = D.today();
+      let todayPlaced = false;
+      return h`<div class="page-head"><div><h1>Linha do tempo</h1><p>Metas e marcos por prazo</p></div></div>
+        <div class="filters mb-3">${P.pf.bar(fk, fo)}<div class="row-f">${P.flt.chips(fk, 'status', [['todas', 'Todas'], ['ativas', 'Em andamento'], ['concluidas', 'Concluídas']])}${P.flt.select(fk, 'area', Object.entries(AL), 'Todas as áreas')}</div></div>
+        ${ms.length ? h`<div class="timeline-v">${ms.map((m) => { const marker = !todayPlaced && m.prazo >= today ? (todayPlaced = true, h`<div class="tv-today"><span>Hoje · ${fmt.date(today)}</span></div>`) : ''; const pace = G.pace(m); const mk = S.where('met_marcos', (x) => x.meta_id === m.id).sort((a, b) => String(a.data_prevista).localeCompare(String(b.data_prevista))); return h`${marker}<div class="tv-item ${m.prazo < today ? 'past' : ''}" style="--gc:${m.cor || 'var(--primary)'}"><span class="tv-dot"></span>
+          <a class="card link" href="#/met/meta/${m.id}"><div class="row between"><b>${m.titulo}</b><span class="chip ${pace.cls}">${fmt.pct(pace.pct)}</span></div><div class="muted" style="font-size:12.5px">${fmt.date(m.prazo)} · ${AL[m.area]}</div>
+          ${mk.length ? h`<div class="row-sm wrap mt-2">${mk.map((x) => h`<span class="chip ${x.concluido ? 'up' : ''}">${x.concluido ? icon('check', 'xs') : ''}${x.titulo}</span>`)}</div>` : ''}</a></div>`; })}${!todayPlaced ? h`<div class="tv-today"><span>Hoje · ${fmt.date(today)}</span></div>` : ''}</div>`
+          : ui.empty({ ill: 'calendar', title: 'Nenhuma meta com prazo', text: 'Defina prazos para ver a linha do tempo.' })}`;
+    }
+  });
+
+  P.screen('met/revisao', {
+    mod: 'met', tab: 'revisao', title: 'Revisão', deps: deps.concat(['fit_sessoes', 'rot_rotinas', 'fin_orcamentos']),
+    render() {
+      const ws = +P.settings.get('geral.inicio_semana', 0), a = D.weekStart(D.today(), ws), b = D.add(a, 6), key = 'revisao_' + a;
+      const saved = P.settings.get('met.' + key, null);
+      const risk = G.active().filter((m) => ['atencao', 'atrasada'].includes(G.pace(m).key));
+      const done = S.where('tar_tarefas', (t) => t.status === 'feito' && String(t.concluida_em).slice(0, 10) >= a).length;
+      const late = P.tar ? P.tar.overdue().length : 0;
+      const rots = S.where('rot_rotinas', (r) => r.ativa);
+      const due = rots.reduce((n, r) => n + D.range(a, D.today()).filter((d) => P.rotDue(r, d)).length, 0);
+      const feitos = S.where('rot_execucoes', (e) => e.data >= a && e.data <= b && e.status === 'feito').length;
+      const gastos = P.fin ? P.sum(S.where('fin_lancamentos', (l) => l.tipo === 'despesa' && l.data >= a && l.data <= b), (l) => +l.valor) : 0;
+      const treinos = P.fit ? P.fit.weekSessions().length : 0;
+      return h`<div class="page-head"><div><h1>Revisão da semana</h1><p>${fmt.dm(a)} a ${fmt.dm(b)}${saved ? ' · revisada em ' + fmt.date(saved.data) : ''}</p></div></div>
+        <div class="grid g4"><div class="card">${ui.metric({ label: 'Tarefas concluídas', value: done, size: 'md', sub: late ? `${late} atrasada(s)` : 'nada atrasado' })}</div>
+          <div class="card">${ui.metric({ label: 'Rotinas', value: due ? fmt.pct((feitos / due) * 100) : '—', size: 'md', sub: `${feitos} de ${due} feitas` })}</div>
+          <div class="card">${ui.metric({ label: 'Treinos', value: `${treinos}/${P.fit ? P.fit.goalWeek() : 4}`, size: 'md' })}</div>
+          <div class="card">${ui.metric({ label: 'Gastos na semana', value: fmt.money(gastos), size: 'md' })}</div></div>
+        <div class="section-title"><h2>1. Metas que pedem atenção</h2></div>
+        ${risk.length ? h`<div class="grid acc-grid">${risk.map(goalCard)}</div>` : h`<div class="card row">${icon('check-circle', 'accent')}<span>Todas as metas estão no ritmo.</span></div>`}
+        <div class="section-title"><h2>2. Reflexão</h2></div>
+        <div class="card"><div class="form"><div class="field"><label>O que funcionou nesta semana?</label><textarea class="input" rows="3" data-rv="funcionou">${saved ? saved.funcionou : ''}</textarea></div>
+          <div class="field"><label>O que vou ajustar na próxima?</label><textarea class="input" rows="3" data-rv="ajustar">${saved ? saved.ajustar : ''}</textarea></div>
+          <div class="field"><label>Prioridade número 1 da próxima semana</label><input class="input" data-rv="prioridade" value="${saved ? saved.prioridade || '' : ''}"></div>
+          <div class="row-sm wrap"><button class="btn btn-primary" data-act="met.saveReview" data-key="${key}">${icon('check', 'sm')}Concluir revisão</button>${late ? h`<button class="btn btn-ghost" data-act="tar.rescheduleAll">Reagendar ${late} atrasada(s) para hoje</button>` : ''}</div></div></div>`;
+    }
+  });
+
+  P.screen('met/concluidas', {
+    mod: 'met', tab: 'concluidas', title: 'Concluídas e arquivadas', deps,
+    render() {
+      const fk = 'met.done', fo = { def: 'tudo', modes: ['mes', 'ano', 'intervalo', 'tudo'] }, stt = P.flt.get(fk, 'status', 'todas'), area = P.flt.get(fk, 'area', '');
+      const base = S.where('met_metas', (m) => m.status === 'concluida' || m.status === 'abandonada');
+      const ms = P.pf.filter(fk, base.filter((m) => (stt === 'todas' || m.status === stt) && (!area || m.area === area)), (m) => m.concluida_em || m.updated_at, fo).sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+      return h`<div class="page-head"><div><h1>Concluídas e arquivadas</h1><p>${ms.length} de ${base.length}</p></div></div>
+        <div class="filters mb-3">${P.pf.bar(fk, fo)}<div class="row-f">${P.flt.chips(fk, 'status', [['todas', 'Todas'], ['concluida', 'Concluídas'], ['abandonada', 'Abandonadas']])}${P.flt.select(fk, 'area', Object.entries(AL), 'Todas as áreas')}</div></div>
+        ${ms.length ? h`<div class="grid acc-grid">${ms.map(goalCard)}</div>` : base.length ? ui.empty({ ill: 'search', title: 'Nada neste filtro', small: true }) : ui.empty({ ill: 'target', title: 'Nada aqui ainda', text: 'Metas concluídas ou abandonadas aparecem nesta lista.' })}`;
+    }
+  });
+
+  // ================= Edição =================
+  G.edit = (row) => {
+    const isNew = !row;
+    const reservas = S.all('fin_reservas'), rotinas = S.where('rot_rotinas', (r) => r.ativa !== false);
+    ui.editSheet({
+      table: 'met_metas', row, title: isNew ? 'Nova meta' : 'Editar meta', size: 'full',
+      defaults: { area: 'pessoal', horizonte: 'medio', medicao: 'manual', data_inicio: D.today(), prazo: D.addMonths(D.today(), 6), valor_inicial: 0, prioridade: 2, status: 'ativa', cor: '#F2B705' },
+      fields: [{ k: 'titulo', l: 'Meta', t: 'text', req: true, focus: isNew, ph: 'Ex.: Juntar 20 mil para a reserva' }, { k: 'motivo', l: 'Por que isso importa?', t: 'textarea', rows: 2, ph: 'O motivo ajuda nos dias difíceis' },
+        { k: 'area', l: 'Área', t: 'select', req: true, half: true, opts: AREAS.map((a) => [a[0], a[1]]) }, { k: 'horizonte', l: 'Horizonte', t: 'select', req: true, half: true, opts: [['curto', 'Curto (até 3 meses)'], ['medio', 'Médio (3 a 12 meses)'], ['longo', 'Longo (+1 ano)']] },
+        { k: 'data_inicio', l: 'Início', t: 'date', half: true }, { k: 'prazo', l: 'Prazo', t: 'date', half: true },
+        { k: 'medicao', l: 'Como medir', t: 'seg', opts: [['manual', 'Manual'], ['automatica', 'Automática'], ['marcos', 'Por marcos']], def: 'manual' },
+        { k: 'origem_metrica', l: 'Fonte da medição', t: 'select', req: true, opts: ORIG, show: (v) => v.medicao === 'automatica' },
+        { k: 'origem_id', l: 'Qual reserva', t: 'select', opts: reservas.map((r) => [r.id, r.nome]), ph: 'Criar reserva nova ao salvar', show: (v) => v.medicao === 'automatica' && v.origem_metrica === 'fin_reserva' },
+        { k: 'origem_id_r', l: 'Qual rotina', t: 'select', opts: rotinas.map((r) => [r.id, r.titulo]), ph: 'Todas', show: (v) => v.medicao === 'automatica' && v.origem_metrica === 'rotina' },
+        { k: 'valor_inicial', l: 'Valor inicial', t: 'num', half: true }, { k: 'valor_alvo', l: 'Valor alvo', t: 'num', req: true, half: true },
+        { k: 'unidade', l: 'Unidade', t: 'text', half: true, ph: 'R$, kg, livros, dias…' }, { k: 'prioridade', l: 'Prioridade', t: 'select', half: true, opts: [[1, 'Alta'], [2, 'Média'], [3, 'Baixa']] },
+        { k: 'descricao', l: 'Detalhes', t: 'textarea', rows: 2 }, { k: 'cor', l: 'Cor', t: 'color' }],
+      onChange: (v, sh) => {
+        if (v.medicao === 'automatica' && v.origem_metrica === 'fit_peso' && P.fit && P.fit.latestWeight()) { const i = sh.$('[data-k="valor_inicial"]'); if (i && !i.value) i.value = String(P.fit.latestWeight()).replace('.', ','); const u = sh.$('[data-k="unidade"]'); if (u && !u.value) u.value = 'kg'; }
+        if (v.medicao === 'automatica' && v.origem_metrica === 'fin_reserva') { const u = sh.$('[data-k="unidade"]'); if (u && !u.value) u.value = 'R$'; }
+        if (v.prazo && v.data_inicio) { const days = D.diff(v.data_inicio, v.prazo), hz = sh.$('[data-k="horizonte"]'); if (hz && isNew) hz.value = days <= 92 ? 'curto' : days <= 366 ? 'medio' : 'longo'; }
+      },
+      beforeSave: (r) => {
+        const out = { ...r, prioridade: +r.prioridade || 2 };
+        if (r.origem_id_r) out.origem_id = r.origem_id_r;
+        delete out.origem_id_r;
+        if (out.medicao !== 'automatica') { out.origem_metrica = null; out.origem_id = null; }
+        if (out.prazo && out.data_inicio && out.prazo < out.data_inicio) throw Object.assign(new Error('O prazo precisa ser depois do início.'), { field: 'prazo' });
+        return out;
+      },
+      save: async (r) => {
+        const saved = await S.save('met_metas', r, { silentError: true });
+        if (r.medicao === 'automatica' && r.origem_metrica === 'fin_reserva' && !r.origem_id) {
+          const res = await S.save('fin_reservas', { nome: r.titulo, meta_id: saved.id, valor_alvo: r.valor_alvo, saldo_atual: r.valor_inicial || 0, cor: r.cor });
+          await S.save('met_metas', { id: saved.id, origem_id: res.id });
+          ui.toast('Reserva criada e vinculada', { action: { label: 'Aportar', fn: () => P.act['fin.aporte']({ dataset: { id: res.id, v: '1' } }) } });
+        } else if (r.origem_metrica === 'fin_reserva' && r.origem_id) {
+          await S.save('fin_reservas', { id: r.origem_id, meta_id: saved.id }).catch(() => {});
+        }
+        if (r.medicao === 'automatica') { const v = P.goalValue(S.get('met_metas', saved.id)); if (v !== saved.valor_atual) S.save('met_metas', { id: saved.id, valor_atual: v }).catch(() => {}); }
+        if (!row) setTimeout(() => P.router.go('met/meta/' + saved.id), 300);
+        return saved;
+      },
+      deleteText: 'Marcos e check-ins também deixam de aparecer.', deleteLabel: 'Meta excluída', onDelete: (m) => { S.remove('met_metas', m.id, { label: 'Meta excluída' }); P.router.go('met'); }
+    });
+  };
+
+  // ================= Ações =================
+  const reRender = () => P.router.render(true);
+  Object.assign(P.act, {
+    'met.hz': (el) => { st.hz = el.dataset.v; reRender(); },
+    'met.edit': (el) => { const m = el && el.dataset.id ? S.get('met_metas', el.dataset.id) : null; G.edit(m ? { ...m, origem_id_r: m.origem_metrica === 'rotina' ? m.origem_id : null } : null); },
+    'met.menu': (el) => {
+      const m = S.get('met_metas', el.dataset.id);
+      ui.menu(m.titulo, [
+        m.status === 'ativa' ? { label: 'Pausar', icon: 'pause', act: () => S.save('met_metas', { id: m.id, status: 'pausada' }, { toast: 'Meta pausada' }) } : { label: 'Retomar', icon: 'play', act: () => S.save('met_metas', { id: m.id, status: 'ativa' }, { toast: 'Meta retomada' }) },
+        { label: 'Marcar como concluída', icon: 'check-circle', act: () => S.save('met_metas', { id: m.id, status: 'concluida', valor_atual: m.medicao === 'automatica' ? P.goalValue(m) : m.valor_alvo }, { toast: 'Meta concluída. Parabéns!' }) },
+        { label: 'Abandonar', icon: 'x', act: () => S.save('met_metas', { id: m.id, status: 'abandonada' }, { toast: 'Meta arquivada' }) },
+        { label: 'Excluir', icon: 'trash', danger: true, act: async () => { if (await ui.confirm({ title: 'Excluir a meta?', ok: 'Excluir', danger: true })) { S.remove('met_metas', m.id, { label: 'Meta excluída' }); P.router.go('met'); } } }]);
+    },
+    'met.checkin': (el) => {
+      const m = S.get('met_metas', el.dataset.id), row = el.dataset.ck ? S.get('met_checkins', el.dataset.ck) : null;
+      ui.editSheet({ table: 'met_checkins', row, title: row ? 'Editar check-in' : 'Registrar progresso', defaults: { meta_id: m.id, data: D.today(), valor: G.value(m), humor: 4 },
+        fields: [{ k: 'valor', l: `Valor atual${m.unidade ? ' (' + m.unidade + ')' : ''}`, t: 'num', focus: true }, { k: 'data', l: 'Data', t: 'date', req: true, half: true }, { k: 'humor', l: 'Como está', t: 'select', half: true, opts: [[5, 'Ótimo'], [4, 'Bem'], [3, 'Ok'], [2, 'Puxado'], [1, 'Difícil']] }, { k: 'nota', l: 'Anotação', t: 'textarea', rows: 2 }],
+        save: async (r) => { const saved = await S.save('met_checkins', { ...r, humor: +r.humor || null }, { silentError: true }); if (r.valor !== null && r.valor !== undefined) await S.save('met_metas', { id: m.id, valor_atual: r.valor }); const pct = P.calc.goalProgress(m, r.valor); if (pct >= 100 && m.status === 'ativa') ui.toast('Você chegou ao alvo!', { icon: 'trophy', action: { label: 'Concluir meta', fn: () => S.save('met_metas', { id: m.id, status: 'concluida' }) } }); return saved; },
+        savedMsg: 'Progresso registrado' });
+    },
+    'met.marco': (el) => {
+      const row = el.dataset.id ? S.get('met_marcos', el.dataset.id) : null, meta = el.dataset.meta;
+      ui.editSheet({ table: 'met_marcos', row, title: row ? 'Editar marco' : 'Novo marco', defaults: { meta_id: meta, ordem: S.where('met_marcos', (x) => x.meta_id === meta).length },
+        fields: [{ k: 'titulo', l: 'Marco', t: 'text', req: true, focus: true }, { k: 'data_prevista', l: 'Previsto para', t: 'date', half: true }, { k: 'valor_alvo', l: 'Valor do marco', t: 'num', half: true }] });
+    },
+    'met.marcoToggle': (el) => { const x = S.get('met_marcos', el.dataset.id); S.save('met_marcos', { id: x.id, concluido: !x.concluido, concluido_em: x.concluido ? null : D.nowIso() }, { toast: x.concluido ? 'Marco reaberto' : 'Marco concluído' }); },
+    'met.newTask': (el) => P.tar && P.tar.edit(null, { meta_id: el.dataset.id }),
+    'met.newReserva': async (el) => {
+      const m = S.get('met_metas', el.dataset.id);
+      const r = await S.save('fin_reservas', { nome: m.titulo, meta_id: m.id, valor_alvo: m.valor_alvo, saldo_atual: G.value(m) || 0, cor: m.cor });
+      await S.save('met_metas', { id: m.id, medicao: 'automatica', origem_metrica: 'fin_reserva', origem_id: r.id });
+      ui.toast('Reserva criada: a meta agora mede sozinha');
+    },
+    'met.rate': async (el) => { const mine = { ...(P.settings.get('met.roda', {}) || {}) }; mine[el.dataset.area] = +el.value; el.nextElementSibling.textContent = el.value; await P.settings.set({ 'met.roda': mine }); P.charts.destroyAll(); const cur = P.router.current(); if (cur && cur.mount) cur.mount(document.getElementById('view')); else P.router.render(true); },
+    'met.saveReview': async (el) => {
+      const vals = {}; P.$$('[data-rv]').forEach((x) => { vals[x.dataset.rv] = x.value.trim(); });
+      await P.settings.set({ ['met.' + el.dataset.key]: { ...vals, data: D.today() } });
+      if (vals.prioridade) await S.save('tar_tarefas', { titulo: vals.prioridade, prioridade: 1, status: 'a_fazer', data_vencimento: D.add(D.today(), 1), tags: 'revisão' }).catch(() => {});
+      ui.toast('Revisão concluída' + (vals.prioridade ? ' · prioridade virou tarefa' : ''));
+    }
+  });
+
+  P.module({
+    id: 'met', name: 'Metas', icon: 'target', home: 'met', plusLabel: 'Nova meta', plus: () => G.edit(null),
+    blurb: () => { const a = G.active(); return a.length ? `${a.length} ativas · ${fmt.pct(P.sum(a, G.pct) / a.length)} em média` : 'Nenhuma meta ativa'; },
+    tabs: [{ id: 'visao', label: 'Visão', icon: 'target', route: 'met' }, { id: 'roda', label: 'Roda', icon: 'radar', route: 'met/roda' }, { id: 'linha', label: 'Linha', icon: 'flag', route: 'met/linha' }, { id: 'mais', label: 'Mais', icon: 'grid', more: true }],
+    more: [{ id: 'revisao', label: 'Revisão da semana', icon: 'check-circle', route: 'met/revisao' }, { id: 'concluidas', label: 'Concluídas e arquivadas', icon: 'trophy', route: 'met/concluidas' }]
+  });
+})();
+</script>

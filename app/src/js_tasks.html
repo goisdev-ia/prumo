@@ -1,0 +1,448 @@
+<script>
+/* Prumo · Tarefas: hoje, próximas, pendências, quadro, agenda (dia/semana/mês), projetos, foco (Pomodoro), concluídas e estatísticas. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const PRIO = { 1: ['Urgente', 'var(--danger)'], 2: ['Alta', 'var(--c4)'], 3: ['Média', 'var(--primary)'], 4: ['Baixa', 'var(--text-3)'] };
+  const WDN = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'];
+  const st = { agenda: 'mes', agMonth: D.month(D.today()), agDay: D.today(), proj: null };
+
+  // ================= Seletores =================
+  const TK = P.tar = {
+    open: () => S.where('tar_tarefas', (t) => t.status !== 'feito' && t.status !== 'cancelada' && !t.pai_id),
+    subs: (id) => S.where('tar_tarefas', (t) => t.pai_id === id).sort((a, b) => (a.ordem || 0) - (b.ordem || 0)),
+    today: () => TK.open().filter((t) => t.data_vencimento === D.today()),
+    overdue: () => TK.open().filter((t) => t.data_vencimento && t.data_vencimento < D.today()),
+    events: (date) => S.where('tar_eventos', (e) => String(e.inicio).slice(0, 10) === date).sort((a, b) => (a.inicio < b.inicio ? -1 : 1)),
+    sort: (a, b) => (a.prioridade || 3) - (b.prioridade || 3) || String(a.hora || '99').localeCompare(String(b.hora || '99')) || (a.ordem || 0) - (b.ordem || 0),
+    projName: (id) => (S.getAny('tar_projetos', id) || {}).nome,
+    /** Interpreta texto livre em pt-BR: "pagar luz amanhã 18h #contas p1". */
+    parse(text) {
+      let t = ' ' + text + ' ';
+      const out = { titulo: '', data_vencimento: null, hora: null, prioridade: 3, tags: [], projeto_id: null, recorrencia_json: null };
+      const today = D.today();
+      const take = (re, fn) => { t = t.replace(re, (...m) => { fn(...m); return ' '; }); };
+      take(/\s[pP]([1-4])(?=\s)/, (m, p) => { out.prioridade = +p; });
+      take(/\s!{1,3}(?=\s)/, (m) => { out.prioridade = 4 - m.trim().length; });
+      take(/\s#([\wÀ-ú-]+)/g, (m, tag) => { const pr = S.all('tar_projetos').find((p) => P.norm(p.nome) === P.norm(tag)); if (pr && !out.projeto_id) out.projeto_id = pr.id; else out.tags.push(tag); });
+      take(/\s(todo dia|todos os dias|diariamente)(?=\s)/i, () => { out.recorrencia_json = { freq: 'diaria' }; });
+      take(/\s(toda semana|semanalmente)(?=\s)/i, () => { out.recorrencia_json = { freq: 'semanal' }; });
+      take(/\s(todo m[eê]s|mensalmente)(?=\s)/i, () => { out.recorrencia_json = { freq: 'mensal' }; });
+      take(/\s(?:[àa]s?\s)?(\d{1,2})(?::(\d{2})|h(\d{2})?)(?=\s)/i, (m, hh, m1, m2) => { if (+hh < 24) out.hora = `${String(hh).padStart(2, '0')}:${m1 || m2 || '00'}`; });
+      take(/\s(hoje)(?=\s)/i, () => { out.data_vencimento = today; });
+      take(/\s(depois de amanh[ãa])(?=\s)/i, () => { out.data_vencimento = D.add(today, 2); });
+      take(/\s(amanh[ãa])(?=\s)/i, () => { out.data_vencimento = D.add(today, 1); });
+      take(/\sem (\d{1,3}) dias?(?=\s)/i, (m, n) => { out.data_vencimento = D.add(today, +n); });
+      take(/\s(pr[oó]xima semana)(?=\s)/i, () => { out.data_vencimento = D.add(D.weekStart(today, 1), 7); });
+      take(/\s(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?(?=\s)/, (m, dd, mm, yy) => { const y = yy ? (yy.length === 2 ? '20' + yy : yy) : today.slice(0, 4); let d = `${y}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`; if (!yy && d < today) d = `${+y + 1}${d.slice(4)}`; if (D.parse(d)) out.data_vencimento = d; });
+      take(/\sdia (\d{1,2})(?=\s)/i, (m, dd) => { let d = `${today.slice(0, 7)}-${dd.padStart(2, '0')}`; if (d < today) d = D.shiftMonth(today.slice(0, 7), 1) + '-' + dd.padStart(2, '0'); out.data_vencimento = d; });
+      take(/\s(?:na |no )?(domingo|segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado)(?:-feira)?(?=\s)/i, (m, w) => { const idx = WDN.indexOf(P.norm(w).replace('ç', 'c')); let n = (idx - D.dow(today) + 7) % 7; if (n === 0) n = 7; out.data_vencimento = D.add(today, n); });
+      out.titulo = t.replace(/\s+/g, ' ').trim();
+      out.titulo = out.titulo.charAt(0).toUpperCase() + out.titulo.slice(1);
+      return out;
+    }
+  };
+
+  const dueLabel = (t) => {
+    if (!t.data_vencimento) return '';
+    const late = t.data_vencimento < D.today() && t.status !== 'feito';
+    return h`<span class="${late ? 'neg' : ''}">${icon('calendar', 'xs')} ${fmt.day(t.data_vencimento)}${t.hora ? ' · ' + t.hora : ''}</span>`;
+  };
+  /** Linha de tarefa com check e swipe (concluir / adiar). */
+  function taskRow(t, o = {}) {
+    const done = t.status === 'feito', subs = TK.subs(t.id), subDone = subs.filter((x) => x.status === 'feito').length, proj = TK.projName(t.projeto_id);
+    return h`<div class="swipe-wrap" data-id="${t.id}"><div class="swipe-act"><span class="l">${icon('check', 'sm')}Concluir</span><span class="r">Amanhã ${icon('calendar', 'sm')}</span></div>
+      <div class="swipe-body li ${done ? 'done' : ''}"><button class="check ${done ? 'on' : ''}" style="border-color:${PRIO[t.prioridade || 3][1]}" data-act="tar.toggle" data-id="${t.id}" aria-label="${done ? 'Reabrir' : 'Concluir'}">${icon('check')}</button>
+      <span class="main tap" data-act="tar.edit" data-id="${t.id}"><span class="t">${t.titulo}</span><span class="s row-sm wrap" style="gap:8px">${o.noDate ? '' : dueLabel(t)}${proj ? h`<span>${icon('folder', 'xs')} ${proj}</span>` : ''}${subs.length ? h`<span>${icon('check-circle', 'xs')} ${subDone}/${subs.length}</span>` : ''}${t.recorrencia_json ? icon('repeat', 'xs') : ''}${t.lembrete_min_antes !== null && t.lembrete_min_antes !== undefined ? icon('bell', 'xs') : ''}${t.tags ? h`<span class="faint">${String(t.tags).split(',').map((x) => '#' + x.trim().replace(/^#/, '')).join(' ')}</span>` : ''}</span></span>
+      ${t.status === 'fazendo' ? h`<span class="chip acc">fazendo</span>` : ''}</div></div>`;
+  }
+  TK.row = taskRow;
+  const list = (rows, o) => rows.length ? h`<div class="list cardlist">${rows.map((t) => taskRow(t, o))}</div>` : '';
+  const bindRows = (root) => ui.bindSwipe(root, '.swipe-wrap', {
+    right: (w) => P.act['tar.toggle']({ dataset: { id: w.dataset.id } }),
+    left: (w) => { const t = S.get('tar_tarefas', w.dataset.id); if (t) S.save('tar_tarefas', { id: t.id, data_vencimento: D.add(D.today(), 1), lembrete_enviado: false }, { toast: 'Adiada para amanhã' }); }
+  });
+  const quickBar = () => h`<form class="quick" data-quick><span class="tile sm">${icon('plus', 'sm')}</span><input class="input" placeholder='Nova tarefa: "pagar luz amanhã 18h #casa p1"' data-quick-in aria-label="Nova tarefa rápida"><button class="btn btn-primary btn-sm" type="submit">Adicionar</button></form><div class="quick-prev" data-quick-prev></div>`;
+  function bindQuick(root, defaults = {}) {
+    const form = root.querySelector('[data-quick]'); if (!form) return;
+    const inp = form.querySelector('[data-quick-in]'), prev = root.querySelector('[data-quick-prev]');
+    inp.addEventListener('input', () => {
+      if (!inp.value.trim()) { prev.innerHTML = ''; return; }
+      const p = TK.parse(inp.value);
+      prev.innerHTML = P.toHtml(h`<span class="chip">${p.titulo || '…'}</span>${p.data_vencimento ? h`<span class="chip acc">${icon('calendar', 'xs')}${fmt.day(p.data_vencimento)}</span>` : ''}${p.hora ? h`<span class="chip acc">${icon('clock', 'xs')}${p.hora}</span>` : ''}${p.prioridade !== 3 ? h`<span class="chip" style="color:${PRIO[p.prioridade][1]}">${PRIO[p.prioridade][0]}</span>` : ''}${p.projeto_id ? h`<span class="chip">${icon('folder', 'xs')}${TK.projName(p.projeto_id)}</span>` : ''}${p.tags.map((t) => h`<span class="chip">#${t}</span>`)}${p.recorrencia_json ? h`<span class="chip">${icon('repeat', 'xs')}${p.recorrencia_json.freq}</span>` : ''}`);
+    });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const p = TK.parse(inp.value);
+      if (!p.titulo) return;
+      inp.value = ''; prev.innerHTML = '';
+      await S.save('tar_tarefas', { titulo: p.titulo, data_vencimento: p.data_vencimento || defaults.data_vencimento || null, hora: p.hora, prioridade: p.prioridade, projeto_id: p.projeto_id || defaults.projeto_id || null, tags: p.tags.join(', ') || null, recorrencia_json: p.recorrencia_json, status: 'a_fazer', ordem: Date.now() / 1e10 }, { toast: 'Tarefa criada' }).catch(() => {});
+      inp.focus();
+    });
+  }
+
+  // ================= Telas =================
+  const deps = ['tar_tarefas', 'tar_projetos', 'tar_eventos', 'tar_foco', 'met_metas'];
+
+  // ================= Filtros comuns (projeto, prioridade, busca) =================
+  function tfBar(fk, extra = '') {
+    const projs = S.all('tar_projetos').filter((p) => !p.arquivado);
+    return h`<div class="filters mb-3"><div class="row-sm">${P.flt.search(fk, 'Buscar tarefa, tag ou descrição')}</div>
+      <div class="row-f">${P.flt.chips(fk, 'prio', [['todos', 'Todas'], ['1', 'Urgentes'], ['2', 'Altas'], ['3', 'Médias'], ['4', 'Baixas']])}${projs.length ? P.flt.select(fk, 'proj', [['_sem', 'Sem projeto'], ...projs.map((p) => [p.id, p.nome])], 'Todos os projetos') : ''}${extra}</div></div>`;
+  }
+  function tf(fk, rows) {
+    const prio = P.flt.get(fk, 'prio', 'todos'), proj = P.flt.get(fk, 'proj', '');
+    return rows.filter((t) => (prio === 'todos' || String(t.prioridade || 3) === prio) && (!proj || (proj === '_sem' ? !t.projeto_id : t.projeto_id === proj))
+      && P.flt.match(fk, t.titulo, t.descricao, t.tags, TK.projName(t.projeto_id)));
+  }
+  const tfOn = (fk) => P.flt.get(fk, 'prio', 'todos') !== 'todos' || !!P.flt.get(fk, 'proj', '') || !!P.flt.get(fk, 'q', '');
+  const semFiltro = ui.empty ? () => ui.empty({ ill: 'search', title: 'Nada neste filtro', text: 'Limpe a busca ou escolha outra prioridade/projeto.', small: true }) : () => '';
+
+  P.screen('tar', {
+    mod: 'tar', tab: 'hoje', title: 'Hoje', deps,
+    render() {
+      const today = D.today(), late = TK.overdue().sort(TK.sort), now = TK.today().sort(TK.sort), ev = TK.events(today);
+      const doneToday = S.where('tar_tarefas', (t) => t.status === 'feito' && !t.pai_id && String(t.concluida_em || '').slice(0, 10) === today);
+      const total = now.length + doneToday.length;
+      return h`<div class="page-head"><div><h1>Hoje</h1><p>${fmt.dayLong(today)}</p></div>${total ? ui.ring((doneToday.length / total) * 100, { size: 58, stroke: 6, label: `${doneToday.length}/${total}`, labelSize: 14 }) : ''}</div>
+        ${quickBar()}
+        ${ev.length ? h`<div class="group-h"><span>Agenda</span></div><div class="list cardlist">${ev.map((e) => h`<div class="li tap" data-act="tar.editEvent" data-id="${e.id}"><span class="tile sm" style="background:${e.cor || 'var(--c6)'};color:#1A1A1A">${icon('calendar', 'sm')}</span><span class="main"><span class="t">${e.titulo}</span><span class="s">${e.dia_inteiro ? 'Dia inteiro' : fmt.time(e.inicio) + (e.fim ? '–' + fmt.time(e.fim) : '')}${e.local ? ' · ' + e.local : ''}</span></span></div>`)}</div>` : ''}
+        ${late.length ? h`<div class="group-h"><span class="neg">Atrasadas · ${late.length}</span><button class="link" data-act="tar.rescheduleAll" style="font-size:12px;font-weight:700;color:var(--primary-ink)">Reagendar para hoje</button></div>${list(late)}` : ''}
+        <div class="group-h"><span>Para hoje</span><span>${now.length}</span></div>
+        ${now.length ? list(now, { noDate: true }) : ui.empty({ ill: 'check', title: late.length ? 'Nada novo para hoje' : 'Dia livre', text: 'Adicione acima ou puxe algo das próximas tarefas.', small: true })}
+        ${doneToday.length ? h`<details class="mt-4"><summary class="group-h" style="cursor:pointer">Concluídas hoje · ${doneToday.length}</summary>${list(doneToday, { noDate: true })}</details>` : ''}`;
+    },
+    mount(root) { bindQuick(root, { data_vencimento: D.today() }); bindRows(root); }
+  });
+
+  P.screen('tar/proximas', {
+    mod: 'tar', tab: 'proximas', title: 'Próximas', deps,
+    render() {
+      const fk = 'tar.prox', horiz = +P.flt.get(fk, 'dias', 14) || 14, open = tf(fk, TK.open()), today = D.today();
+      const days = Array.from({ length: horiz }, (_, i) => D.add(today, i + 1));
+      const later = open.filter((t) => t.data_vencimento && t.data_vencimento > days[days.length - 1]).sort((a, b) => (a.data_vencimento < b.data_vencimento ? -1 : 1));
+      const nodate = open.filter((t) => !t.data_vencimento).sort(TK.sort);
+      return h`<div class="page-head"><div><h1>Próximas</h1><p>Próximos ${horiz} dias</p></div></div>${quickBar()}
+        ${tfBar(fk, P.flt.chips(fk, 'dias', [['7', '7 dias'], ['14', '14 dias'], ['30', '30 dias'], ['90', '90 dias']], '14'))}
+        ${days.map((d) => { const rows = open.filter((t) => t.data_vencimento === d).sort(TK.sort); const ev = TK.events(d); return rows.length || ev.length ? h`<div class="group-h"><span>${fmt.day(d)}</span><span>${rows.length}</span></div>${ev.length ? h`<div class="row-sm wrap mb-2">${ev.map((e) => h`<button class="chip" data-act="tar.editEvent" data-id="${e.id}">${icon('calendar', 'xs')}${e.dia_inteiro ? '' : fmt.time(e.inicio) + ' '}${e.titulo}</button>`)}</div>` : ''}${list(rows, { noDate: true })}` : ''; })}
+        ${later.length ? h`<div class="group-h"><span>Mais adiante</span><span>${later.length}</span></div>${list(later)}` : ''}
+        ${nodate.length ? h`<div class="group-h"><span>Sem data</span><span>${nodate.length}</span></div>${list(nodate)}` : ''}
+        ${!open.length ? (tfOn(fk) ? semFiltro() : ui.empty({ ill: 'check', title: 'Nenhuma tarefa aberta', text: 'Tudo em dia por aqui.' })) : ''}`;
+    },
+    mount(root) { bindQuick(root, { data_vencimento: D.add(D.today(), 1) }); bindRows(root); }
+  });
+
+  P.screen('tar/pendencias', {
+    mod: 'tar', tab: 'pendencias', title: 'Pendências', deps,
+    render() {
+      const fk = 'tar.pend', late = tf(fk, TK.overdue()).sort((a, b) => (a.data_vencimento < b.data_vencimento ? -1 : 1)), nodate = tf(fk, TK.open().filter((t) => !t.data_vencimento)).sort(TK.sort);
+      return h`<div class="page-head"><div><h1>Pendências</h1><p>Atrasadas e sem data</p></div>${late.length ? h`<button class="btn btn-primary btn-sm" data-act="tar.rescheduleAll">${icon('calendar', 'sm')}Reagendar tudo para hoje</button>` : ''}</div>
+        ${tfBar(fk)}
+        ${late.length ? h`<div class="group-h"><span class="neg">Atrasadas</span><span>${late.length}</span></div>${list(late)}` : ''}
+        ${nodate.length ? h`<div class="group-h"><span>Sem data</span><span>${nodate.length}</span></div>${list(nodate)}` : ''}
+        ${!late.length && !nodate.length ? (tfOn(fk) ? semFiltro() : ui.empty({ ill: 'check', title: 'Sem pendências', text: 'Nada atrasado e tudo tem data.' })) : ''}`;
+    },
+    mount(root) { bindRows(root); }
+  });
+
+  P.screen('tar/quadro', {
+    mod: 'tar', tab: 'quadro', title: 'Quadro', deps,
+    render() {
+      const cols = [['a_fazer', 'A fazer'], ['fazendo', 'Fazendo'], ['feito', 'Feito']];
+      const recent = D.add(D.today(), -7);
+      const rows = tf('tar.quadro', S.where('tar_tarefas', (t) => !t.pai_id && t.status !== 'cancelada' && (t.status !== 'feito' || String(t.concluida_em || '') >= recent) && (!st.proj || t.projeto_id === st.proj)));
+      const projs = S.all('tar_projetos').filter((p) => !p.arquivado);
+      return h`<div class="page-head"><div><h1>Quadro</h1><p class="hide-m">Arraste os cartões entre colunas</p><p class="hide-d">Toque no cartão para mover</p></div></div>
+        <div class="filters mb-3"><div class="row-f">${P.flt.search('tar.quadro', 'Buscar no quadro')}${P.flt.chips('tar.quadro', 'prio', [['todos', 'Todas'], ['1', 'Urgentes'], ['2', 'Altas'], ['3', 'Médias'], ['4', 'Baixas']])}</div></div>
+        ${projs.length ? ui.chips([['', 'Todos os projetos']].concat(projs.map((p) => [p.id, p.nome])), st.proj || '', 'tar.boardProj') : ''}
+        <div class="kanban mt-3">${cols.map(([k, l]) => { const items = rows.filter((t) => t.status === k).sort(TK.sort); return h`<div class="kcol" data-col="${k}"><h3><span>${l}</span><span class="faint">${items.length}</span></h3>
+          ${items.map((t) => h`<div class="kcard" draggable="true" data-card="${t.id}" data-act="tar.cardMenu" data-id="${t.id}"><div class="row-sm"><span class="dot" style="background:${PRIO[t.prioridade || 3][1]}"></span><b class="grow" style="font-size:14px">${t.titulo}</b></div><div class="muted row-sm wrap mt-2" style="font-size:12px;gap:8px">${dueLabel(t)}${TK.projName(t.projeto_id) ? h`<span>${icon('folder', 'xs')} ${TK.projName(t.projeto_id)}</span>` : ''}</div></div>`)}
+          ${k === 'a_fazer' ? h`<button class="btn btn-quiet btn-sm" data-act="tar.new">${icon('plus', 'sm')}Adicionar</button>` : ''}</div>`; })}</div>`;
+    },
+    mount(root) {
+      let dragId = null;
+      P.$$('[data-card]', root).forEach((c) => {
+        c.addEventListener('dragstart', (e) => { dragId = c.dataset.card; c.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+        c.addEventListener('dragend', () => c.classList.remove('dragging'));
+      });
+      P.$$('[data-col]', root).forEach((col) => {
+        col.addEventListener('dragover', (e) => { e.preventDefault(); col.classList.add('drop'); });
+        col.addEventListener('dragleave', () => col.classList.remove('drop'));
+        col.addEventListener('drop', (e) => { e.preventDefault(); col.classList.remove('drop'); if (dragId) setStatus(dragId, col.dataset.col); dragId = null; });
+      });
+    }
+  });
+
+  P.screen('tar/agenda', {
+    mod: 'tar', tab: 'agenda', title: 'Agenda', deps,
+    render() {
+      const all = S.where('tar_tarefas', (t) => !t.pai_id && t.data_vencimento && t.status !== 'cancelada'), evs = S.all('tar_eventos');
+      const tasksOn = (d) => all.filter((t) => t.data_vencimento === d).sort(TK.sort);
+      const evsOn = (d) => evs.filter((e) => String(e.inicio).slice(0, 10) === d).sort((a, b) => (a.inicio < b.inicio ? -1 : 1));
+      const dayList = (d) => { const ev = evsOn(d), tk = tasksOn(d); return ev.length || tk.length ? h`${ev.length ? h`<div class="list cardlist mb-3">${ev.map((e) => h`<div class="li tap" data-act="tar.editEvent" data-id="${e.id}"><span class="tile sm" style="background:${e.cor || 'var(--c6)'};color:#1A1A1A">${icon('calendar', 'sm')}</span><span class="main"><span class="t">${e.titulo}</span><span class="s">${e.dia_inteiro ? 'Dia inteiro' : fmt.time(e.inicio) + (e.fim ? '–' + fmt.time(e.fim) : '')}${e.local ? ' · ' + e.local : ''}${e.calendar_event_id ? ' · no Google Agenda' : ''}</span></span></div>`)}</div>` : ''}${list(tk, { noDate: true })}` : ui.empty({ ill: 'calendar', title: 'Nada neste dia', small: true, action: { label: 'Novo evento', act: 'tar.editEvent' } }); };
+      const head = h`<div class="page-head"><div><h1>Agenda</h1></div><div class="row-sm">${ui.seg([['dia', 'Dia'], ['semana', 'Semana'], ['mes', 'Mês']], st.agenda, 'tar.agMode', { cls: 'sm' })}<button class="btn btn-primary btn-sm" data-act="tar.editEvent">${icon('plus', 'sm')}Evento</button></div></div>`;
+      if (st.agenda === 'mes') {
+        return h`${head}<div class="dash"><div class="card span-7"><div class="row between mb-3"><button class="btn-icon sm filled" data-act="tar.agMonth" data-v="-1" aria-label="Mês anterior">${icon('chev-l', 'sm')}</button><b>${fmt.monthCap(st.agMonth)}</b><button class="btn-icon sm filled" data-act="tar.agMonth" data-v="1" aria-label="Próximo mês">${icon('chev-r', 'sm')}</button></div>
+          ${ui.monthCal(st.agMonth, { selected: st.agDay, act: 'tar.agDay', renderDay: (d) => { const dots = evsOn(d).map((e) => e.cor || 'var(--c6)').concat(tasksOn(d).map((t) => (t.status === 'feito' ? 'var(--text-3)' : PRIO[t.prioridade || 3][1]))); return dots.length ? { dots } : null; } })}</div>
+          <div class="span-5"><div class="group-h" style="padding-top:0"><span>${fmt.day(st.agDay)}</span></div>${dayList(st.agDay)}</div></div>`;
+      }
+      if (st.agenda === 'semana') {
+        const ws = +P.settings.get('geral.inicio_semana', 0), a = D.weekStart(st.agDay, ws), days = Array.from({ length: 7 }, (_, i) => D.add(a, i));
+        return h`${head}<div class="row between mb-3"><button class="btn-icon sm filled" data-act="tar.agDay" data-v="${D.add(a, -7)}" aria-label="Semana anterior">${icon('chev-l', 'sm')}</button><b>${fmt.dm(days[0])} – ${fmt.dm(days[6])}</b><button class="btn-icon sm filled" data-act="tar.agDay" data-v="${D.add(a, 7)}" aria-label="Próxima semana">${icon('chev-r', 'sm')}</button></div>
+          <div class="week-grid">${days.map((d) => h`<div class="card week-col ${d === D.today() ? 'today' : ''}"><b>${fmt.WD[D.dow(d)]} ${D.parse(d).getDate()}</b>${evsOn(d).map((e) => h`<button class="wk-item" style="--wc:${e.cor || 'var(--c6)'}" data-act="tar.editEvent" data-id="${e.id}">${e.dia_inteiro ? '' : fmt.time(e.inicio) + ' '}${e.titulo}</button>`)}${tasksOn(d).map((t) => h`<button class="wk-item task ${t.status === 'feito' ? 'done' : ''}" style="--wc:${PRIO[t.prioridade || 3][1]}" data-act="tar.edit" data-id="${t.id}">${t.hora ? t.hora + ' ' : ''}${t.titulo}</button>`)}</div>`)}</div>`;
+      }
+      const hours = Array.from({ length: 17 }, (_, i) => i + 6);
+      const ev = evsOn(st.agDay), tk = tasksOn(st.agDay);
+      return h`${head}${ui.datestrip(st.agDay, 'tar.agDay')}
+        ${ev.filter((e) => e.dia_inteiro).map((e) => h`<button class="chip lg mb-2" data-act="tar.editEvent" data-id="${e.id}">${e.titulo} · dia inteiro</button>`)}
+        <div class="timeline">${hours.map((hr) => { const hh = String(hr).padStart(2, '0'); const items = ev.filter((e) => !e.dia_inteiro && fmt.time(e.inicio).slice(0, 2) === hh).map((e) => h`<button class="tl-item" style="--wc:${e.cor || 'var(--c6)'}" data-act="tar.editEvent" data-id="${e.id}"><b>${e.titulo}</b><span>${fmt.time(e.inicio)}${e.fim ? '–' + fmt.time(e.fim) : ''}</span></button>`).concat(tk.filter((t) => t.hora && t.hora.slice(0, 2) === hh).map((t) => h`<button class="tl-item task" style="--wc:${PRIO[t.prioridade || 3][1]}" data-act="tar.edit" data-id="${t.id}"><b>${t.titulo}</b><span>${t.hora}</span></button>`)); return h`<div class="tl-row"><span class="tl-h">${hh}:00</span><div class="tl-slot">${items}</div></div>`; })}</div>
+        ${tk.filter((t) => !t.hora).length ? h`<div class="group-h"><span>Sem horário</span></div>${list(tk.filter((t) => !t.hora), { noDate: true })}` : ''}`;
+    },
+    mount(root) { bindRows(root); }
+  });
+
+  P.screen('tar/projetos', {
+    mod: 'tar', tab: 'projetos', title: 'Projetos', deps,
+    render(ctx) {
+      const pid = ctx.q.id;
+      if (pid) {
+        const p = S.get('tar_projetos', pid); if (!p) return ui.empty({ ill: 'search', title: 'Projeto não encontrado' });
+        const rows = S.where('tar_tarefas', (t) => t.projeto_id === pid && !t.pai_id && t.status !== 'cancelada');
+        const open = rows.filter((t) => t.status !== 'feito').sort(TK.sort), done = rows.filter((t) => t.status === 'feito');
+        return h`<div class="page-head"><div><a href="#/tar/projetos" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Projetos</a><h1 class="mt-2">${p.nome}</h1><p>${open.length} abertas · ${done.length} concluídas</p></div><button class="btn btn-ghost btn-sm" data-act="tar.editProj" data-id="${p.id}">${icon('edit', 'sm')}Editar</button></div>
+          ${quickBar()}${list(open) || ui.empty({ ill: 'check', title: 'Nada aberto neste projeto', small: true })}${done.length ? h`<details class="mt-4"><summary class="group-h" style="cursor:pointer">Concluídas · ${done.length}</summary>${list(done)}</details>` : ''}`;
+      }
+      const ps = S.all('tar_projetos').sort((a, b) => (a.arquivado ? 1 : 0) - (b.arquivado ? 1 : 0) || a.nome.localeCompare(b.nome));
+      return h`<div class="page-head"><div><h1>Projetos</h1></div><button class="btn btn-primary btn-sm" data-act="tar.editProj">${icon('plus', 'sm')}Novo projeto</button></div>
+        ${ps.length ? h`<div class="grid acc-grid">${ps.map((p) => { const rows = S.where('tar_tarefas', (t) => t.projeto_id === p.id && !t.pai_id && t.status !== 'cancelada'); const d = rows.filter((t) => t.status === 'feito').length; return h`<a class="card link ${p.arquivado ? 'archived' : ''}" href="#/tar/projetos?id=${p.id}"><div class="row">${P.tile(p.cor || 'var(--c6)', p.icone || 'folder')}<div class="grow"><b>${p.nome}</b><div class="muted" style="font-size:12.5px">${rows.length - d} abertas</div></div></div><div class="mt-4">${ui.progress(rows.length ? (d / rows.length) * 100 : 0)}</div></a>`; })}</div>`
+          : ui.empty({ ill: 'list', title: 'Nenhum projeto', text: 'Agrupe tarefas por área: casa, trabalho, estudos…', action: { label: 'Novo projeto', act: 'tar.editProj' } })}`;
+    },
+    mount(root, ctx) { bindQuick(root, { projeto_id: ctx.q.id }); bindRows(root); }
+  });
+
+  // ---------- Foco (Pomodoro) ----------
+  const F = { running: false, end: 0, total: 25 * 60, kind: 'pomodoro', tarefa: null, t0: 0, remaining: 25 * 60, timer: null };
+  const focusLeft = () => (F.running ? Math.max(0, (F.end - Date.now()) / 1000) : F.remaining);
+  function focusTick() {
+    const el = document.getElementById('focus-face'); if (!el) { clearInterval(F.timer); return; }
+    const left = focusLeft();
+    el.querySelector('[data-main]').textContent = fmt.clock(Math.ceil(left));
+    const ring = el.querySelector('.ring-val'); if (ring) { const c = +ring.getAttribute('stroke-dasharray'); ring.setAttribute('stroke-dashoffset', c * (1 - left / F.total)); }
+    if (F.running && left <= 0) {
+      F.running = false; clearInterval(F.timer);
+      if (P.fit) P.fit.beep(3); if (navigator.vibrate) navigator.vibrate([300, 100, 300]);
+      S.save('tar_foco', { tarefa_id: F.tarefa || null, inicio: new Date(F.t0).toISOString(), duracao_s: F.total, tipo: F.kind }).then((f) => {
+        // Pomodoro de uma tarefa de estudo também conta como sessão de estudo (sem duplicar se já houver uma aberta)
+        const tk = F.tarefa && S.get('tar_tarefas', F.tarefa);
+        if (f && f.id && f.tipo !== 'pausa' && tk && (tk.est_tipo || tk.est_disciplina_id || tk.est_assunto_id)) P.api.call('est.fromFocus', { foco_id: f.id }, { mutation: true }).then((r) => { if (r.sessao && !r.repetido) { S.put('est_sessoes', r.sessao); ui.toast('Pomodoro registrado também em Estudos'); } }).catch(() => {});
+      }).catch(() => {});
+      ui.toast(F.kind === 'pomodoro' ? 'Pomodoro concluído. Hora da pausa.' : 'Pausa encerrada. De volta ao foco.', { icon: 'check-circle' });
+      F.kind = F.kind === 'pomodoro' ? 'pausa' : 'pomodoro'; F.total = F.remaining = (F.kind === 'pomodoro' ? +P.settings.get('tar.pomodoro_min', 25) : +P.settings.get('tar.pausa_min', 5)) * 60;
+      P.router.render(true);
+    }
+  }
+  P.screen('tar/foco', {
+    mod: 'tar', tab: 'foco', title: 'Foco', deps: ['tar_foco', 'tar_tarefas'],
+    render() {
+      const today = D.today(), sessions = S.all('tar_foco').filter((f) => f.tipo !== 'pausa'), todayS = sessions.filter((f) => String(f.inicio).slice(0, 10) === today);
+      const opts = TK.open().sort(TK.sort).slice(0, 50);
+      return h`<div class="page-head"><div><h1>Foco</h1><p>Hoje: ${fmt.dur(P.sum(todayS, (f) => +f.duracao_s))} em ${P.fmt.plural(todayS.length, 'sessão', 'sessões')}</p></div></div>
+        <div class="card pad-lg timer" id="focus-face">
+          <span class="chip ${F.kind === 'pomodoro' ? 'acc' : 'up'}">${F.kind === 'pomodoro' ? 'Foco' : 'Pausa'}</span>
+          <div class="timer-dial">${ui.ring((focusLeft() / F.total) * 100, { size: 236, stroke: 14, color: F.kind === 'pomodoro' ? 'var(--primary)' : 'var(--c5)' })}
+          <div class="timer-read"><b class="num" data-main>${fmt.clock(Math.ceil(focusLeft()))}</b><span class="muted">${F.tarefa ? (S.getAny('tar_tarefas', F.tarefa) || {}).titulo : 'Sem tarefa vinculada'}</span></div></div>
+          <div class="row" style="justify-content:center;gap:20px"><button class="btn-icon filled" style="width:56px;height:56px" data-act="tar.focusReset" aria-label="Zerar">${icon('refresh')}</button><button class="fab" style="transform:none;box-shadow:none;width:76px;height:76px" data-act="tar.focusToggle" aria-label="${F.running ? 'Pausar' : 'Iniciar'}">${icon(F.running ? 'pause' : 'play')}</button><button class="btn-icon filled" style="width:56px;height:56px" data-act="tar.focusSkip" aria-label="Pular">${icon('skip')}</button></div>
+          <div class="field mt-4" style="width:100%;max-width:420px"><label>Tarefa</label><select class="input" data-on-change="tar.focusTask"><option value="">Nenhuma</option>${opts.map((t) => h`<option value="${t.id}" ${t.id === F.tarefa ? raw('selected') : ''}>${t.titulo}</option>`)}</select></div>
+        </div>
+        <div class="card mt-4"><div class="card-head">${icon('chart')}<h3>Minutos de foco por dia</h3></div><div id="focus-chart"></div></div>`;
+    },
+    mount() {
+      clearInterval(F.timer); if (F.running) F.timer = setInterval(focusTick, 250);
+      const days = Array.from({ length: 14 }, (_, i) => D.add(D.today(), i - 13));
+      P.charts.mount('#focus-chart', { type: 'bar', labels: days.map((d) => fmt.dm(d)), series: [{ label: 'min', data: days.map((d) => Math.round(P.sum(S.where('tar_foco', (f) => f.tipo !== 'pausa' && String(f.inicio).slice(0, 10) === d), (f) => +f.duracao_s) / 60)) }], highlight: 13, fmt: (v) => v + ' min', height: 180, empty: 'Nenhuma sessão de foco ainda' });
+    }
+  });
+
+  P.screen('tar/concluidas', {
+    mod: 'tar', tab: 'concluidas', title: 'Concluídas', deps,
+    render() {
+      const fk = 'tar.done', fo = { def: '30d', modes: ['7d', '30d', 'mes', 'ano', 'intervalo', 'tudo'] };
+      const doneAt = (t) => String(t.concluida_em || t.updated_at || '').slice(0, 10);
+      const all = S.where('tar_tarefas', (t) => t.status === 'feito' && !t.pai_id);
+      const rows = tf(fk, P.pf.filter(fk, all, doneAt, fo)).sort((a, b) => (String(a.concluida_em) < String(b.concluida_em) ? 1 : -1));
+      const shown = rows.slice(0, 400);
+      const g = P.groupBy(shown, doneAt);
+      return h`<div class="page-head"><div><h1>Concluídas</h1><p>${P.fmt.plural(rows.length, 'tarefa', 'tarefas')} · ${P.pf.range(fk, fo).label}</p></div></div>
+        <div class="filters mb-3">${P.pf.bar(fk, fo)}</div>${tfBar(fk)}
+        ${shown.length ? Object.keys(g).sort().reverse().map((d) => h`<div class="group-h"><span>${fmt.day(d)}</span><span>${g[d].length}</span></div>${list(g[d], { noDate: true })}`) : all.length ? semFiltro() : ui.empty({ ill: 'check', title: 'Nada concluído ainda' })}`;
+    }
+  });
+
+  // Estatísticas: período escolhido, em semanas (até ~6 meses) ou meses
+  const STATS_PF = { def: '90d', modes: ['30d', '90d', 'mes', 'ano', 'intervalo', 'tudo'] };
+  function statsBuckets() {
+    const r = P.pf.range('tar.stats', STATS_PF), t = D.today();
+    const first = S.all('tar_tarefas').reduce((m, x) => { const d = String(x.concluida_em || x.created_at || '').slice(0, 10); return d && (!m || d < m) ? d : m; }, '') || D.add(t, -90);
+    const a = r.from || first, b = r.to && r.to < t ? r.to : t, span = D.diff(a, b);
+    if (span <= 190) {
+      const ws = +P.settings.get('geral.inicio_semana', 0), keys = [];
+      for (let k = D.weekStart(a, ws); k <= b && keys.length < 30; k = D.add(k, 7)) keys.push(k);
+      return { unit: 'semana', keys, label: fmt.dm, inB: (iso, wk) => { const d = String(iso || '').slice(0, 10); return d >= wk && d <= D.add(wk, 6) && d >= a && d <= b; } };
+    }
+    const keys = [];
+    for (let k = D.month(a); k <= D.month(b) && keys.length < 120; k = D.shiftMonth(k, 1)) keys.push(k);
+    return { unit: 'mês', keys, label: fmt.monthShort, inB: (iso, mk) => { const d = String(iso || '').slice(0, 10); return D.month(d) === mk && d >= a && d <= b; } };
+  }
+  P.screen('tar/stats', {
+    mod: 'tar', tab: 'stats', title: 'Estatísticas', deps,
+    render() {
+      const open = TK.open();
+      return h`<div class="page-head"><div><h1>Estatísticas</h1></div>${P.rep.button('tar')}</div>
+        <div class="filters mb-3">${P.pf.bar('tar.stats', STATS_PF)}</div>
+        <div class="grid g3"><div class="card">${ui.metric({ label: 'Abertas', value: open.length, size: 'md' })}</div><div class="card">${ui.metric({ label: 'Atrasadas', value: TK.overdue().length, cls: TK.overdue().length ? 'neg' : '', size: 'md' })}</div><div class="card">${ui.metric({ label: 'Concluídas no período', value: S.where('tar_tarefas', (t) => t.status === 'feito' && P.pf.has('tar.stats', t.concluida_em, STATS_PF)).length, size: 'md', sub: P.pf.range('tar.stats', STATS_PF).label })}</div></div>
+        <div class="dash mt-4"><div class="card span-7"><div class="card-head">${icon('chart')}<h3>Concluídas por ${statsBuckets().unit}</h3></div><div id="tk-week"></div></div>
+        <div class="card span-5"><div class="card-head">${icon('pie')}<h3>Abertas por projeto</h3></div><div id="tk-proj"></div></div>
+        <div class="card span-6"><div class="card-head">${icon('flag')}<h3>Abertas por prioridade</h3></div>${[1, 2, 3, 4].map((p) => { const n = open.filter((t) => (t.prioridade || 3) === p).length; return h`<div class="mb-3"><div class="row between" style="font-size:13.5px;margin-bottom:6px"><span>${PRIO[p][0]}</span><b class="num">${n}</b></div>${ui.progress(open.length ? (n / open.length) * 100 : 0, { color: PRIO[p][1] })}</div>`; })}</div>
+        <div class="card span-6"><div class="card-head">${icon('clock')}<h3>Foco por ${statsBuckets().unit}</h3></div><div id="tk-focus"></div></div></div>`;
+    },
+    mount() {
+      const bk = statsBuckets(), weeks = bk.keys, inW = bk.inB;
+      P.charts.mount('#tk-week', { type: 'bar', labels: weeks.map(bk.label), series: [{ label: 'Concluídas', data: weeks.map((wk) => S.where('tar_tarefas', (t) => t.status === 'feito' && inW(t.concluida_em, wk)).length) }], highlight: weeks.length - 1, height: 200 });
+      const byP = P.groupBy(TK.open(), (t) => TK.projName(t.projeto_id) || 'Sem projeto');
+      const keys = Object.keys(byP);
+      P.charts.mount('#tk-proj', { type: 'doughnut', labels: keys, series: [{ data: keys.map((k) => byP[k].length) }], noScales: true, legend: true, height: 220 });
+      P.charts.mount('#tk-focus', { type: 'bar', labels: weeks.map(bk.label), series: [{ label: 'horas', data: weeks.map((wk) => P.round(P.sum(S.where('tar_foco', (f) => f.tipo !== 'pausa' && inW(f.inicio, wk)), (f) => +f.duracao_s) / 3600, 1)) }], highlight: weeks.length - 1, fmt: (v) => fmt.num(v, 1) + ' h', height: 200, empty: 'Sem sessões de foco' });
+    }
+  });
+
+  // ================= Edição =================
+  function nextDue(t) {
+    const f = (t.recorrencia_json || {}).freq, base = t.data_vencimento || D.today();
+    return f === 'diaria' ? D.add(base, 1) : f === 'semanal' ? D.add(base, 7) : f === 'mensal' ? D.addMonths(base, 1) : f === 'anual' ? D.addMonths(base, 12) : null;
+  }
+  async function setStatus(id, status) {
+    const t = S.get('tar_tarefas', id); if (!t || t.status === status) return;
+    await S.save('tar_tarefas', { id, status, concluida_em: status === 'feito' ? D.nowIso() : null }).catch(() => {});
+    if (status === 'feito' && t.recorrencia_json && t.recorrencia_json.freq) {
+      const nd = nextDue(t);
+      await S.save('tar_tarefas', { titulo: t.titulo, descricao: t.descricao, prioridade: t.prioridade, projeto_id: t.projeto_id, tags: t.tags, hora: t.hora, lembrete_min_antes: t.lembrete_min_antes, recorrencia_json: t.recorrencia_json, data_vencimento: nd, status: 'a_fazer', meta_id: t.meta_id, rotina_id: t.rotina_id }).catch(() => {});
+      ui.toast(`Próxima: ${fmt.day(nd)}`, { icon: 'repeat' });
+    }
+  }
+  TK.setStatus = setStatus;
+
+  TK.edit = (row, defaults = {}) => {
+    const isNew = !row || !row.id;
+    const subs = isNew ? [] : TK.subs(row.id);
+    const v = { status: 'a_fazer', prioridade: 3, ...defaults, ...(row || {}), recorrencia: row && row.recorrencia_json ? row.recorrencia_json.freq : '' };
+    v._alarme = P.alarms ? P.alarms.taskOffset(row) : '';
+    ui.editSheet({
+      table: 'tar_tarefas', row: isNew ? null : v, title: isNew ? 'Nova tarefa' : 'Editar tarefa', size: 'full', defaults: v,
+      fields: [{ k: 'titulo', l: 'Título', t: 'text', req: true, focus: isNew, max: 160 }, { k: 'descricao', l: 'Descrição', t: 'textarea', rows: 2 },
+        { k: 'data_vencimento', l: 'Data', t: 'date', half: true }, { k: 'hora', l: 'Hora', t: 'time', half: true },
+        { k: 'prioridade', l: 'Prioridade', t: 'seg', opts: [[1, 'Urgente'], [2, 'Alta'], [3, 'Média'], [4, 'Baixa']], def: 3 },
+        { k: 'projeto_id', l: 'Projeto', t: 'select', half: true, opts: S.all('tar_projetos').filter((p) => !p.arquivado).map((p) => [p.id, p.nome]) },
+        { k: 'status', l: 'Situação', t: 'select', half: true, req: true, opts: [['a_fazer', 'A fazer'], ['fazendo', 'Fazendo'], ['feito', 'Feito'], ['cancelada', 'Cancelada']] },
+        { k: '_alarme', l: 'Alarme', t: 'select', half: true, ph: 'Sem alarme', opts: [[0, 'Na hora'], [5, '5 min antes'], [10, '10 min antes'], [15, '15 min antes'], [30, '30 min antes'], [60, '1 h antes'], [1440, '1 dia antes']], hint: 'Toca no app e avisa no celular' },
+        { k: 'lembrete_min_antes', l: 'Lembrete por e-mail', t: 'select', half: true, ph: 'Sem lembrete', opts: [[0, 'Na hora'], [15, '15 min antes'], [30, '30 min antes'], [60, '1 h antes'], [1440, '1 dia antes']] },
+        { k: 'recorrencia', l: 'Repetir', t: 'select', half: true, ph: 'Não repetir', opts: [['diaria', 'Todo dia'], ['semanal', 'Toda semana'], ['mensal', 'Todo mês'], ['anual', 'Todo ano']] },
+        { k: 'duracao_estimada_min', l: 'Duração estimada', t: 'int', unit: 'min', half: true }, { k: 'tags', l: 'Tags', t: 'text', half: true, ph: 'casa, banco' },
+        { k: 'meta_id', l: 'Vincular a uma meta', t: 'select', opts: S.where('met_metas', (m) => m.status === 'ativa').map((m) => [m.id, m.titulo]) }],
+      extra: !isNew ? h`<div class="field"><span class="label">Subtarefas</span><div class="list" data-subs>${subs.map((s) => h`<div class="li" style="min-height:44px"><button type="button" class="check ${s.status === 'feito' ? 'on' : ''}" data-sub-toggle="${s.id}" aria-label="Concluir">${icon('check')}</button><span class="main"><span class="t" style="${s.status === 'feito' ? 'text-decoration:line-through;color:var(--text-3)' : ''}">${s.titulo}</span></span><button type="button" class="btn-icon sm" data-sub-del="${s.id}" aria-label="Excluir">${icon('x', 'sm')}</button></div>`)}</div>
+        <div class="row-sm"><input class="input" placeholder="Nova subtarefa" data-sub-new><button type="button" class="btn btn-ghost btn-sm" data-sub-add>${icon('plus', 'sm')}</button></div></div>
+        <div class="row-sm wrap"><button type="button" class="btn btn-ghost btn-sm" data-focus>${icon('timer', 'sm')}Focar nesta tarefa</button></div>` : '',
+      mount(sh) {
+        if (isNew) return;
+        const add = () => { const inp = sh.$('[data-sub-new]'); if (!inp.value.trim()) return; S.save('tar_tarefas', { titulo: inp.value.trim(), pai_id: row.id, status: 'a_fazer', prioridade: row.prioridade || 3, ordem: subs.length }).then(() => { sh.close(); setTimeout(() => TK.edit(S.get('tar_tarefas', row.id)), 260); }).catch(() => {}); };
+        sh.$('[data-sub-add]').onclick = add;
+        sh.$('[data-sub-new]').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
+        sh.$('[data-subs]').addEventListener('click', (e) => {
+          const tg = e.target.closest('[data-sub-toggle]'), dl = e.target.closest('[data-sub-del]');
+          if (tg) { const s = S.get('tar_tarefas', tg.dataset.subToggle); setStatus(s.id, s.status === 'feito' ? 'a_fazer' : 'feito'); tg.classList.toggle('on'); }
+          if (dl) { S.remove('tar_tarefas', dl.dataset.subDel, { undo: false }); dl.closest('.li').remove(); }
+        });
+        sh.$('[data-focus]').onclick = () => { F.tarefa = row.id; sh.close(); P.router.go('tar/foco'); };
+      },
+      beforeSave: (r) => {
+        const out = { ...r, recorrencia_json: r.recorrencia ? { freq: r.recorrencia } : null, prioridade: +r.prioridade || 3 };
+        delete out.recorrencia;
+        if (out.status === 'feito' && (!row || row.status !== 'feito')) out.concluida_em = D.nowIso();
+        if (out.status !== 'feito') out.concluida_em = null;
+        if (row && (row.data_vencimento !== out.data_vencimento || row.hora !== out.hora || row.lembrete_min_antes !== out.lembrete_min_antes)) out.lembrete_enviado = false;
+        return out;
+      },
+      afterSave: (saved, extras) => { if (P.alarms && extras && '_alarme' in extras && (extras._alarme !== '' || P.alarms.taskOffset(saved) !== '')) P.alarms.linkTask(saved, extras._alarme); },
+      deleteLabel: 'Tarefa excluída'
+    });
+  };
+
+  TK.editEvent = (row, defaults = {}) => {
+    const isNew = !row;
+    const v = row ? { ...row, data: String(row.inicio).slice(0, 10), hora_ini: fmt.time(row.inicio), hora_fim: row.fim ? fmt.time(row.fim) : '' } : { data: defaults.data || st.agDay || D.today(), hora_ini: '09:00', hora_fim: '10:00', cor: '#8FA3B8' };
+    const calOn = P.settings.get('int.calendar', false) === true;
+    ui.editSheet({
+      table: 'tar_eventos', row: isNew ? null : v, title: isNew ? 'Novo evento' : 'Editar evento', defaults: v,
+      fields: [{ k: 'titulo', l: 'Título', t: 'text', req: true, focus: isNew }, { k: 'data', l: 'Data', t: 'date', req: true },
+        { k: 'dia_inteiro', l: 'Dia inteiro', t: 'toggle' }, { k: 'hora_ini', l: 'Início', t: 'time', half: true, show: (x) => !x.dia_inteiro }, { k: 'hora_fim', l: 'Fim', t: 'time', half: true, show: (x) => !x.dia_inteiro },
+        { k: 'local', l: 'Local', t: 'text' }, { k: 'lembrete_min', l: 'Lembrete', t: 'select', ph: 'Sem lembrete', opts: [[10, '10 min antes'], [30, '30 min antes'], [60, '1 h antes'], [1440, '1 dia antes']] }, { k: 'cor', l: 'Cor', t: 'color' }, { k: 'descricao', l: 'Descrição', t: 'textarea', rows: 2 }],
+      extra: calOn ? h`<label class="row between"><span style="font-weight:600">Enviar ao Google Agenda</span><span class="toggle"><input type="checkbox" data-gcal ${!row || row.calendar_event_id ? raw('checked') : ''}><span></span></span></label>` : '',
+      mount(sh) { sh._gcal = () => { const c = sh.$('[data-gcal]'); return c && c.checked; }; },
+      save: async (r, sh) => {
+        const off = D.nowIso().slice(19);
+        const ev = { ...(row || {}), titulo: r.titulo, dia_inteiro: !!r.dia_inteiro, local: r.local, lembrete_min: r.lembrete_min, cor: r.cor, descricao: r.descricao,
+          inicio: `${r.data}T${r.dia_inteiro ? '00:00' : (r.hora_ini || '09:00')}:00${off}`, fim: r.dia_inteiro ? null : `${r.data}T${r.hora_fim || r.hora_ini || '10:00'}:00${off}` };
+        if (ev.fim && ev.fim < ev.inicio) throw Object.assign(new Error('O fim precisa ser depois do início.'), { field: 'hora_fim' });
+        const saved = await S.save('tar_eventos', ev, { silentError: true });
+        if (sh._gcal()) S.route('tasks.calendar', { evento_id: saved.id }).then(() => ui.toast('Enviado ao Google Agenda', { icon: 'calendar' })).catch((e) => ui.toast(e.message, { error: true }));
+        return saved;
+      },
+      deleteLabel: 'Evento excluído'
+    });
+  };
+
+  // ================= Ações =================
+  const reRender = () => P.router.render(true);
+  Object.assign(P.act, {
+    'tar.new': () => TK.edit(null, { data_vencimento: P.router.current() && P.router.current().tab === 'hoje' ? D.today() : null }),
+    'tar.edit': (el) => { const t = S.get('tar_tarefas', el.dataset.id); if (t) TK.edit(t); },
+    'tar.toggle': (el) => { const t = S.get('tar_tarefas', el.dataset.id); if (!t) return; if (navigator.vibrate) navigator.vibrate(12); setStatus(t.id, t.status === 'feito' ? 'a_fazer' : 'feito'); },
+    'tar.rescheduleAll': async () => {
+      const late = TK.overdue(); if (!late.length) return;
+      await S.saveMany('tar_tarefas', late.map((t) => ({ id: t.id, data_vencimento: D.today(), lembrete_enviado: false })));
+      ui.toast(`${late.length} tarefa(s) reagendada(s) para hoje`);
+    },
+    'tar.cardMenu': (el) => {
+      if (innerWidth >= 1024) return TK.edit(S.get('tar_tarefas', el.dataset.id));
+      const t = S.get('tar_tarefas', el.dataset.id);
+      ui.menu(t.titulo, [['a_fazer', 'Mover para A fazer', 'list'], ['fazendo', 'Mover para Fazendo', 'play'], ['feito', 'Concluir', 'check']].filter(([s]) => s !== t.status).map(([s, l, ic]) => ({ label: l, icon: ic, act: () => setStatus(t.id, s) })).concat([{ label: 'Editar', icon: 'edit', act: () => TK.edit(t) }]));
+    },
+    'tar.boardProj': (el) => { st.proj = el.dataset.v || null; reRender(); },
+    'tar.agMode': (el) => { st.agenda = el.dataset.v; reRender(); },
+    'tar.agMonth': (el) => { st.agMonth = D.shiftMonth(st.agMonth, +el.dataset.v); reRender(); },
+    'tar.agDay': (el) => { st.agDay = el.dataset.v; st.agMonth = D.month(st.agDay); reRender(); },
+    'tar.editEvent': (el) => TK.editEvent(el && el.dataset.id ? S.get('tar_eventos', el.dataset.id) : null),
+    'tar.editProj': (el) => {
+      const row = el && el.dataset.id ? S.get('tar_projetos', el.dataset.id) : null;
+      ui.editSheet({ table: 'tar_projetos', row, title: row ? 'Editar projeto' : 'Novo projeto', defaults: { cor: '#8FA3B8', icone: 'folder' },
+        fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true }, { k: 'icone', l: 'Ícone', t: 'select', opts: ['folder', 'home', 'briefcase', 'book', 'heart', 'laptop', 'car', 'plane', 'gift', 'wallet'].map((i) => [i, i]) }, { k: 'cor', l: 'Cor', t: 'color' }, { k: 'arquivado', l: 'Arquivar', t: 'toggle', show: () => !!row }],
+        deleteText: 'As tarefas ficam sem projeto.', deleteLabel: 'Projeto excluído' });
+    },
+    'tar.focusToggle': () => {
+      if (F.running) { F.remaining = focusLeft(); F.running = false; clearInterval(F.timer); }
+      else { if (!F.t0 || F.remaining === F.total) F.t0 = Date.now(); F.end = Date.now() + F.remaining * 1000; F.running = true; clearInterval(F.timer); F.timer = setInterval(focusTick, 250); try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); } catch (e) { /* noop */ } }
+      reRender();
+    },
+    'tar.focusReset': () => { F.running = false; clearInterval(F.timer); F.remaining = F.total; F.t0 = 0; reRender(); },
+    'tar.focusSkip': () => { F.running = false; clearInterval(F.timer); F.kind = F.kind === 'pomodoro' ? 'pausa' : 'pomodoro'; F.total = F.remaining = (F.kind === 'pomodoro' ? +P.settings.get('tar.pomodoro_min', 25) : +P.settings.get('tar.pausa_min', 5)) * 60; reRender(); },
+    'tar.focusTask': (el) => { F.tarefa = el.value || null; }
+  });
+
+  P.module({
+    id: 'tar', name: 'Tarefas', icon: 'tasks', home: 'tar', plusLabel: 'Nova tarefa', plus: () => P.act['tar.new'](),
+    blurb: () => `${TK.today().length} hoje · ${TK.overdue().length} atrasada(s)`,
+    tabs: [{ id: 'hoje', label: 'Hoje', icon: 'check-circle', route: 'tar' }, { id: 'proximas', label: 'Próximas', icon: 'list', route: 'tar/proximas' }, { id: 'agenda', label: 'Agenda', icon: 'calendar', route: 'tar/agenda' }, { id: 'mais', label: 'Mais', icon: 'grid', more: true }],
+    more: [{ id: 'alarmes', label: 'Alarmes', icon: 'alarm', route: 'tar/alarmes' }, { id: 'pendencias', label: 'Pendências', icon: 'alert', route: 'tar/pendencias' }, { id: 'quadro', label: 'Quadro', icon: 'kanban', route: 'tar/quadro' }, { id: 'projetos', label: 'Projetos', icon: 'folder', route: 'tar/projetos' }, { id: 'foco', label: 'Foco (Pomodoro)', icon: 'timer', route: 'tar/foco' }, { id: 'concluidas', label: 'Concluídas', icon: 'check', route: 'tar/concluidas' }, { id: 'stats', label: 'Estatísticas', icon: 'chart', route: 'tar/stats' }]
+  });
+})();
+</script>

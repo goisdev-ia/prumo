@@ -1,0 +1,1007 @@
+<script>
+/* Prumo · Finanças: resumo, lançamentos, contas, cartões e faturas, orçamento, agenda/recorrências,
+   reservas e investimentos, dívidas, relatórios, categorias e regras, importação e OCR de comprovantes. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const CAT_ICONS = ['home', 'cart', 'utensils', 'coffee', 'car', 'heart', 'book', 'ticket', 'repeat', 'bag', 'landmark', 'paw', 'plane', 'gift', 'briefcase', 'laptop', 'trending', 'zap', 'droplet', 'wallet', 'card', 'piggy', 'dumbbell', 'dots'];
+  const FORMAS = [['pix', 'Pix'], ['debito', 'Débito'], ['credito', 'Crédito'], ['dinheiro', 'Dinheiro'], ['boleto', 'Boleto'], ['transferencia', 'Transferência'], ['outro', 'Outro']];
+  const st = { month: D.month(D.today()), txFilter: { tipo: 'todos', q: '', periodo: 'mes' }, txLimit: 120, select: null, catTipo: 'despesa', faturaTab: 'abertas', relPeriodo: 6, debtStrategy: 'avalanche', debtExtra: 300 };
+
+  // ================= Seletores =================
+  const F = P.fin = {
+    st,
+    cats: () => S.all('fin_categorias').filter((c) => !c.arquivada).sort((a, b) => (a.ordem || 0) - (b.ordem || 0) || a.nome.localeCompare(b.nome)),
+    parentId(id) { const c = S.getAny('fin_categorias', id); return c ? (c.pai_id || c.id) : null; },
+    cat: (id) => S.getAny('fin_categorias', id),
+    catColor(id) { const c = F.cat(id); if (!c) return 'var(--c7)'; const p = c.pai_id ? F.cat(c.pai_id) : null; return c.cor || (p && p.cor) || 'var(--c7)'; },
+    catIcon(id) { const c = F.cat(id); if (!c) return 'dots'; const p = c.pai_id ? F.cat(c.pai_id) : null; return c.icone || (p && p.icone) || 'dots'; },
+    catLabel(id) { const c = F.cat(id); if (!c) return 'Sem categoria'; const p = c.pai_id ? F.cat(c.pai_id) : null; return p ? `${p.nome} › ${c.nome}` : c.nome; },
+    catOptions(tipo) {
+      const all = F.cats().filter((c) => !tipo || c.tipo === tipo);
+      return all.filter((c) => !c.pai_id).map((p) => {
+        const kids = all.filter((c) => c.pai_id === p.id);
+        return kids.length ? { group: p.nome, items: [[p.id, p.nome + ' (geral)']].concat(kids.map((k) => [k.id, k.nome])) } : [p.id, p.nome];
+      });
+    },
+    contas: (all) => S.all('fin_contas').filter((c) => all || !c.arquivada).sort((a, b) => (a.ordem || 0) - (b.ordem || 0)),
+    cartoes: (all) => S.all('fin_cartoes').filter((c) => all || !c.arquivado),
+    txs: () => S.all('fin_lancamentos'),
+    sign: (l) => (l.tipo === 'receita' ? 1 : l.tipo === 'despesa' ? -1 : 0),
+    /** Saldo da conta: saldo inicial + base anterior à janela do boot + lançamentos pagos carregados. */
+    balance(contaId) {
+      const c = S.getAny('fin_contas', contaId); if (!c) return 0;
+      let cents = P.cents(c.saldo_inicial) + P.cents((P.bootInfo && P.bootInfo.finBase && P.bootInfo.finBase[contaId]) || 0);
+      F.txs().forEach((l) => {
+        if (l.status !== 'pago') return;
+        const v = P.cents(l.valor);
+        if (l.tipo === 'receita' && l.conta_id === contaId && !l.cartao_id) cents += v;
+        else if (l.tipo === 'despesa' && l.conta_id === contaId && !l.cartao_id) cents -= v;
+        else if (l.tipo === 'transferencia') { if (l.conta_id === contaId) cents -= v; if (l.conta_destino_id === contaId) cents += v; }
+      });
+      return cents / 100;
+    },
+    totalBalance: () => P.sum(F.contas().filter((c) => c.incluir_no_total !== false), (c) => F.balance(c.id)),
+    /** Contas + reservas (aportes já saíram das contas) + investimentos − dívidas. */
+    patrimonio() {
+      return F.totalBalance() + P.sum(S.all('fin_reservas'), (r) => +r.saldo_atual || 0)
+        + P.sum(S.all('fin_investimentos'), (i) => +(i.valor_atual ?? i.valor_aplicado) || 0) - P.sum(S.where('fin_dividas', (d) => d.status !== 'quitada'), (d) => +d.saldo_devedor || 0);
+    },
+    monthTx: (key) => F.txs().filter((l) => l.tipo !== 'transferencia' && D.month(l.data) === key),
+    monthStats(key) {
+      const r = { rec: 0, desp: 0, recPago: 0, despPago: 0, recPend: 0, despPend: 0 };
+      F.monthTx(key).forEach((l) => {
+        const v = P.cents(l.valor);
+        if (l.tipo === 'receita') { r.rec += v; l.status === 'pago' ? r.recPago += v : r.recPend += v; }
+        else { r.desp += v; l.status === 'pago' ? r.despPago += v : r.despPend += v; }
+      });
+      Object.keys(r).forEach((k) => { r[k] /= 100; });
+      r.saldo = r.rec - r.desp;
+      r.economia = r.rec ? (r.saldo / r.rec) * 100 : 0;
+      return r;
+    },
+    byCategory(key, tipo = 'despesa', untilDay) {
+      const m = {};
+      F.monthTx(key).forEach((l) => {
+        if (l.tipo !== tipo) return;
+        if (untilDay && +l.data.slice(8, 10) > untilDay) return;
+        const pid = F.parentId(l.categoria_id) || 'none';
+        m[pid] = (m[pid] || 0) + P.cents(l.valor);
+      });
+      return Object.entries(m).map(([id, c]) => { const cat = F.cat(id); return { id, nome: cat ? cat.nome : 'Sem categoria', cor: cat ? (cat.cor || 'var(--c7)') : '#9A9A9A', icone: cat ? cat.icone : 'dots', valor: c / 100 }; }).sort((a, b) => b.valor - a.valor);
+    },
+    cashflow(n, endKey = D.month(D.today())) {
+      return Array.from({ length: n }, (_, i) => { const k = D.shiftMonth(endKey, i - n + 1); const s = F.monthStats(k); return { key: k, rec: s.rec, desp: s.desp }; });
+    },
+    invoiceTotal(fid) { return P.sum(S.where('fin_lancamentos', (l) => l.fatura_id === fid), (l) => (l.tipo === 'despesa' ? 1 : l.tipo === 'receita' ? -1 : 0) * P.cents(l.valor)) / 100; },
+    invoices: (cid) => S.where('fin_faturas', (f) => f.cartao_id === cid).sort((a, b) => (a.competencia < b.competencia ? 1 : -1)),
+    currentInvoice(card) {
+      const info = P.calc.invoiceFor(D.today(), card.dia_fechamento, card.dia_vencimento);
+      return S.where('fin_faturas', (f) => f.cartao_id === card.id && f.competencia === info.competencia)[0] || { competencia: info.competencia, data_fechamento: info.data_fechamento, data_vencimento: info.data_vencimento, status: 'aberta', id: null };
+    },
+    cardUsed: (card) => P.sum(S.where('fin_faturas', (f) => f.cartao_id === card.id && f.status !== 'paga'), (f) => F.invoiceTotal(f.id)),
+    upcoming(days = 7) {
+      const until = D.add(D.today(), days);
+      const tx = F.txs().filter((l) => l.status !== 'pago' && l.tipo !== 'transferencia' && l.data <= until).map((l) => ({ kind: 'tx', date: l.data, title: l.descricao, valor: l.valor, tipo: l.tipo, ref: l }));
+      const inv = S.where('fin_faturas', (f) => f.status !== 'paga' && f.data_vencimento <= until && f.data_vencimento >= D.add(D.today(), -45)).map((f) => ({ kind: 'fatura', date: f.data_vencimento, title: 'Fatura ' + ((S.get('fin_cartoes', f.cartao_id) || {}).nome || ''), valor: F.invoiceTotal(f.id), tipo: 'despesa', ref: f })).filter((x) => x.valor > 0);
+      return tx.concat(inv).sort((a, b) => (a.date < b.date ? -1 : 1));
+    },
+    isFixed: (l) => !!(l.recorrencia_id || l.grupo_parcela_id || /aluguel|condom|internet|plano|assinatura|escola|financiamento/i.test(l.descricao + ' ' + F.catLabel(l.categoria_id))),
+    projection(key) {
+      const s = F.monthStats(key), today = D.today();
+      if (key !== D.month(today)) return { desp: s.desp, rec: s.rec };
+      const day = +today.slice(8, 10), dim = D.dim(key);
+      let fixas = 0, varPago = 0;
+      F.monthTx(key).filter((l) => l.tipo === 'despesa').forEach((l) => { if (F.isFixed(l)) fixas += +l.valor; else if (l.data <= today) varPago += +l.valor; });
+      return { desp: P.round(fixas + (varPago / day) * dim), rec: s.rec, fixas, variaveis: P.round((varPago / day) * dim) };
+    },
+    budget(key) {
+      const plan = S.where('fin_orcamentos', (o) => o.competencia === key);
+      const spent = {};
+      F.byCategory(key).forEach((c) => { spent[c.id] = c.valor; });
+      return plan.map((o) => { const pid = F.parentId(o.categoria_id); const c = F.cat(pid); const real = spent[pid] || 0; return { o, cat: c, nome: c ? c.nome : '—', cor: c && c.cor, icone: c && c.icone, plan: +o.valor_planejado, real, pct: o.valor_planejado ? (real / o.valor_planejado) * 100 : 0 }; }).sort((a, b) => b.pct - a.pct);
+    },
+    /** Insights determinísticos do mês (comparando o mesmo intervalo de dias). */
+    insights(key) {
+      const out = [], today = D.today(), day = key === D.month(today) ? +today.slice(8, 10) : D.dim(key);
+      const prevKey = D.shiftMonth(key, -1);
+      const cur = F.byCategory(key, 'despesa', day), prev = F.byCategory(prevKey, 'despesa', day);
+      const prevMap = Object.fromEntries(prev.map((c) => [c.id, c.valor]));
+      cur.filter((c) => c.valor > 80 && prevMap[c.id] > 0).map((c) => ({ c, d: ((c.valor - prevMap[c.id]) / prevMap[c.id]) * 100 }))
+        .filter((x) => Math.abs(x.d) >= 15).sort((a, b) => Math.abs(b.d) - Math.abs(a.d)).slice(0, 2)
+        .forEach((x) => out.push({ icon: x.d > 0 ? 'up' : 'down', tone: x.d > 0 ? 'down' : 'up', text: `${x.c.nome} ${fmt.pct(Math.abs(x.d))} ${x.d > 0 ? 'acima' : 'abaixo'} do mês passado`, sub: `${fmt.money(x.c.valor)} até dia ${day}` }));
+      const b = F.budget(key).filter((x) => x.pct >= 80);
+      if (b.length) out.push({ icon: 'alert', tone: 'acc', text: `${b[0].nome}: ${fmt.pct(b[0].pct)} do orçamento`, sub: `${fmt.money(b[0].real)} de ${fmt.money(b[0].plan)}` });
+      const s = F.monthStats(key);
+      if (s.rec > 0) out.push({ icon: 'piggy', tone: s.economia >= 10 ? 'up' : 'acc', text: `Você ${s.saldo >= 0 ? 'guardou' : 'gastou além de'} ${fmt.pct(Math.abs(s.economia))} da renda`, sub: `${fmt.money(s.saldo)} no mês` });
+      return out;
+    },
+    contaNome: (id) => (S.getAny('fin_contas', id) || {}).nome || '—',
+    cartaoNome: (id) => (S.getAny('fin_cartoes', id) || {}).nome || '—'
+  };
+
+  // ================= Peças de UI =================
+  const tile = (color, ic, sm) => h`<span class="tile tc ${sm ? 'sm' : ''}" style="--tc:${color}">${icon(ic, sm ? 'sm' : '')}</span>`;
+  P.tile = tile;
+  const monthNav = (act = 'fin.month') => h`<div class="row-sm"><button class="btn-icon sm filled" data-act="${act}" data-v="-1" aria-label="Mês anterior">${icon('chev-l', 'sm')}</button><b style="min-width:120px;text-align:center">${fmt.monthCap(st.month)}</b><button class="btn-icon sm filled" data-act="${act}" data-v="1" aria-label="Próximo mês">${icon('chev-r', 'sm')}</button></div>`;
+
+  function whereLabel(l) {
+    if (l.tipo === 'transferencia') {
+      if (l.reserva_id) { const r = S.getAny('fin_reservas', l.reserva_id); return (l.conta_id ? F.contaNome(l.conta_id) + ' → ' : '') + (r ? r.nome : 'Reserva') + (l.conta_destino_id ? ' → ' + F.contaNome(l.conta_destino_id) : ''); }
+      if (l.cartao_id && l.conta_id) return F.contaNome(l.conta_id) + ' → ' + F.cartaoNome(l.cartao_id);
+      return F.contaNome(l.conta_id) + ' → ' + F.contaNome(l.conta_destino_id);
+    }
+    return l.cartao_id ? F.cartaoNome(l.cartao_id) : F.contaNome(l.conta_id);
+  }
+
+  /** Linha de lançamento (com swipe no mobile). */
+  function txRow(l, o = {}) {
+    const isT = l.tipo === 'transferencia';
+    const color = isT ? 'var(--c6)' : F.catColor(l.categoria_id), ic = isT ? 'transfer' : F.catIcon(l.categoria_id);
+    const sign = l.tipo === 'receita' ? '+' : l.tipo === 'despesa' ? '−' : '';
+    const sel = st.select;
+    return h`<div class="swipe-wrap" data-id="${l.id}">
+      <div class="swipe-act"><span class="l">${icon('check', 'sm')}${l.status === 'pago' ? '' : (l.tipo === 'receita' ? 'Recebido' : 'Pago')}</span><span class="r" style="color:var(--danger)">Excluir ${icon('trash', 'sm')}</span></div>
+      <div class="swipe-body li tap" data-act="${sel ? 'fin.toggleSel' : 'fin.openTx'}" data-id="${l.id}">
+        ${sel ? h`<span class="check ${sel.has(l.id) ? 'on' : ''}">${icon('check')}</span>` : tile(color, ic)}
+        <span class="main"><span class="t">${l.descricao}${l.parcela_total ? h` <span class="faint">${l.parcela_num}/${l.parcela_total}</span>` : ''}</span>
+          <span class="s">${isT ? 'Transferência' : F.catLabel(l.categoria_id)} · ${whereLabel(l)}${o.showDate ? ' · ' + fmt.dm(l.data) : ''}</span></span>
+        <span class="v ${l.tipo === 'receita' ? 'pos' : ''} ${isT ? 'muted' : ''}">${sign}${fmt.money(l.valor)}${l.status !== 'pago' ? h`<small>${l.data < D.today() ? 'vencido' : l.status}</small>` : (l.arquivo_ids ? h`<small>${icon('file', 'xs')}</small>` : '')}</span>
+      </div></div>`;
+  }
+  F.txRow = txRow;
+
+  function txList(rows, o = {}) {
+    if (!rows.length) return '';
+    const groups = P.groupBy(rows, (l) => l.data);
+    return h`${Object.keys(groups).sort().reverse().map((day) => {
+      const tot = P.sum(groups[day], (l) => F.sign(l) * P.cents(l.valor)) / 100;
+      return h`<div class="group-h"><span>${fmt.day(day)}</span><span class="num">${tot ? (tot > 0 ? '+' : '') + fmt.money(tot) : ''}</span></div>
+        <div class="list cardlist">${groups[day].map((l) => txRow(l, o))}</div>`;
+    })}`;
+  }
+
+  function bindTxSwipe(root) {
+    ui.bindSwipe(root, '.swipe-wrap', {
+      right: (w) => { const l = S.get('fin_lancamentos', w.dataset.id); if (l && l.status !== 'pago') markPaid(l); },
+      left: (w) => { const l = S.get('fin_lancamentos', w.dataset.id); if (l) removeTx(l); }
+    });
+  }
+
+  async function markPaid(l) {
+    try { await S.route('fin.saveTx', { tx: { ...strip(l), status: 'pago', data: l.data > D.today() ? D.today() : l.data } }); ui.toast(l.tipo === 'receita' ? 'Marcado como recebido' : 'Marcado como pago'); }
+    catch (e) { ui.toast(e.message, { error: true }); }
+  }
+  async function removeTx(l) {
+    if (l.grupo_parcela_id) {
+      ui.menu('Excluir parcela', [
+        { label: 'Só esta parcela', icon: 'trash', act: () => S.remove('fin_lancamentos', l.id, { label: 'Parcela excluída' }) },
+        { label: `Esta e as próximas (${l.parcela_num}–${l.parcela_total})`, icon: 'layers', danger: true, act: async () => { const r = await S.route('fin.removeGroup', { grupo_parcela_id: l.grupo_parcela_id, a_partir: l.parcela_num }); ui.toast(`${r.removidos} parcelas excluídas`); } }
+      ]);
+      return;
+    }
+    S.remove('fin_lancamentos', l.id, { label: 'Lançamento excluído' });
+  }
+  const strip = (r) => { const o = { ...r }; delete o._pending; return o; };
+
+  // ================= Formulário de lançamento =================
+  /**
+   * Abre o sheet de lançamento.
+   * @param {Object=} row lançamento existente ou rascunho (ex.: vindo do OCR)
+   */
+  F.openTx = (row = {}) => {
+    const isNew = !row.id || !S.get('fin_lancamentos', row.id);
+    const draft = isNew && !row.descricao ? P.ls.get('draft.tx', null) : null;
+    const v = { tipo: 'despesa', status: 'pago', data: D.today(), ...(draft || {}), ...row };
+    const contas = F.contas(), cartoes = F.cartoes();
+    if (!v.conta_id && !v.cartao_id && v.tipo !== 'transferencia') v.conta_id = (contas[0] || {}).id;
+    const payOpts = [{ group: 'Contas', items: contas.map((c) => ['c:' + c.id, c.nome]) }].concat(cartoes.length ? [{ group: 'Cartões', items: cartoes.map((c) => ['k:' + c.id, `${c.nome} •${c.final || ''}`]) }] : []);
+    const metas = S.where('met_metas', (m) => m.status === 'ativa');
+    let arquivos = String(v.arquivo_ids || '').split(',').filter(Boolean);
+    const extraOpen = !!(v.estabelecimento || v.tags || v.observacao || v.meta_id || arquivos.length);
+    const fields = () => [
+      { k: 'descricao', l: 'Descrição', t: 'text', req: true, ph: v.tipo === 'receita' ? 'Ex.: Salário de outubro' : 'Ex.: Mercado da semana', max: 140, focus: isNew },
+      { k: 'data', l: 'Data', t: 'date', req: true, half: true },
+      { k: 'status', l: 'Situação', t: 'seg', half: true, opts: [['pago', v.tipo === 'receita' ? 'Recebido' : 'Pago'], ['pendente', 'Pendente']], def: 'pago' }
+    ];
+    const s = ui.sheet({
+      title: isNew ? 'Novo lançamento' : 'Editar lançamento', size: 'full',
+      headExtra: !isNew ? h`<button class="btn-icon sm" data-dup aria-label="Duplicar">${icon('copy', 'sm')}</button>` : '',
+      body: h`<form class="form" novalidate>
+        ${isNew ? h`<button type="button" class="btn btn-ghost btn-sm" data-scan style="align-self:flex-start">${icon('receipt', 'sm')}Escanear comprovante</button>` : ''}
+        ${ui.seg([['despesa', 'Despesa'], ['receita', 'Receita'], ['transferencia', 'Transferência']], v.tipo, '', { cls: 'tipo' })}
+        <div class="amount"><input inputmode="decimal" data-amount aria-label="Valor" value="${v.valor ? fmt.num(v.valor, 2) : ''}" placeholder="0,00"><div class="cur">reais</div></div>
+        <div data-main></div>
+        <div data-dyn></div>
+        <details ${extraOpen ? raw('open') : ''} class="card flat" style="padding:12px 16px"><summary style="cursor:pointer;font-weight:600">Mais detalhes</summary><div class="form mt-3" data-more></div></details>
+      </form>`,
+      foot: h`${!isNew ? h`<button class="btn btn-danger" data-del style="flex:0 0 auto" aria-label="Excluir">${icon('trash', 'sm')}</button>` : ''}<button class="btn btn-primary" data-save>${isNew ? 'Salvar lançamento' : 'Salvar alterações'}</button>`,
+      onMount(sh) {
+        const form = sh.$('form');
+        const amount = sh.$('[data-amount]');
+        amount.addEventListener('input', () => { const dg = amount.value.replace(/\D/g, '').replace(/^0+/, '').slice(0, 11); amount.value = dg ? fmt.num(+dg / 100, 2) : ''; saveDraft(); });
+        const tipoSeg = sh.$('.seg.tipo');
+        tipoSeg.addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; capture(); v.tipo = b.dataset.v; $$('button', tipoSeg).forEach((x) => x.classList.toggle('on', x === b)); draw(); });
+        const $$ = P.$$;
+        function capture() {
+          const r = P.form.read(form, allFields(), { silent: true }).values;
+          Object.assign(v, r);
+          if (r.pagar_com) { v.conta_id = r.pagar_com.startsWith('c:') ? r.pagar_com.slice(2) : null; v.cartao_id = r.pagar_com.startsWith('k:') ? r.pagar_com.slice(2) : null; }
+        }
+        function dynFields() {
+          if (v.tipo === 'transferencia') return [
+            { k: 'conta_id', l: 'De', t: 'select', req: true, half: true, opts: contas.map((c) => [c.id, c.nome]) },
+            { k: 'conta_destino_id', l: 'Para', t: 'select', req: true, half: true, opts: contas.map((c) => [c.id, c.nome]), hint: contas.length < 2 ? 'Cadastre uma segunda conta em Finanças › Contas para transferir.' : '', validate: (x, all) => (x && x === all.conta_id ? 'Escolha outra conta.' : '') }];
+          const out = [
+            { k: 'categoria_id', l: 'Categoria', t: 'select', half: true, opts: F.catOptions(v.tipo), ph: 'Sem categoria' },
+            { k: 'pagar_com', l: v.tipo === 'receita' ? 'Receber em' : 'Pagar com', t: 'select', req: true, half: true, opts: v.tipo === 'receita' ? [{ group: 'Contas', items: contas.map((c) => ['c:' + c.id, c.nome]) }] : payOpts }];
+          if (isNew && v.tipo === 'despesa') out.push({ k: 'parcelas', l: 'Parcelas', t: 'int', half: true, min: 1, max: 72, ph: '1', hint: v.cartao_id ? 'Distribuídas nas próximas faturas' : 'Uma por mês' });
+          if (isNew) out.push({ k: 'recorrencia', l: 'Repetir', t: 'select', half: true, ph: 'Não repetir', opts: [['mensal', 'Todo mês'], ['semanal', 'Toda semana'], ['anual', 'Todo ano']] });
+          return out;
+        }
+        const moreFields = () => [
+          { k: 'estabelecimento', l: 'Estabelecimento', t: 'text', max: 120, ph: 'Onde foi' },
+          { k: 'forma_pagamento', l: 'Forma de pagamento', t: 'select', half: true, opts: FORMAS },
+          { k: 'tags', l: 'Tags', t: 'text', half: true, ph: 'viagem, casa' },
+          { k: 'meta_id', l: 'Vincular a uma meta', t: 'select', opts: metas.map((m) => [m.id, m.titulo]), ph: 'Nenhuma' },
+          { k: 'observacao', l: 'Observação', t: 'textarea', rows: 2 }];
+        const allFields = () => fields().concat(dynFields(), moreFields());
+        function draw() {
+          const vals = { ...v, pagar_com: v.cartao_id ? 'k:' + v.cartao_id : v.conta_id ? 'c:' + v.conta_id : '' };
+          sh.$('[data-main]').innerHTML = P.toHtml(P.form.html(fields(), vals));
+          sh.$('[data-dyn]').innerHTML = P.toHtml(P.form.html(dynFields(), vals));
+          sh.$('[data-more]').innerHTML = P.toHtml(h`${P.form.html(moreFields(), vals)}<div class="field"><span class="label">Anexos</span><div class="row-sm wrap" data-files>${fileChips()}</div>
+            <div class="row-sm"><button type="button" class="btn btn-ghost btn-sm" data-attach>${icon('upload', 'sm')}Anexar arquivo</button><button type="button" class="btn btn-ghost btn-sm" data-photo>${icon('camera', 'sm')}Foto</button></div></div>`);
+          P.form.bind(form, null);
+          bindExtra();
+        }
+        const fileChips = () => arquivos.map((id) => { const a = S.getAny('arquivos', id); return h`<span class="chip lg">${icon(a && /pdf/.test(a.mime) ? 'file' : 'image', 'xs')}<span class="ellipsis" style="max-width:150px">${a ? a.nome : 'arquivo'}</span><button type="button" data-unattach="${id}" aria-label="Remover">${icon('x', 'xs')}</button></span>`; });
+        function bindExtra() {
+          const est = sh.$('[data-k="estabelecimento"]');
+          if (est) est.addEventListener('change', () => {
+            const cat = sh.$('[data-k="categoria_id"]');
+            if (!cat || cat.value) return;
+            const k = P.norm(est.value);
+            const rule = S.all('fin_regras').find((r) => k.includes(P.norm(r.padrao)));
+            if (rule) { cat.value = rule.categoria_id; ui.toast('Categoria sugerida pela regra "' + rule.padrao + '"', { icon: 'zap' }); }
+          });
+          const attach = async (capture) => {
+            const file = await P.files.pick({ capture, accept: capture ? 'image/\u002A' : 'image/\u002A,application/pdf' });
+            if (!file) return;
+            ui.toast('Enviando anexo…', { icon: 'upload' });
+            try { const a = await P.files.upload(file, { tipo: 'comprovante', modulo: 'financas', entidade: 'fin_lancamentos', entidade_id: v.id || null }); arquivos.push(a.id); sh.$('[data-files]').innerHTML = P.toHtml(fileChips()); }
+            catch (e) { ui.toast(e.message, { error: true }); }
+          };
+          sh.$('[data-attach]').onclick = () => attach(false);
+          sh.$('[data-photo]').onclick = () => attach(true);
+          sh.$('[data-files]').onclick = (e) => { const b = e.target.closest('[data-unattach]'); if (b) { arquivos = arquivos.filter((x) => x !== b.dataset.unattach); sh.$('[data-files]').innerHTML = P.toHtml(fileChips()); } };
+        }
+        const saveDraft = P.debounce(() => { if (!isNew) return; capture(); P.ls.set('draft.tx', { tipo: v.tipo, descricao: v.descricao, valor: P.parseNum(amount.value), categoria_id: v.categoria_id }); }, 400);
+        form.addEventListener('input', saveDraft);
+        draw();
+        const scan = sh.$('[data-scan]');
+        if (scan) scan.onclick = () => { sh.close(); setTimeout(() => F.scan(), 280); };
+        const dup = sh.$('[data-dup]');
+        if (dup) dup.onclick = () => { sh.close(); const c = strip(row); ['id', 'created_at', 'updated_at', 'fatura_id', 'grupo_parcela_id', 'parcela_num', 'parcela_total', 'recorrencia_id', 'import_hash'].forEach((k) => delete c[k]); c.data = D.today(); setTimeout(() => F.openTx(c), 280); };
+        const del = sh.$('[data-del]');
+        if (del) del.onclick = () => { sh.close(); removeTx(row); };
+        sh.$('[data-save]').onclick = async () => {
+          capture();
+          const r = P.form.read(form, allFields());
+          const valor = P.parseNum(amount.value);
+          if (!valor || valor <= 0) { amount.focus(); ui.toast('Informe o valor.', { error: true }); return; }
+          if (!r.ok) return;
+          const tx = { ...strip(row), ...v, valor, arquivo_ids: arquivos.join(',') || null };
+          delete tx.pagar_com; delete tx.parcelas; delete tx.recorrencia;
+          if (tx.tipo === 'transferencia') { tx.categoria_id = null; tx.cartao_id = row.cartao_id && !isNew ? row.cartao_id : null; }
+          else tx.conta_destino_id = null;
+          if (isNew) tx.id = tx.id || P.uuid();
+          if (row.origem === 'ocr') tx.origem = 'ocr';
+          const btn = sh.$('[data-save]'); btn.classList.add('loading');
+          try {
+            const res = await S.route('fin.saveTx', { tx, parcelas: r.values.parcelas || 1, recorrencia: r.values.recorrencia ? { frequencia: r.values.recorrencia, intervalo: 1 } : null });
+            P.ls.del('draft.tx');
+            sh.close();
+            const n = res.changes.fin_lancamentos.length;
+            ui.toast(n > 1 ? `${n} parcelas lançadas` : isNew ? 'Lançamento salvo' : 'Alterações salvas', isNew && n === 1 ? { undo: () => S.remove('fin_lancamentos', tx.id, { undo: false }) } : {});
+          } catch (e) { btn.classList.remove('loading'); if (!P.form.serverError(form, e)) ui.toast(e.message, { error: true }); }
+        };
+      }
+    });
+    return s;
+  };
+
+  // ================= OCR de comprovantes =================
+  const CONF = { alta: ['up', 'confiável'], media: ['acc', 'confira'], baixa: ['down', 'revise'] };
+  const confChip = (c) => c ? h`<span class="chip ${CONF[c][0]}" style="height:22px;font-size:11px">${CONF[c][1]}</span>` : '';
+
+  /** Fluxo: foto/arquivo → upload → OCR → revisão lado a lado → lançamento. Aceita vários arquivos (fila). */
+  F.scan = async () => {
+    const files = await P.files.pick({ accept: 'image/\u002A,application/pdf', multiple: true });
+    if (!files || !files.length) return;
+    const queue = files.map((f) => ({ file: f, status: 'na fila', res: null, arquivo: null, err: null }));
+    const s = ui.sheet({ title: queue.length > 1 ? `Leitura de ${queue.length} comprovantes` : 'Lendo comprovante', body: h`<div data-q></div>` });
+    const draw = () => s.setBody(h`<div class="list">${queue.map((q, i) => h`<div class="li"><span class="tile sm">${q.status === 'pronto' ? icon('check', 'sm') : q.err ? icon('alert', 'sm') : h`<span class="spinner"></span>`}</span>
+      <span class="main"><span class="t">${q.file.name}</span><span class="s">${q.err || q.status}</span></span>
+      ${q.status === 'pronto' ? h`<button class="btn btn-primary btn-sm" data-review="${i}">Revisar</button>` : ''}</div>`)}</div>
+      <p class="faint mt-4" style="font-size:12.5px">${icon('info', 'xs')} A leitura usa o OCR do Google Drive. Fotos retas, com boa luz, funcionam melhor.</p>`);
+    s.body.addEventListener('click', (e) => { const b = e.target.closest('[data-review]'); if (b) { const q = queue[+b.dataset.review]; review(q); } });
+    draw();
+    for (const q of queue) {
+      try {
+        q.status = 'enviando…'; draw();
+        q.arquivo = await P.files.upload(q.file, { tipo: 'comprovante', modulo: 'financas' }, { ocr: false, max: 1800 });
+        q.status = 'lendo o texto…'; draw();
+        q.res = await P.api.call('ocr.extract', { id: q.arquivo.id, tipo: 'auto' }, { timeout: 120000, retries: 0 });
+        q.status = 'pronto'; draw();
+        if (queue.length === 1) { s.close(); setTimeout(() => review(q), 260); }
+      } catch (e) { q.err = e.message; q.status = 'erro'; draw(); }
+    }
+  };
+
+  function review(q) {
+    const c = q.res.campos || {};
+    const isPix = q.res.tipo === 'pix';
+    const valor = isPix ? c.valor : c.total;
+    const est = isPix ? c.favorecido : c.estabelecimento;
+    const imgUrl = P.files.cached(q.arquivo.id);
+    ui.sheet({
+      title: 'Revisar leitura', size: 'full', wide: true,
+      body: h`<div class="ocr-review">
+        <div class="ocr-img">${imgUrl ? h`<img src="${imgUrl}" alt="Comprovante">` : h`<div class="empty sm">${icon('file', 'lg')}<p>Prévia indisponível para PDF</p></div>`}</div>
+        <div class="stack">
+          <div class="row-sm wrap"><span class="chip acc">${isPix ? 'Comprovante Pix' : 'Cupom / recibo'}</span>${c.cnpj ? h`<span class="chip">CNPJ ${c.cnpj}</span>` : ''}</div>
+          <div class="kv"><span>Valor</span><b>${valor ? fmt.money(valor) : '—'} ${confChip(isPix ? c.confianca.valor : c.confianca.total)}</b></div>
+          <div class="kv"><span>Data</span><b>${c.data ? fmt.date(c.data) : '—'} ${confChip(c.confianca.data)}</b></div>
+          <div class="kv"><span>${isPix ? 'Favorecido' : 'Estabelecimento'}</span><b class="ellipsis" style="max-width:60%">${est || '—'} ${confChip(c.confianca.estabelecimento || c.confianca.favorecido)}</b></div>
+          ${c.forma_pagamento ? h`<div class="kv"><span>Pagamento</span><b>${(FORMAS.find((f) => f[0] === c.forma_pagamento) || [])[1] || c.forma_pagamento}</b></div>` : ''}
+          ${c.sugestao ? h`<div class="kv"><span>Categoria sugerida</span><b>${F.catLabel(c.sugestao.categoria_id)} <span class="chip">${c.sugestao.motivo}</span></b></div>` : ''}
+          ${(c.itens || []).length ? h`<details><summary class="muted" style="cursor:pointer">${c.itens.length} item(ns) lidos</summary><div class="mt-2">${c.itens.slice(0, 20).map((it) => h`<div class="kv"><span class="ellipsis">${it.descricao}</span><b>${fmt.money(it.valor)}</b></div>`)}</div></details>` : ''}
+          <details><summary class="muted" style="cursor:pointer">Texto lido</summary><pre style="white-space:pre-wrap;font-size:12px;color:var(--text-2);max-height:220px;overflow:auto">${q.res.texto}</pre></details>
+        </div></div>`,
+      foot: h`<button class="btn btn-ghost" data-close>Descartar</button><button class="btn btn-primary" data-use>Criar lançamento</button>`,
+      onMount(sh) {
+        sh.$('[data-use]').onclick = () => {
+          sh.close();
+          setTimeout(() => F.openTx({
+            tipo: 'despesa', valor: valor || null, data: c.data || D.today(), descricao: est ? est.replace(/\s+(LTDA|ME|EIRELI|S\/?A)\.?$/i, '') : 'Compra',
+            estabelecimento: est || null, categoria_id: c.sugestao ? c.sugestao.categoria_id : null,
+            forma_pagamento: c.forma_pagamento || (isPix ? 'pix' : null), arquivo_ids: q.arquivo.id, origem: 'ocr', status: 'pago'
+          }), 260);
+        };
+      }
+    });
+  }
+
+  // ================= Telas =================
+  const deps = ['fin_lancamentos', 'fin_contas', 'fin_cartoes', 'fin_categorias', 'fin_faturas', 'fin_orcamentos', 'fin_reservas', 'fin_investimentos', 'fin_dividas', 'fin_recorrencias', 'fin_regras'];
+
+  P.screen('fin', {
+    mod: 'fin', tab: 'resumo', title: 'Finanças', deps,
+    render() {
+      const key = st.month, s = F.monthStats(key), prev = F.monthStats(D.shiftMonth(key, -1));
+      const total = F.totalBalance(), proj = F.projection(key), up = F.upcoming(10).slice(0, 5), cats = F.byCategory(key).slice(0, 6), bud = F.budget(key).slice(0, 4);
+      const ins = F.insights(key);
+      const daily = Array.from({ length: 7 }, (_, i) => D.add(D.today(), i - 6)).map((d) => P.sum(F.txs().filter((l) => l.tipo === 'despesa' && l.data === d), (l) => +l.valor));
+      const isCur = key === D.month(D.today());
+      if (!F.txs().length) {
+        return h`<div class="page-head"><div><h1>Finanças</h1><p>Contas, cartões, orçamento e metas num lugar só.</p></div></div>
+          ${ui.empty({ ill: 'money', title: 'Nenhum lançamento ainda', text: 'Registre uma despesa ou receita, importe um extrato ou escaneie um comprovante.', action: { label: 'Novo lançamento', act: 'fin.new' } })}
+          <div class="row-sm" style="justify-content:center"><a class="btn btn-ghost btn-sm" href="#/fin/importar">${icon('upload', 'sm')}Importar extrato</a><button class="btn btn-ghost btn-sm" data-act="fin.scan">${icon('receipt', 'sm')}Escanear</button></div>`;
+      }
+      return h`<div class="page-head"><div><h1>Finanças</h1><p>${fmt.month(key)}</p></div>${monthNav()}</div>
+      <div class="dash">
+        <div class="card pad-lg span-5 fin-hero">
+          ${ui.metric({ label: 'Saldo em contas', icon: 'wallet', value: fmt.money(total), count: total, fmt: 'money', size: 'xl', sub: h`<span>Patrimônio ${fmt.moneyShort(F.patrimonio())}</span><span class="faint">·</span><span>${F.contas().length} conta(s)</span>` })}
+          <div class="mt-4">${ui.bars(daily, { hi: 6, labels: Array.from({ length: 7 }, (_, i) => fmt.WD[D.dow(D.add(D.today(), i - 6))][0]), height: 84 })}</div>
+          <p class="faint" style="font-size:12px;margin-top:6px">Gastos dos últimos 7 dias</p>
+        </div>
+        <div class="span-7 grid g2" style="align-content:start">
+          <a class="card link" href="#/fin/lancamentos?tipo=receita">${ui.metric({ label: 'Receitas', icon: 'up', value: fmt.money(s.rec), cls: 'pos', size: 'md', sub: h`${ui.delta(s.rec, prev.rec)}<span>vs mês passado</span>` })}</a>
+          <a class="card link" href="#/fin/lancamentos?tipo=despesa">${ui.metric({ label: 'Despesas', icon: 'down', value: fmt.money(s.desp), size: 'md', sub: h`${ui.delta(s.desp, prev.desp, { invert: true })}<span>vs mês passado</span>` })}</a>
+          <div class="card">${ui.metric({ label: 'Resultado', icon: 'scale', value: fmt.money(s.saldo), cls: s.saldo >= 0 ? 'pos' : 'neg', size: 'md', sub: s.rec ? h`<span>${fmt.pct(s.economia)} da renda</span>` : '' })}</div>
+          <div class="card">${ui.metric({ label: isCur ? 'Projeção de gastos' : 'Gasto total', icon: 'trending', value: fmt.money(proj.desp), size: 'md', sub: isCur ? h`<span>${proj.desp > s.rec && s.rec ? 'acima' : 'dentro'} da receita</span>` : '' })}
+            ${isCur && s.rec ? h`<div class="mt-3">${ui.progress((proj.desp / s.rec) * 100, { alerts: true })}</div>` : ''}</div>
+        </div>
+        <div class="card span-7"><div class="card-head">${icon('chart')}<h3>Fluxo de caixa</h3><span class="chip">6 meses</span></div><div id="fin-cash"></div></div>
+        <div class="card span-5"><div class="card-head">${icon('pie')}<h3>Despesas por categoria</h3><a class="go" href="#/fin/relatorios">${icon('chev-r', 'sm')}</a></div>
+          ${cats.length ? h`<div class="donut-wrap"><div id="fin-donut" class="donut"></div><div class="list" style="flex:1;min-width:0">${cats.map((c) => h`<div class="row-sm" style="padding:6px 0"><span class="dot" style="background:${c.cor}"></span><span class="grow ellipsis">${c.nome}</span><b class="num" style="font-size:13px">${fmt.moneyShort(c.valor)}</b></div>`)}</div></div>` : ui.empty({ ill: 'chart', title: 'Sem despesas no mês', small: true })}</div>
+        <div class="card span-6"><div class="card-head">${icon('calendar')}<h3>Próximos vencimentos</h3><a class="go" href="#/fin/agenda">${icon('chev-r', 'sm')}</a></div>
+          ${up.length ? h`<div class="list">${up.map((u) => h`<div class="li tap" data-act="${u.kind === 'tx' ? 'fin.openTx' : 'fin.openInvoice'}" data-id="${u.ref.id}">${tile(u.kind === 'fatura' ? 'var(--c3)' : F.catColor(u.ref.categoria_id), u.kind === 'fatura' ? 'card' : F.catIcon(u.ref.categoria_id), true)}<span class="main"><span class="t">${u.title}</span><span class="s ${u.date < D.today() ? 'neg' : ''}">${u.date < D.today() ? 'Vencido · ' : ''}${fmt.day(u.date)}</span></span><span class="v ${u.tipo === 'receita' ? 'pos' : ''}">${fmt.money(u.valor)}</span></div>`)}</div>` : ui.empty({ ill: 'check', title: 'Nada vencendo nos próximos dias', small: true })}</div>
+        <div class="card span-6"><div class="card-head">${icon('target')}<h3>Orçamento</h3><a class="go" href="#/fin/orcamento">${icon('chev-r', 'sm')}</a></div>
+          ${bud.length ? h`<div class="stack-sm">${bud.map((b) => h`<div><div class="row between" style="font-size:13.5px;margin-bottom:6px"><span class="row-sm"><span class="dot" style="background:${b.cor}"></span>${b.nome}</span><span class="num muted">${fmt.moneyShort(b.real)} / ${fmt.moneyShort(b.plan)}</span></div>${ui.progress(b.pct, { alerts: true })}</div>`)}</div>`
+            : ui.empty({ ill: 'target', title: 'Sem orçamento para o mês', small: true, action: { label: 'Planejar', act: 'ui.go', data: { to: 'fin/orcamento' } } })}</div>
+        <div class="card span-7"><div class="card-head">${icon('trending')}<h3>Evolução do patrimônio</h3></div><div id="fin-worth"></div></div>
+        <div class="span-5 stack-sm">${ins.length ? ins.map((i) => h`<div class="card insight"><span class="tile sm chip ${i.tone}" style="height:34px;padding:0;justify-content:center">${icon(i.icon, 'sm')}</span><div class="grow"><b>${i.text}</b><div class="muted" style="font-size:12.5px">${i.sub}</div></div></div>`) : ''}</div>
+      </div>`;
+    },
+    mount(root) {
+      ui.countUp(root);
+      const cf = F.cashflow(6, st.month);
+      P.charts.mount('#fin-cash', { type: 'bar', labels: cf.map((c) => fmt.monthShort(c.key)), series: [{ label: 'Receitas', data: cf.map((c) => c.rec), color: P.charts.income() }, { label: 'Despesas', data: cf.map((c) => c.desp), color: '#F2B705' }], fmt: P.fmt.money, yfmt: P.charts.money, legend: true, height: 220 });
+      const cats = F.byCategory(st.month).slice(0, 6);
+      if (cats.length) P.charts.mount('#fin-donut', { type: 'doughnut', labels: cats.map((c) => c.nome), series: [{ data: cats.map((c) => c.valor), colors: cats.map((c) => c.cor) }], noScales: true, fmt: P.fmt.money, height: 150 });
+      // patrimônio: saldo das contas no fim de cada mês (aproximação retroativa pelos lançamentos carregados)
+      const months = Array.from({ length: 6 }, (_, i) => D.shiftMonth(D.month(D.today()), i - 5));
+      let cur = F.totalBalance();
+      const values = [];
+      for (let i = months.length - 1; i >= 0; i--) {
+        values[i] = P.round(cur);
+        const net = P.sum(F.txs().filter((l) => l.status === 'pago' && D.month(l.data) === months[i] && !l.cartao_id && l.tipo !== 'transferencia'), (l) => F.sign(l) * +l.valor)
+          - P.sum(F.txs().filter((l) => l.status === 'pago' && D.month(l.data) === months[i] && l.tipo === 'transferencia' && (l.reserva_id || l.cartao_id)), (l) => +l.valor);
+        cur -= net;
+      }
+      const inv = P.sum(S.all('fin_reservas'), (r) => +r.saldo_atual || 0) + P.sum(S.all('fin_investimentos'), (x) => +(x.valor_atual ?? x.valor_aplicado) || 0);
+      P.charts.mount('#fin-worth', { type: 'line', labels: months.map(fmt.monthShort), series: [{ label: 'Patrimônio', data: values.map((v) => P.round(v + inv)), fill: true }], fmt: P.fmt.money, yfmt: P.charts.money, zero: false, height: 200 });
+    }
+  });
+
+  // ---------- Lançamentos ----------
+  function filteredTx(q) {
+    const f = st.txFilter, today = D.today();
+    let rows = F.txs();
+    rows = P.pf.filter('fin.tx', rows, 'data');
+    if (f.tipo === 'pendentes') rows = rows.filter((l) => l.status !== 'pago');
+    else if (f.tipo !== 'todos') rows = rows.filter((l) => l.tipo === f.tipo);
+    if (f.conta) rows = rows.filter((l) => l.conta_id === f.conta || l.conta_destino_id === f.conta);
+    if (f.cartao) rows = rows.filter((l) => l.cartao_id === f.cartao);
+    if (f.cat) rows = rows.filter((l) => F.parentId(l.categoria_id) === f.cat || l.categoria_id === f.cat);
+    if (f.tag) rows = rows.filter((l) => P.norm(l.tags).includes(P.norm(f.tag)));
+    if (f.min) rows = rows.filter((l) => +l.valor >= f.min);
+    if (f.max) rows = rows.filter((l) => +l.valor <= f.max);
+    const term = P.norm(q ?? f.q);
+    if (term) rows = rows.filter((l) => P.norm([l.descricao, l.estabelecimento, l.tags, l.observacao, F.catLabel(l.categoria_id)].join(' ')).includes(term) || fmt.num(l.valor, 2).includes(term));
+    return rows.sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : (a.created_at < b.created_at ? 1 : -1)));
+  }
+  function txListBlock() {
+    const rows = filteredTx();
+    const rec = P.sum(rows.filter((l) => l.tipo === 'receita'), (l) => +l.valor), desp = P.sum(rows.filter((l) => l.tipo === 'despesa'), (l) => +l.valor);
+    const shown = rows.slice(0, st.txLimit);
+    return h`<div class="tx-totals"><span>${P.fmt.plural(rows.length, 'lançamento', 'lançamentos')}</span><span class="pos num">+${fmt.money(rec)}</span><span class="num">−${fmt.money(desp)}</span></div>
+      ${st.select ? h`<div class="card selbar"><b>${st.select.size} selecionado(s)</b><div class="row-sm wrap"><button class="btn btn-sm btn-ghost" data-act="fin.selPay">${icon('check', 'sm')}Marcar pago</button><button class="btn btn-sm btn-ghost" data-act="fin.selCat">${icon('tag', 'sm')}Categoria</button><button class="btn btn-sm btn-danger" data-act="fin.selDel">${icon('trash', 'sm')}Excluir</button><button class="btn btn-sm btn-quiet" data-act="fin.selectMode">Cancelar</button></div></div>` : ''}
+      ${rows.length ? txList(shown) : ui.empty({ ill: 'search', title: 'Nenhum lançamento encontrado', text: 'Ajuste os filtros ou cadastre um novo.', action: { label: 'Novo lançamento', act: 'fin.new' } })}
+      ${rows.length > shown.length ? h`<button class="btn btn-ghost btn-block mt-4" data-act="fin.more">Mostrar mais ${P.fmt.num(Math.min(120, rows.length - shown.length))}</button>` : ''}`;
+  }
+  P.screen('fin/lancamentos', {
+    mod: 'fin', tab: 'lancamentos', title: 'Lançamentos', deps,
+    render(ctx) {
+      if (ctx.q.tipo) st.txFilter.tipo = ctx.q.tipo;
+      if (ctx.q.conta) { st.txFilter.conta = ctx.q.conta; P.pf.set('fin.tx', { mode: 'tudo' }); }
+      const f = st.txFilter, adv = ['conta', 'cartao', 'cat', 'tag', 'min', 'max'].filter((k) => f[k]).length;
+      return h`<div class="page-head"><div><h1>Lançamentos</h1><p>${P.pf.range('fin.tx').label}</p></div><div class="row-sm">${P.rep.button('fin_tx')}<button class="btn btn-ghost btn-sm" data-act="fin.selectMode">${icon('check-circle', 'sm')}Selecionar</button></div></div>
+        <div class="stack-sm">
+          <div class="row-sm"><div class="search grow">${icon('search')}<input class="input" placeholder="Buscar descrição, estabelecimento, valor…" value="${f.q}" data-on-input="fin.search" aria-label="Buscar lançamentos"></div>
+            <button class="btn-icon filled" data-act="fin.filters" aria-label="Filtros" style="position:relative">${icon('sliders')}${adv ? h`<span class="badge">${adv}</span>` : ''}</button></div>
+          ${ui.chips([['todos', 'Todos'], ['despesa', 'Despesas'], ['receita', 'Receitas'], ['transferencia', 'Transferências'], ['pendentes', 'Pendentes']], f.tipo, 'fin.tipo')}
+          ${P.pf.bar('fin.tx', { modes: ['mes', 'ano', '90d', 'intervalo', 'tudo'], tables: ['fin_lancamentos'] })}
+        </div>
+        <div id="tx-list" class="mt-3">${txListBlock()}</div>`;
+    },
+    mount(root) { bindTxSwipe(root); }
+  });
+  const redrawList = () => { const el = document.getElementById('tx-list'); if (el) { el.innerHTML = P.toHtml(txListBlock()); bindTxSwipe(el); } };
+
+  // ---------- Contas ----------
+  P.screen('fin/contas', {
+    mod: 'fin', tab: 'contas', title: 'Contas', deps,
+    render() {
+      const contas = F.contas(true);
+      const total = F.totalBalance();
+      return h`<div class="page-head"><div><h1>Contas</h1><p>Saldo somado: <b class="num">${fmt.money(total)}</b></p></div><button class="btn btn-primary btn-sm" data-act="fin.editConta">${icon('plus', 'sm')}Nova conta</button></div>
+        ${contas.length ? h`<div class="grid acc-grid">${contas.map((c) => { const b = F.balance(c.id); return h`<a class="card link acc-card ${c.arquivada ? 'archived' : ''}" href="#/fin/conta/${c.id}">
+          <div class="row">${tile(c.cor || 'var(--c1)', c.icone || 'landmark')}<div class="grow"><b>${c.nome}</b><div class="muted" style="font-size:12.5px">${{ carteira: 'Carteira', corrente: 'Conta corrente', poupanca: 'Poupança', investimento: 'Investimento', outro: 'Outra' }[c.tipo]}${c.instituicao ? ' · ' + c.instituicao : ''}${c.arquivada ? ' · arquivada' : ''}</div></div>${icon('chev-r', 'sm faint')}</div>
+          <div class="metric mt-4"><div class="value md num ${b < 0 ? 'neg' : ''}">${fmt.money(b)}</div>${c.incluir_no_total === false ? h`<div class="sub">fora do total</div>` : ''}</div></a>`; })}</div>`
+          : ui.empty({ ill: 'money', title: 'Nenhuma conta', text: 'Cadastre suas contas para acompanhar os saldos.', action: { label: 'Nova conta', act: 'fin.editConta' } })}`;
+    }
+  });
+
+  P.screen('fin/conta/:id', {
+    mod: 'fin', tab: 'contas', title: (c) => F.contaNome(c.params && c.params.id), deps,
+    render(ctx) {
+      const c = S.getAny('fin_contas', ctx.params.id);
+      if (!c) return ui.empty({ ill: 'search', title: 'Conta não encontrada', action: { label: 'Voltar', act: 'ui.go', data: { to: 'fin/contas' } } });
+      const fk = 'fin.conta', tipo = P.flt.get(fk, 'tipo', 'todos');
+      const rows = P.pf.filter(fk, F.txs().filter((l) => l.conta_id === c.id || l.conta_destino_id === c.id), 'data').sort((a, b) => (a.data < b.data ? 1 : -1));
+      const isEnt = (l) => l.tipo === 'receita' || (l.tipo === 'transferencia' && l.conta_destino_id === c.id);
+      const isSai = (l) => (l.tipo === 'despesa' && !l.cartao_id) || (l.tipo === 'transferencia' && l.conta_id === c.id);
+      const ent = P.sum(rows.filter((l) => l.status === 'pago' && isEnt(l)), (l) => +l.valor);
+      const sai = P.sum(rows.filter((l) => l.status === 'pago' && isSai(l)), (l) => +l.valor);
+      const lista = rows.filter((l) => tipo === 'todos' || (tipo === 'entradas' ? isEnt(l) : tipo === 'saidas' ? isSai(l) : l.status !== 'pago'));
+      return h`<div class="page-head"><div><a href="#/fin/contas" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Contas</a><h1 class="mt-2">${c.nome}</h1></div>
+        <div class="row-sm"><button class="btn btn-ghost btn-sm" data-act="fin.reconcile" data-id="${c.id}">${icon('scale', 'sm')}Ajustar saldo</button><button class="btn btn-ghost btn-sm" data-act="fin.editConta" data-id="${c.id}">${icon('edit', 'sm')}Editar</button></div></div>
+        <div class="grid g3">
+          <div class="card">${ui.metric({ label: 'Saldo atual', value: fmt.money(F.balance(c.id)), size: 'md' })}</div>
+          <div class="card">${ui.metric({ label: 'Entradas no período', value: fmt.money(ent), cls: 'pos', size: 'md' })}</div>
+          <div class="card">${ui.metric({ label: 'Saídas no período', value: fmt.money(sai), size: 'md' })}</div>
+        </div>
+        <div class="section-title"><h2>Extrato</h2><button class="btn btn-sm btn-primary" data-act="fin.new" data-conta="${c.id}">${icon('plus', 'sm')}Lançar</button></div>
+        <div class="filters mb-3">${P.pf.bar(fk, { modes: ['mes', 'ano', '90d', 'intervalo', 'tudo'], tables: ['fin_lancamentos'] })}${P.flt.chips(fk, 'tipo', [['todos', 'Tudo'], ['entradas', 'Entradas'], ['saidas', 'Saídas'], ['pendentes', 'Pendentes']])}</div>
+        <div id="conta-list">${lista.length ? txList(lista.slice(0, 300)) : ui.empty({ ill: 'list', title: 'Sem movimentações neste filtro', small: true })}</div>`;
+    },
+    mount(root) { bindTxSwipe(root); }
+  });
+
+  // ---------- Cartões e faturas ----------
+  P.screen('fin/cartoes', {
+    mod: 'fin', tab: 'cartoes', title: 'Cartões', deps,
+    render(ctx) {
+      const cards = F.cartoes();
+      if (ctx.q.fatura) setTimeout(() => F.openInvoice(ctx.q.fatura), 50);
+      if (!cards.length) return h`<div class="page-head"><div><h1>Cartões</h1></div></div>${ui.empty({ ill: 'money', title: 'Nenhum cartão', text: 'Cadastre o cartão com dia de fechamento e vencimento: as compras caem na fatura certa sozinhas.', action: { label: 'Novo cartão', act: 'fin.editCartao' } })}`;
+      return h`<div class="page-head"><div><h1>Cartões</h1></div><div class="row-sm"><button class="btn btn-ghost btn-sm" data-act="fin.simulate">${icon('calc', 'sm')}Simular parcelas</button><button class="btn btn-primary btn-sm" data-act="fin.editCartao">${icon('plus', 'sm')}Novo</button></div></div>
+      <div class="stack">${cards.map((c) => {
+        const used = F.cardUsed(c), cur = F.currentInvoice(c), curTotal = cur.id ? F.invoiceTotal(cur.id) : 0;
+        const inv = F.invoices(c.id);
+        const hasTx = (f) => S.where('fin_lancamentos', (l) => l.fatura_id === f.id).length > 0;
+        const anoF = P.flt.get('fin.cart', 'ano:' + c.id, ''), pagasAll = inv.filter((f) => f.status === 'paga');
+        const anos = [...new Set(pagasAll.map((f) => String(f.competencia || '').slice(0, 4)).filter(Boolean))].sort().reverse();
+        const tabs = { abertas: inv.filter((f) => f.status !== 'paga' && hasTx(f)).sort((a, b) => (a.competencia < b.competencia ? -1 : 1)), pagas: pagasAll.filter((f) => !anoF || String(f.competencia || '').startsWith(anoF)) };
+        const list = tabs[st.faturaTab] || tabs.abertas;
+        return h`<div class="dash">
+          <div class="span-5 stack-sm">
+            <div class="cc" style="--cc:${c.cor || '#B98900'}"><div class="row between"><b>${c.nome}</b><button class="btn-icon sm" data-act="fin.editCartao" data-id="${c.id}" aria-label="Editar cartão" style="color:inherit">${icon('edit', 'sm')}</button></div>
+              <div class="cc-num num">•••• •••• •••• ${c.final || '0000'}</div><div class="row between"><span>Fecha dia ${c.dia_fechamento} · vence dia ${c.dia_vencimento}</span><b style="text-transform:uppercase;letter-spacing:.05em">${c.bandeira}</b></div></div>
+            <div class="card row" style="justify-content:space-around">${ui.gauge((used / (c.limite || 1)) * 100, { label: 'do limite', w: 150 })}
+              <div class="stack-sm"><div>${ui.metric({ label: 'Disponível', value: fmt.money(Math.max(0, c.limite - used)), size: 'md' })}</div><div class="muted" style="font-size:12.5px">Limite ${fmt.money(c.limite)}</div></div></div>
+          </div>
+          <div class="span-7 card"><div class="card-head">${icon('receipt')}<h3>Fatura de ${fmt.monthCap(cur.competencia)}</h3><span class="chip ${cur.status === 'aberta' ? 'acc' : cur.status === 'paga' ? 'up' : ''}">${cur.status}</span></div>
+            <div class="row between wrap"><div class="metric"><div class="value num">${fmt.money(curTotal)}</div><div class="sub">Fecha ${fmt.dm(cur.data_fechamento)} · vence ${fmt.dm(cur.data_vencimento)}</div></div>
+              ${cur.id ? h`<button class="btn btn-ghost btn-sm" data-act="fin.openInvoice" data-id="${cur.id}">Ver compras</button>` : ''}</div>
+            <div class="section-title" style="margin-top:var(--s-4)"><h3>Faturas</h3>${ui.seg([['abertas', 'Em aberto'], ['pagas', 'Pagas']], st.faturaTab, 'fin.faturaTab', { cls: 'sm' })}</div>
+            ${st.faturaTab === 'pagas' && anos.length > 1 ? h`<div class="row-f">${P.flt.select('fin.cart', 'ano:' + c.id, anos.map((y) => [y, y]), 'Todos os anos')}</div>` : ''}
+            ${list.length ? h`<div class="list">${list.slice(0, 12).map((f) => { const t = F.invoiceTotal(f.id); return h`<div class="li tap" data-act="fin.openInvoice" data-id="${f.id}"><span class="tile sm">${icon('calendar', 'sm')}</span><span class="main"><span class="t">${fmt.monthCap(f.competencia)}</span><span class="s">vence ${fmt.date(f.data_vencimento)}</span></span><span class="v">${fmt.money(t)}<small>${f.status}</small></span></div>`; })}</div>` : ui.empty({ ill: 'check', title: st.faturaTab === 'pagas' ? 'Nenhuma fatura paga ainda' : 'Nenhuma fatura em aberto', small: true })}
+          </div></div>`;
+      })}</div>`;
+    }
+  });
+
+  F.openInvoice = (id) => {
+    const f = S.get('fin_faturas', id); if (!f) return;
+    const card = S.get('fin_cartoes', f.cartao_id) || {};
+    const rows = S.where('fin_lancamentos', (l) => l.fatura_id === id).sort((a, b) => (a.data < b.data ? 1 : -1));
+    const total = F.invoiceTotal(id);
+    const s = ui.sheet({
+      title: `Fatura ${fmt.monthCap(f.competencia)}`, size: 'full',
+      body: h`<div class="card tint"><div class="row between wrap"><div>${ui.metric({ label: card.nome, value: fmt.money(total), size: 'md', sub: h`Fecha ${fmt.date(f.data_fechamento)} · vence ${fmt.date(f.data_vencimento)}` })}</div><span class="chip ${f.status === 'paga' ? 'up' : 'acc'}">${f.status}</span></div></div>
+        <div class="mt-4">${rows.length ? h`<div class="list cardlist">${rows.map((l) => txRow(l, { showDate: true }))}</div>` : ui.empty({ ill: 'list', title: 'Sem compras nesta fatura', small: true })}</div>`,
+      foot: f.status !== 'paga' && total > 0 ? h`<button class="btn btn-primary" data-pay>${icon('check', 'sm')}Pagar fatura</button>` : '',
+      onMount(sh) {
+        const pay = sh.$('[data-pay]');
+        if (pay) pay.onclick = () => { sh.close(); setTimeout(() => payInvoice(f, card, total), 260); };
+      }
+    });
+    return s;
+  };
+
+  function payInvoice(f, card, total) {
+    const fields = [
+      { k: 'conta_id', l: 'Pagar com a conta', t: 'select', req: true, opts: F.contas().map((c) => [c.id, `${c.nome} · ${fmt.money(F.balance(c.id))}`]) },
+      { k: 'valor', l: 'Valor', t: 'money', req: true, half: true },
+      { k: 'data', l: 'Data do pagamento', t: 'date', req: true, half: true }];
+    ui.editSheet({
+      title: 'Pagar fatura', fields, defaults: { conta_id: card.conta_pagamento_id || (F.contas()[0] || {}).id, valor: total, data: D.today() }, deletable: false, createLabel: 'Confirmar pagamento',
+      save: (row) => S.route('fin.payInvoice', { fatura_id: f.id, conta_id: row.conta_id, valor: row.valor, data: row.data }), savedMsg: 'Fatura paga'
+    });
+  }
+
+  // ---------- Orçamento ----------
+  P.screen('fin/orcamento', {
+    mod: 'fin', tab: 'orcamento', title: 'Orçamento', deps,
+    render() {
+      const key = st.month, items = F.budget(key);
+      const plan = P.sum(items, (i) => i.plan), real = P.sum(items, (i) => i.real);
+      const budgeted = new Set(items.map((i) => F.parentId(i.o.categoria_id)));
+      const out = F.byCategory(key).filter((c) => !budgeted.has(c.id) && c.id !== 'none');
+      const day = key === D.month(D.today()) ? +D.today().slice(8, 10) : D.dim(key);
+      return h`<div class="page-head"><div><h1>Orçamento</h1><p>${fmt.month(key)}</p></div>${monthNav()}</div>
+        ${items.length ? h`<div class="card pad-lg row wrap" style="gap:24px">${ui.ring((real / (plan || 1)) * 100, { size: 116, stroke: 11, label: fmt.pct((real / (plan || 1)) * 100), sub: 'usado', color: real > plan ? 'var(--danger)' : 'var(--primary)' })}
+          <div class="grow stack-sm"><div class="kv"><span>Planejado</span><b>${fmt.money(plan)}</b></div><div class="kv"><span>Realizado</span><b>${fmt.money(real)}</b></div><div class="kv"><span>${real > plan ? 'Excedido' : 'Disponível'}</span><b class="${real > plan ? 'neg' : 'pos'}">${fmt.money(Math.abs(plan - real))}</b></div>
+          <div class="kv"><span>Ritmo ideal até hoje</span><b>${fmt.money((plan * day) / D.dim(key))}</b></div></div></div>` : ''}
+        <div class="section-title"><h2>Categorias</h2><div class="row-sm"><button class="btn btn-ghost btn-sm" data-act="fin.copyBudget">${icon('copy', 'sm')}Copiar mês anterior</button><button class="btn btn-primary btn-sm" data-act="fin.editBudget">${icon('plus', 'sm')}Adicionar</button></div></div>
+        ${items.length ? h`<div class="list cardlist">${items.map((b) => h`<div class="li tap" data-act="fin.editBudget" data-id="${b.o.id}">${tile(b.cor || 'var(--c7)', b.icone || 'dots')}
+          <span class="main"><span class="row between"><span class="t">${b.nome}</span><span class="num ${b.pct >= 100 ? 'neg' : ''}" style="font-size:13px;font-weight:700">${fmt.pct(b.pct)}</span></span>
+          <span class="s">${fmt.money(b.real)} de ${fmt.money(b.plan)}${b.pct >= 100 ? ' · estourou' : b.pct >= 80 ? ' · perto do limite' : ''}</span><div class="mt-2">${ui.progress(b.pct, { alerts: true, size: 'thin' })}</div></span></div>`)}</div>`
+          : ui.empty({ ill: 'target', title: 'Sem orçamento neste mês', text: 'Defina quanto quer gastar por categoria. Avisamos em 80% e 100%.', action: { label: 'Adicionar categoria', act: 'fin.editBudget' } })}
+        ${out.length ? h`<div class="section-title"><h2>Gastos fora do orçamento</h2></div><div class="list cardlist">${out.map((c) => h`<div class="li">${tile(c.cor, c.icone || 'dots', true)}<span class="main"><span class="t">${c.nome}</span></span><span class="v">${fmt.money(c.valor)}</span></div>`)}</div>` : ''}`;
+    }
+  });
+
+  // ---------- Agenda: contas a pagar + recorrências ----------
+  P.screen('fin/agenda', {
+    mod: 'fin', tab: 'agenda', title: 'Contas a pagar', deps,
+    render() {
+      const today = D.today();
+      const fk = 'fin.agenda', ft = P.flt.get(fk, 'tipo', 'todos'), fc = P.flt.get(fk, 'conta', '');
+      const pend = F.txs().filter((l) => l.status !== 'pago' && l.tipo !== 'transferencia' && (ft === 'todos' || l.tipo === ft) && (!fc || (fc.startsWith('k:') ? l.cartao_id === fc.slice(2) : l.conta_id === fc.slice(2) && !l.cartao_id))).sort((a, b) => (a.data < b.data ? -1 : 1));
+      const venc = pend.filter((l) => l.data < today), hoje = pend.filter((l) => l.data === today), prox = pend.filter((l) => l.data > today && l.data <= D.add(today, 45));
+      const recs = S.all('fin_recorrencias').sort((a, b) => (a.proxima_geracao < b.proxima_geracao ? -1 : 1));
+      const byDay = P.groupBy(pend.filter((l) => D.month(l.data) === st.month), (l) => l.data);
+      const block = (title, rows, tone) => rows.length ? h`<div class="group-h"><span class="${tone || ''}">${title}</span><span class="num">${fmt.money(P.sum(rows, (l) => F.sign(l) * l.valor))}</span></div><div class="list cardlist">${rows.map((l) => h`<div class="li">
+        <button class="check" data-act="fin.pay" data-id="${l.id}" aria-label="Marcar como pago">${icon('check')}</button>
+        <span class="main tap" data-act="fin.openTx" data-id="${l.id}"><span class="t">${l.descricao}</span><span class="s">${fmt.day(l.data)} · ${l.cartao_id ? F.cartaoNome(l.cartao_id) : F.contaNome(l.conta_id)}</span></span>
+        <span class="v ${l.tipo === 'receita' ? 'pos' : ''}">${fmt.money(l.valor)}</span></div>`)}</div>` : '';
+      return h`<div class="page-head"><div><h1>Contas a pagar</h1><p>Vencimentos, recebimentos e recorrências</p></div>${monthNav()}</div>
+        <div class="filters mb-3"><div class="row-f">${P.flt.chips(fk, 'tipo', [['todos', 'Tudo'], ['despesa', 'A pagar'], ['receita', 'A receber']])}${P.flt.select(fk, 'conta', [...F.contas().map((x) => ['c:' + x.id, x.nome]), ...S.all('fin_cartoes').map((x) => ['k:' + x.id, 'Cartão ' + x.nome])], 'Todas as contas')}</div></div>
+        <div class="dash"><div class="span-5"><div class="card">${ui.monthCal(st.month, { renderDay: (d) => { const it = byDay[d]; return it ? { dots: it.map((l) => (l.tipo === 'receita' ? 'var(--success)' : l.data < today ? 'var(--danger)' : 'var(--primary)')), amt: fmt.moneyShort(P.sum(it, (l) => +l.valor)).replace('R$ ', '') } : null; } })}</div></div>
+        <div class="span-7">${venc.length + hoje.length + prox.length ? h`${block('Vencidas', venc, 'neg')}${block('Hoje', hoje)}${block('Próximos 45 dias', prox)}` : ui.empty({ ill: 'check', title: 'Tudo em dia', text: 'Nenhuma conta pendente.' })}</div></div>
+        <div class="section-title"><h2>Recorrências</h2><button class="btn btn-ghost btn-sm" data-act="fin.genRec">${icon('refresh', 'sm')}Gerar agora</button></div>
+        ${recs.length ? h`<div class="list cardlist">${recs.map((r) => { const m = r.modelo_json || {}; return h`<div class="li"><span class="tile sm">${icon('repeat', 'sm')}</span><span class="main tap" data-act="fin.editRec" data-id="${r.id}"><span class="t">${r.descricao}</span><span class="s">${{ diaria: 'Diária', semanal: 'Semanal', mensal: 'Mensal', anual: 'Anual' }[r.frequencia]} · próxima ${fmt.date(r.proxima_geracao)}${r.fim ? ' · até ' + fmt.date(r.fim) : ''}</span></span><span class="v ${m.tipo === 'receita' ? 'pos' : ''}">${fmt.money(m.valor)}</span><label class="toggle" style="margin-left:8px"><input type="checkbox" data-on-change="fin.toggleRec" data-id="${r.id}" ${r.ativa ? raw('checked') : ''} aria-label="Ativa"><span></span></label></div>`; })}</div>`
+          : ui.empty({ ill: 'calendar', title: 'Sem recorrências', text: 'Ao criar um lançamento, escolha "Repetir" para gerar automaticamente todo mês.', small: true })}`;
+    }
+  });
+
+  // ---------- Reservas e investimentos ----------
+  P.screen('fin/reservas', {
+    mod: 'fin', tab: 'reservas', title: 'Reservas e investimentos', deps: deps.concat(['met_metas']),
+    render() {
+      const res = S.all('fin_reservas'), inv = S.all('fin_investimentos');
+      const totRes = P.sum(res, (r) => +r.saldo_atual || 0), aplic = P.sum(inv, (i) => +i.valor_aplicado || 0), atual = P.sum(inv, (i) => +(i.valor_atual ?? i.valor_aplicado) || 0);
+      return h`<div class="page-head"><div><h1>Reservas e investimentos</h1><p>Guardado: <b class="num">${fmt.money(totRes + atual)}</b></p></div></div>
+        <div class="section-title" style="margin-top:0"><h2>Cofrinhos</h2><button class="btn btn-primary btn-sm" data-act="fin.editReserva">${icon('plus', 'sm')}Nova reserva</button></div>
+        ${res.length ? h`<div class="grid acc-grid">${res.map((r) => { const pct = r.valor_alvo ? (r.saldo_atual / r.valor_alvo) * 100 : 0; const meta = S.get('met_metas', r.meta_id); return h`<div class="card">
+          <div class="row">${ui.ring(pct, { size: 64, stroke: 7, label: fmt.pct(pct), labelSize: 14, color: r.cor || 'var(--primary)' })}<div class="grow"><b class="tap" data-act="fin.editReserva" data-id="${r.id}">${r.nome}</b><div class="metric"><div class="value md num">${fmt.money(r.saldo_atual)}</div></div><div class="muted" style="font-size:12.5px">${r.valor_alvo ? 'de ' + fmt.money(r.valor_alvo) : 'sem alvo'}${r.rendimento_pct ? ' · rende ' + fmt.num(r.rendimento_pct, 2) + '% a.m.' : ''}</div></div></div>
+          ${meta ? h`<a class="chip acc mt-3" href="#/met/meta/${meta.id}">${icon('target', 'xs')}${meta.titulo}</a>` : ''}
+          <div class="row-sm mt-4"><button class="btn btn-primary btn-sm grow" data-act="fin.aporte" data-id="${r.id}" data-v="1">${icon('plus', 'sm')}Aportar</button><button class="btn btn-ghost btn-sm grow" data-act="fin.aporte" data-id="${r.id}" data-v="-1">${icon('minus', 'sm')}Resgatar</button></div></div>`; })}</div>`
+          : ui.empty({ ill: 'target', title: 'Nenhuma reserva', text: 'Crie cofrinhos para emergência, viagem, troca de carro… e ligue a uma meta.', small: true, action: { label: 'Nova reserva', act: 'fin.editReserva' } })}
+        <div class="section-title"><h2>Investimentos</h2><button class="btn btn-ghost btn-sm" data-act="fin.editInv">${icon('plus', 'sm')}Adicionar</button></div>
+        ${inv.length ? h`<div class="grid g3 mb-3"><div class="card">${ui.metric({ label: 'Aplicado', value: fmt.money(aplic), size: 'md' })}</div><div class="card">${ui.metric({ label: 'Valor atual', value: fmt.money(atual), size: 'md' })}</div><div class="card">${ui.metric({ label: 'Rendimento', value: fmt.money(atual - aplic), cls: atual >= aplic ? 'pos' : 'neg', size: 'md', sub: aplic ? fmt.pct(((atual - aplic) / aplic) * 100, 1) : '' })}</div></div>
+          <div class="list cardlist">${inv.map((i) => { const g = (+(i.valor_atual ?? i.valor_aplicado)) - i.valor_aplicado; return h`<div class="li tap" data-act="fin.editInv" data-id="${i.id}"><span class="tile">${icon('trending')}</span><span class="main"><span class="t">${i.nome}</span><span class="s">${i.instituicao || ''}${i.vencimento ? ' · vence ' + fmt.date(i.vencimento) : ''}</span></span><span class="v">${fmt.money(i.valor_atual ?? i.valor_aplicado)}<small class="${g >= 0 ? 'pos' : 'neg'}">${g >= 0 ? '+' : ''}${fmt.money(g)}</small></span></div>`; })}</div>`
+          : ui.empty({ ill: 'chart', title: 'Nenhum investimento cadastrado', small: true })}`;
+    }
+  });
+
+  // ---------- Dívidas ----------
+  /** Simulação mês a mês: avalanche (maior juros) ou bola de neve (menor saldo). */
+  function simulateDebts(debts, extra, strategy) {
+    let ds = debts.map((d) => ({ id: d.id, nome: d.credor, saldo: +d.saldo_devedor, juros: (+d.juros_mensal_pct || 0) / 100, min: +d.valor_parcela || Math.max(50, +d.saldo_devedor * 0.03) })).filter((d) => d.saldo > 0);
+    let months = 0, interest = 0; const order = [];
+    while (ds.length && months < 600) {
+      months++;
+      ds.forEach((d) => { const j = d.saldo * d.juros; interest += j; d.saldo += j; });
+      let pool = extra;
+      ds.forEach((d) => { const p = Math.min(d.min, d.saldo); d.saldo -= p; });
+      ds.sort(strategy === 'avalanche' ? (a, b) => b.juros - a.juros : (a, b) => a.saldo - b.saldo);
+      for (const d of ds) { if (pool <= 0) break; const p = Math.min(pool, d.saldo); d.saldo -= p; pool -= p; }
+      ds.filter((d) => d.saldo <= 0.01).forEach((d) => { order.push({ nome: d.nome, mes: months }); });
+      ds = ds.filter((d) => d.saldo > 0.01);
+    }
+    return { months, interest, order };
+  }
+  P.screen('fin/dividas', {
+    mod: 'fin', tab: 'dividas', title: 'Dívidas', deps,
+    render() {
+      const all = S.all('fin_dividas'), ativas = all.filter((d) => d.status !== 'quitada');
+      const total = P.sum(ativas, (d) => +d.saldo_devedor);
+      const sa = simulateDebts(ativas, st.debtExtra, 'avalanche'), sb = simulateDebts(ativas, st.debtExtra, 'bola');
+      const chosen = st.debtStrategy === 'avalanche' ? sa : sb, other = st.debtStrategy === 'avalanche' ? sb : sa;
+      return h`<div class="page-head"><div><h1>Dívidas</h1><p>Saldo devedor: <b class="num">${fmt.money(total)}</b></p></div><button class="btn btn-primary btn-sm" data-act="fin.editDivida">${icon('plus', 'sm')}Adicionar</button></div>
+        ${all.length ? h`<div class="list cardlist">${all.map((d) => { const pct = d.valor_original ? ((d.valor_original - d.saldo_devedor) / d.valor_original) * 100 : 0; return h`<div class="li tap" data-act="fin.editDivida" data-id="${d.id}"><span class="tile">${icon('landmark')}</span><span class="main"><span class="t">${d.credor}</span><span class="s">${fmt.num(d.juros_mensal_pct || 0, 2)}% a.m.${d.valor_parcela ? ' · parcela ' + fmt.money(d.valor_parcela) : ''}${d.proximo_vencimento ? ' · vence ' + fmt.dm(d.proximo_vencimento) : ''}</span><div class="mt-2">${ui.progress(pct, { size: 'thin', cls: 'ok' })}</div></span><span class="v">${fmt.money(d.saldo_devedor)}<small>${d.status}</small></span></div>`; })}</div>
+          ${ativas.length ? h`<div class="card mt-4"><div class="card-head">${icon('calc')}<h3>Estratégia de quitação</h3></div>
+            <div class="row wrap" style="gap:16px">${ui.seg([['avalanche', 'Avalanche'], ['bola', 'Bola de neve']], st.debtStrategy, 'fin.debtStrategy', { cls: 'sm' })}
+            <label class="row-sm"><span class="muted" style="font-size:13px">Extra por mês</span><span class="input-wrap" style="width:150px"><span class="prefix">R$</span><input class="input num" inputmode="decimal" value="${fmt.num(st.debtExtra, 2)}" data-on-change="fin.debtExtra"></span></label></div>
+            <div class="grid g3 mt-4"><div>${ui.metric({ label: 'Quitação em', value: chosen.months >= 600 ? '—' : P.fmt.plural(chosen.months, 'mês', 'meses'), size: 'md' })}</div><div>${ui.metric({ label: 'Juros pagos', value: fmt.money(chosen.interest), size: 'md' })}</div>
+            <div>${ui.metric({ label: 'Diferença', value: fmt.money(Math.abs(other.interest - chosen.interest)), size: 'md', sub: chosen.interest <= other.interest ? 'economia vs outra estratégia' : 'a mais que a outra' })}</div></div>
+            <p class="muted mt-3" style="font-size:12.5px">${st.debtStrategy === 'avalanche' ? 'Avalanche paga primeiro a dívida com maior juros: menor custo total.' : 'Bola de neve quita primeiro a menor dívida: vitórias rápidas, mais motivação.'} Ordem: ${chosen.order.map((o) => `${o.nome} (mês ${o.mes})`).join(' → ')}</p></div>` : ''}`
+          : ui.empty({ ill: 'check', title: 'Nenhuma dívida cadastrada', text: 'Ótimo. Se tiver financiamentos ou parcelamentos longos, cadastre para simular a quitação.', small: true })}`;
+    }
+  });
+
+  // ---------- Relatórios ----------
+  // Relatórios: período e conta/cartão escolhidos na barra de filtros
+  const relConta = () => P.flt.get('fin.rel', 'conta', '');
+  const relContaNome = () => { const v = relConta(); return v.startsWith('c:') ? F.contaNome(v.slice(2)) : v.startsWith('k:') ? 'Cartão ' + F.cartaoNome(v.slice(2)) : ''; };
+  function relRows() {
+    const v = relConta();
+    let rows = P.pf.filter('fin.rel', F.txs().filter((l) => l.tipo !== 'transferencia'), 'data', { def: '6m' });
+    if (v.startsWith('c:')) rows = rows.filter((l) => l.conta_id === v.slice(2) && !l.cartao_id);
+    if (v.startsWith('k:')) rows = rows.filter((l) => l.cartao_id === v.slice(2));
+    return rows;
+  }
+  P.finRep = { filteredTx: (q) => filteredTx(q), relRows: () => relRows(), txFilter: () => st.txFilter, relLabel: () => (relConta() ? relContaNome() : ''), F };
+  function relMonths() {
+    const first = F.txs().reduce((m, l) => (l.data && (!m || l.data < m) ? l.data : m), '') || D.today();
+    const last = F.txs().reduce((m, l) => (l.data > m ? l.data : m), '');
+    return P.pf.months('fin.rel', first, { def: '6m', maxDate: last });
+  }
+  P.screen('fin/relatorios', {
+    mod: 'fin', tab: 'relatorios', title: 'Relatórios', deps,
+    render() {
+      const rows = relRows(), ms = relMonths(), n = ms.length || 1, start = ms[0], end = ms[ms.length - 1];
+      const desp = rows.filter((l) => l.tipo === 'despesa');
+      const est = Object.entries(P.groupBy(desp, (l) => l.estabelecimento || l.descricao)).map(([k, v]) => ({ k, n: v.length, t: P.sum(v, (x) => +x.valor) })).sort((a, b) => b.t - a.t).slice(0, 8);
+      const fix = P.sum(desp.filter(F.isFixed), (l) => +l.valor), vari = P.sum(desp, (l) => +l.valor) - fix;
+      return h`<div class="page-head"><div><h1>Relatórios</h1><p>${start === end ? fmt.monthCap(start) : `${fmt.monthCap(start)} a ${fmt.monthCap(end)}`}${relConta() ? ' · ' + relContaNome() : ''}</p></div>
+        <div class="row-sm">${P.rep.button('fin_rel')}</div></div>
+        <div class="filters mb-4">${P.pf.bar('fin.rel', { def: '6m', modes: ['mes', '3m', '6m', '12m', 'ano', 'intervalo', 'tudo'], tables: ['fin_lancamentos'], extra: P.flt.select('fin.rel', 'conta', [...F.contas().map((x) => ['c:' + x.id, x.nome]), ...S.all('fin_cartoes').map((x) => ['k:' + x.id, 'Cartão ' + x.nome])], 'Todas as contas e cartões') })}</div>
+        <div class="dash">
+          <div class="card span-7"><div class="card-head">${icon('chart')}<h3>Comparativo mensal</h3></div><div id="rel-month"></div></div>
+          <div class="card span-5"><div class="card-head">${icon('layers')}<h3>Fixas x variáveis</h3></div>
+            <div class="row" style="gap:20px">${ui.ring((fix / ((fix + vari) || 1)) * 100, { size: 110, stroke: 12, label: fmt.pct((fix / ((fix + vari) || 1)) * 100), sub: 'fixas' })}
+            <div class="grow"><div class="kv"><span>Fixas</span><b>${fmt.money(fix)}</b></div><div class="kv"><span>Variáveis</span><b>${fmt.money(vari)}</b></div><div class="kv"><span>Média mensal</span><b>${fmt.money((fix + vari) / n)}</b></div></div></div></div>
+          <div class="card span-7"><div class="card-head">${icon('pie')}<h3>Por categoria</h3></div><div id="rel-cat"></div></div>
+          <div class="card span-5"><div class="card-head">${icon('cart')}<h3>Onde você mais gastou</h3></div>
+            ${est.length ? h`<div class="list">${est.map((e, i) => h`<div class="li" style="min-height:48px"><span class="faint num" style="width:18px">${i + 1}</span><span class="main"><span class="t">${e.k}</span><span class="s">${P.fmt.plural(e.n, 'compra', 'compras')}</span></span><span class="v">${fmt.money(e.t)}</span></div>`)}</div>` : ui.empty({ ill: 'chart', title: 'Sem gastos no período', small: true })}</div>
+          <div class="card span-12"><div class="card-head">${icon('calendar')}<h3>Mapa de gastos por dia</h3><span class="muted" style="font-size:12px">últimas 18 semanas</span></div><div id="rel-heat"></div></div>
+        </div>`;
+    },
+    mount() {
+      const rows = relRows(), cf = relMonths().map((k) => { const r = rows.filter((l) => D.month(l.data) === k); return { key: k, rec: P.sum(r.filter((l) => l.tipo === 'receita'), (l) => +l.valor), desp: P.sum(r.filter((l) => l.tipo === 'despesa'), (l) => +l.valor) }; });
+      P.charts.mount('#rel-month', { type: 'bar', labels: cf.map((c) => fmt.monthShort(c.key)), series: [{ label: 'Receitas', data: cf.map((c) => c.rec), color: P.charts.income() }, { label: 'Despesas', data: cf.map((c) => c.desp), color: '#F2B705' }], legend: true, fmt: P.fmt.money, yfmt: P.charts.money, height: 240 });
+      const agg = {};
+      rows.filter((l) => l.tipo === 'despesa').forEach((l) => { const id = F.parentId(l.categoria_id) || 'none'; agg[id] = (agg[id] || 0) + +l.valor; });
+      const cats = Object.entries(agg).map(([id, v]) => ({ c: F.cat(id), v })).sort((a, b) => b.v - a.v).slice(0, 10);
+      P.charts.mount('#rel-cat', { type: 'bar', horizontal: true, labels: cats.map((x) => (x.c ? x.c.nome : 'Sem categoria')), series: [{ label: 'Despesas', data: cats.map((x) => P.round(x.v)), colors: cats.map((x) => (x.c && x.c.cor) || '#9A9A9A') }], fmt: P.fmt.money, yfmt: P.charts.money, height: Math.max(200, cats.length * 34) });
+      const days = 18 * 7, ws = +P.settings.get('geral.inicio_semana', 0), first = D.weekStart(D.add(D.today(), -days + 7), ws);
+      const per = {}; F.txs().filter((l) => l.tipo === 'despesa' && l.data >= first).forEach((l) => { per[l.data] = (per[l.data] || 0) + +l.valor; });
+      const vals = Object.values(per).sort((a, b) => a - b), q = (p) => vals[Math.floor(p * (vals.length - 1))] || 0;
+      const cells = D.range(first, D.add(first, days - 1)).map((d) => { const v = per[d] || 0; return { date: d, v: d > D.today() ? 0 : !v ? 0 : v <= q(.25) ? 1 : v <= q(.5) ? 2 : v <= q(.8) ? 3 : 4, title: `${fmt.date(d)}: ${fmt.money(v)}` }; });
+      document.getElementById('rel-heat').innerHTML = P.toHtml(ui.heat(cells)); ui.scrollHeat();
+    }
+  });
+
+  // ---------- Categorias e regras ----------
+  P.screen('fin/categorias', {
+    mod: 'fin', tab: 'categorias', title: 'Categorias e regras', deps,
+    render() {
+      const all = S.all('fin_categorias').filter((c) => c.tipo === st.catTipo).sort((a, b) => (a.ordem || 0) - (b.ordem || 0));
+      const parents = all.filter((c) => !c.pai_id), rules = S.all('fin_regras');
+      return h`<div class="page-head"><div><h1>Categorias</h1></div><button class="btn btn-primary btn-sm" data-act="fin.editCat">${icon('plus', 'sm')}Nova categoria</button></div>
+        ${ui.seg([['despesa', 'Despesas'], ['receita', 'Receitas']], st.catTipo, 'fin.catTipo')}
+        <div class="list cardlist mt-4">${parents.map((p) => h`<div class="li tap" data-act="fin.editCat" data-id="${p.id}">${tile(p.cor || 'var(--c7)', p.icone || 'dots')}<span class="main"><span class="t">${p.nome}${p.arquivada ? h` <span class="chip">arquivada</span>` : ''}</span><span class="s">${all.filter((c) => c.pai_id === p.id).map((c) => c.nome).join(', ') || 'Sem subcategorias'}</span></span>${icon('chev-r', 'sm faint')}</div>`)}</div>
+        <div class="section-title"><h2>Regras automáticas</h2><button class="btn btn-ghost btn-sm" data-act="fin.editRegra">${icon('plus', 'sm')}Nova regra</button></div>
+        <p class="muted mb-3" style="font-size:13px">Quando o estabelecimento contém o padrão, a categoria é preenchida sozinha (também na importação e no OCR). Regras novas são aprendidas quando você categoriza um estabelecimento.</p>
+        ${rules.length ? h`<div class="list cardlist">${rules.map((r) => h`<div class="li tap" data-act="fin.editRegra" data-id="${r.id}"><span class="tile sm">${icon('zap', 'sm')}</span><span class="main"><span class="t">“${r.padrao}”</span><span class="s">→ ${F.catLabel(r.categoria_id)}</span></span>${icon('chev-r', 'sm faint')}</div>`)}</div>` : ui.empty({ ill: 'list', title: 'Nenhuma regra ainda', small: true })}`;
+    }
+  });
+
+  // ---------- Importação de extrato ----------
+  const imp = { rows: [], headers: [], map: {}, target: '', invert: false, file: '' };
+  function parseCsv(text) {
+    const first = text.split(/\r?\n/)[0] || '';
+    const sep = (first.match(/;/g) || []).length >= (first.match(/,/g) || []).length ? ';' : ',';
+    const out = []; let row = [], cell = '', q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+      else if (c === '"') q = true;
+      else if (c === sep) { row.push(cell.trim()); cell = ''; }
+      else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell.trim()); if (row.some((x) => x)) out.push(row); row = []; cell = ''; }
+      else cell += c;
+    }
+    if (cell || row.length) { row.push(cell.trim()); if (row.some((x) => x)) out.push(row); }
+    return out;
+  }
+  function parseOfx(text) {
+    const items = [];
+    text.replace(/<STMTTRN>([\s\S]*?)(<\/STMTTRN>|(?=<STMTTRN>))/gi, (m, body) => {
+      const tag = (t) => { const r = new RegExp('<' + t + '>([^<\\r\\n]*)', 'i').exec(body); return r ? r[1].trim() : ''; };
+      const dt = tag('DTPOSTED');
+      items.push({ data: `${dt.slice(0, 4)}-${dt.slice(4, 6)}-${dt.slice(6, 8)}`, descricao: tag('MEMO') || tag('NAME'), valor: P.parseNum(tag('TRNAMT').replace('.', ',')), id_externo: tag('FITID') });
+      return m;
+    });
+    return items;
+  }
+  const toIsoDate = (s) => { s = String(s || '').trim(); let m = s.match(/^(\d{2})[\/.-](\d{2})[\/.-](\d{2,4})/); if (m) return `${m[3].length === 2 ? '20' + m[3] : m[3]}-${m[2]}-${m[1]}`; m = s.match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? m[0] : null; };
+  function importPreview() {
+    if (!imp.rows.length) return '';
+    const sig = new Set(F.txs().map((l) => [l.data, P.cents(l.valor), P.norm(l.descricao)].join('|')));
+    const rows = imp.rows.map((r) => ({ ...r, valor: imp.invert ? -r.valor : r.valor })).map((r) => ({ ...r, dup: sig.has([r.data, P.cents(Math.abs(r.valor)), P.norm(r.descricao)].join('|')) }));
+    const ok = rows.filter((r) => r.data && Number.isFinite(r.valor) && r.valor && !r.dup);
+    imp.ready = ok;
+    return h`<div class="card mt-4"><div class="card-head">${icon('eye')}<h3>Prévia</h3><span class="chip up">${ok.length} novos</span><span class="chip">${rows.length - ok.length} ignorados</span></div>
+      <div style="overflow-x:auto"><table class="table"><thead><tr><th>Data</th><th>Descrição</th><th class="r">Valor</th><th></th></tr></thead><tbody>
+      ${rows.slice(0, 60).map((r) => h`<tr style="${r.dup || !r.data ? 'opacity:.45' : ''}"><td>${r.data ? fmt.date(r.data) : 'data inválida'}</td><td>${r.descricao}</td><td class="r ${r.valor > 0 ? 'pos' : ''}">${fmt.money(r.valor)}</td><td>${r.dup ? h`<span class="chip">duplicado</span>` : ''}</td></tr>`)}</tbody></table></div>
+      ${rows.length > 60 ? h`<p class="faint mt-2">… e mais ${rows.length - 60}</p>` : ''}
+      <button class="btn btn-primary btn-block mt-4" data-act="fin.doImport" ${ok.length ? '' : raw('disabled')}>${icon('upload', 'sm')}Importar ${ok.length} lançamento(s)</button></div>`;
+  }
+  function applyCsvMap() {
+    const m = imp.map; if (!imp.csv) return;
+    imp.rows = imp.csv.slice(m.header ? 1 : 0).map((r) => ({ data: toIsoDate(r[m.data]), descricao: r[m.desc] || '', valor: P.parseNum(r[m.valor]) })).filter((r) => r.descricao || r.valor);
+  }
+  P.screen('fin/importar', {
+    mod: 'fin', tab: 'importar', title: 'Importar extrato', deps: [],
+    render() {
+      const targets = F.contas().map((c) => ['c:' + c.id, c.nome]).concat(F.cartoes().map((c) => ['k:' + c.id, 'Cartão ' + c.nome]));
+      if (!imp.target && targets[0]) imp.target = targets[0][0];
+      const cols = imp.csv ? (imp.csv[0] || []).map((c, i) => [i, imp.map.header ? `${c}` : `Coluna ${i + 1} (${c})`]) : [];
+      return h`<div class="page-head"><div><h1>Importar extrato</h1><p>CSV ou OFX do seu banco, com prévia e detecção de duplicados.</p></div></div>
+        <div class="card stack">
+          <div class="field"><label>Importar para</label><select class="input" data-on-change="fin.impTarget">${targets.map(([v, l]) => h`<option value="${v}" ${v === imp.target ? raw('selected') : ''}>${l}</option>`)}</select></div>
+          <button class="btn btn-ghost" data-act="fin.impPick">${icon('upload', 'sm')}${imp.file ? 'Trocar arquivo · ' + imp.file : 'Escolher arquivo .csv ou .ofx'}</button>
+          ${imp.csv ? h`<div class="form-row">
+            <div class="field"><label>Coluna da data</label><select class="input" data-on-change="fin.impMap" data-k="data">${cols.map(([v, l]) => h`<option value="${v}" ${+v === imp.map.data ? raw('selected') : ''}>${l}</option>`)}</select></div>
+            <div class="field"><label>Coluna da descrição</label><select class="input" data-on-change="fin.impMap" data-k="desc">${cols.map(([v, l]) => h`<option value="${v}" ${+v === imp.map.desc ? raw('selected') : ''}>${l}</option>`)}</select></div>
+            <div class="field"><label>Coluna do valor</label><select class="input" data-on-change="fin.impMap" data-k="valor">${cols.map(([v, l]) => h`<option value="${v}" ${+v === imp.map.valor ? raw('selected') : ''}>${l}</option>`)}</select></div>
+            <div class="field" style="flex-direction:row;align-items:center;justify-content:space-between"><span style="font-weight:600">Primeira linha é cabeçalho</span><label class="toggle"><input type="checkbox" data-on-change="fin.impHeader" ${imp.map.header ? raw('checked') : ''}><span></span></label></div></div>` : ''}
+          ${imp.rows.length ? h`<div class="row between"><span style="font-weight:600">Inverter sinais <span class="faint" style="font-weight:400">(fatura de cartão costuma vir positiva)</span></span><label class="toggle"><input type="checkbox" data-on-change="fin.impInvert" ${imp.invert ? raw('checked') : ''}><span></span></label></div>` : ''}
+        </div>
+        <div id="imp-prev">${importPreview()}</div>`;
+    }
+  });
+
+  // ================= Ações =================
+  const reRender = () => P.router.render(true);
+  Object.assign(P.act, {
+    'fin.new': (el) => F.openTx(el && el.dataset.conta ? { conta_id: el.dataset.conta } : {}),
+    'fin.scan': () => F.scan(),
+    'fin.openTx': (el) => { const l = S.get('fin_lancamentos', el.dataset.id); if (l) F.openTx(l); },
+    'fin.openInvoice': (el) => F.openInvoice(el.dataset.id),
+    'fin.month': (el) => { st.month = D.shiftMonth(st.month, +el.dataset.v); reRender(); },
+    'fin.tipo': (el) => { st.txFilter.tipo = el.dataset.v; st.txLimit = 120; reRender(); },
+    'fin.periodo': (el) => { st.txFilter.periodo = el.dataset.v; reRender(); },
+    'fin.search': P.debounce((el) => { st.txFilter.q = el.value; redrawList(); }, 200),
+    'fin.more': () => { st.txLimit += 120; redrawList(); },
+    'fin.pay': (el) => { const l = S.get('fin_lancamentos', el.dataset.id); if (l) markPaid(l); },
+    'fin.selectMode': () => { st.select = st.select ? null : new Set(); reRender(); },
+    'fin.toggleSel': (el) => { const id = el.dataset.id; st.select.has(id) ? st.select.delete(id) : st.select.add(id); redrawList(); },
+    'fin.selPay': async () => { const ids = [...st.select]; for (const id of ids) { const l = S.get('fin_lancamentos', id); if (l && l.status !== 'pago') await S.route('fin.saveTx', { tx: { ...strip(l), status: 'pago' } }).catch((e) => ui.toast(e.message, { error: true })); } st.select = null; ui.toast(`${ids.length} atualizado(s)`); reRender(); },
+    'fin.selDel': async () => { const ids = [...st.select]; if (!ids.length) return; if (!await ui.confirm({ title: `Excluir ${ids.length} lançamento(s)?`, ok: 'Excluir', danger: true })) return; for (const id of ids) await S.remove('fin_lancamentos', id, { undo: false }); st.select = null; ui.toast(`${ids.length} excluído(s)`); reRender(); },
+    'fin.selCat': () => {
+      const ids = [...st.select]; if (!ids.length) return;
+      ui.editSheet({ title: 'Categorizar selecionados', deletable: false, fields: [{ k: 'categoria_id', l: 'Categoria', t: 'select', req: true, opts: F.catOptions() }],
+        save: async (row) => { for (const id of ids) { const l = S.get('fin_lancamentos', id); if (l && l.tipo !== 'transferencia') await S.route('fin.saveTx', { tx: { ...strip(l), categoria_id: row.categoria_id } }); } st.select = null; reRender(); }, savedMsg: 'Categorias atualizadas' });
+    },
+    'fin.filters': () => {
+      const f = st.txFilter;
+      ui.editSheet({
+        title: 'Filtros', deletable: false, createLabel: 'Aplicar', savedMsg: 'Filtros aplicados',
+        fields: [{ k: 'conta', l: 'Conta', t: 'select', opts: F.contas(true).map((c) => [c.id, c.nome]), ph: 'Todas' }, { k: 'cartao', l: 'Cartão', t: 'select', opts: F.cartoes(true).map((c) => [c.id, c.nome]), ph: 'Todos' },
+          { k: 'cat', l: 'Categoria', t: 'select', opts: F.catOptions(), ph: 'Todas' }, { k: 'tag', l: 'Tag', t: 'text', ph: 'ex.: viagem' }, { k: 'min', l: 'Valor mínimo', t: 'money', half: true }, { k: 'max', l: 'Valor máximo', t: 'money', half: true }],
+        defaults: f, extra: h`<button type="button" class="btn btn-quiet" data-clear>Limpar filtros</button>`,
+        mount(sh) { sh.$('[data-clear]').onclick = () => { ['conta', 'cartao', 'cat', 'tag', 'min', 'max'].forEach((k) => delete f[k]); sh.close(); reRender(); }; },
+        save: async (row) => { Object.assign(f, row); reRender(); }
+      });
+    },
+    'fin.editConta': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_contas', el.dataset.id) : null;
+      ui.editSheet({ table: 'fin_contas', row, title: row ? 'Editar conta' : 'Nova conta', defaults: { tipo: 'corrente', saldo_inicial: 0, incluir_no_total: true, cor: '#F2B705', icone: 'landmark' },
+        fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true }, { k: 'tipo', l: 'Tipo', t: 'select', req: true, half: true, opts: [['corrente', 'Conta corrente'], ['poupanca', 'Poupança'], ['carteira', 'Carteira'], ['investimento', 'Investimento'], ['outro', 'Outra']] },
+          { k: 'instituicao', l: 'Instituição', t: 'text', half: true }, { k: 'saldo_inicial', l: 'Saldo inicial', t: 'money', hint: 'Saldo antes do primeiro lançamento registrado aqui' }, { k: 'cor', l: 'Cor', t: 'color' },
+          { k: 'incluir_no_total', l: 'Somar no saldo total', t: 'toggle' }, { k: 'arquivada', l: 'Arquivar conta', t: 'toggle', hint: 'Some das listas, mas mantém o histórico', show: () => !!row }],
+        deleteText: 'Os lançamentos continuam no histórico.', deleteLabel: 'Conta excluída' });
+    },
+    'fin.reconcile': (el) => {
+      const c = S.get('fin_contas', el.dataset.id);
+      ui.editSheet({ title: 'Ajustar saldo', deletable: false, createLabel: 'Ajustar', fields: [{ k: 'saldo_real', l: 'Saldo real hoje (do app do banco)', t: 'money', req: true }], defaults: { saldo_real: F.balance(c.id) },
+        extra: h`<p class="muted">Saldo no Prumo: <b>${fmt.money(F.balance(c.id))}</b>. A diferença vira um lançamento "Ajuste de saldo".</p>`,
+        save: async (row) => { const r = await S.route('fin.reconcile', { conta_id: c.id, saldo_real: row.saldo_real }); ui.toast(r.diferenca ? `Ajuste de ${fmt.money(r.diferenca)} lançado` : 'Saldo já estava certo'); }, savedMsg: 'Saldo conferido' });
+    },
+    'fin.editCartao': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_cartoes', el.dataset.id) : null;
+      ui.editSheet({ table: 'fin_cartoes', row, title: row ? 'Editar cartão' : 'Novo cartão', defaults: { bandeira: 'mastercard', dia_fechamento: 3, dia_vencimento: 10, cor: '#B98900', conta_pagamento_id: (F.contas()[0] || {}).id },
+        fields: [{ k: 'nome', l: 'Nome do cartão', t: 'text', req: true, focus: true }, { k: 'bandeira', l: 'Bandeira', t: 'select', req: true, half: true, opts: [['mastercard', 'Mastercard'], ['visa', 'Visa'], ['elo', 'Elo'], ['amex', 'Amex'], ['hipercard', 'Hipercard'], ['outro', 'Outra']] },
+          { k: 'final', l: 'Final', t: 'text', half: true, max: 4, ph: '1234' }, { k: 'limite', l: 'Limite', t: 'money', req: true },
+          { k: 'dia_fechamento', l: 'Dia de fechamento', t: 'int', req: true, half: true, min: 1, max: 31 }, { k: 'dia_vencimento', l: 'Dia de vencimento', t: 'int', req: true, half: true, min: 1, max: 31 },
+          { k: 'conta_pagamento_id', l: 'Conta que paga a fatura', t: 'select', opts: F.contas().map((c) => [c.id, c.nome]) }, { k: 'cor', l: 'Cor', t: 'color' }] });
+    },
+    'fin.faturaTab': (el) => { st.faturaTab = el.dataset.v; reRender(); },
+    'fin.simulate': () => {
+      const cards = F.cartoes();
+      const s = ui.sheet({ title: 'Simular parcelamento', body: h`<div class="form"><div class="form-row">${P.form.html([{ k: 'cartao', l: 'Cartão', t: 'select', req: true, opts: cards.map((c) => [c.id, c.nome]) }, { k: 'valor', l: 'Valor total', t: 'money', req: true, half: true }, { k: 'n', l: 'Parcelas', t: 'int', req: true, half: true, min: 1, max: 24 }], { cartao: (cards[0] || {}).id, n: 10 })}</div></div><div data-out class="mt-4"></div>` });
+      const calc = () => {
+        const v = P.form.read(s.body, [{ k: 'cartao' }, { k: 'valor', t: 'money' }, { k: 'n', t: 'int' }], { silent: true }).values;
+        const c = S.get('fin_cartoes', v.cartao); if (!c || !v.valor || !v.n) { s.$('[data-out]').innerHTML = ''; return; }
+        const info = P.calc.invoiceFor(D.today(), c.dia_fechamento, c.dia_vencimento), parc = v.valor / v.n;
+        s.$('[data-out]').innerHTML = P.toHtml(h`<div class="list cardlist">${Array.from({ length: v.n }, (_, i) => { const k = D.shiftMonth(info.competencia, i); const f = S.where('fin_faturas', (x) => x.cartao_id === c.id && x.competencia === k)[0]; const cur = f ? F.invoiceTotal(f.id) : 0; return h`<div class="li" style="min-height:48px"><span class="main"><span class="t">${fmt.monthCap(k)}</span><span class="s">hoje ${fmt.money(cur)}</span></span><span class="v">${fmt.money(cur + parc)}<small>+${fmt.money(parc)}</small></span></div>`; })}</div>
+          <p class="muted mt-3">Limite disponível depois: <b>${fmt.money(c.limite - F.cardUsed(c) - v.valor)}</b></p>`);
+      };
+      P.form.bind(s.body, null); s.body.addEventListener('input', P.debounce(calc, 200)); s.body.addEventListener('change', calc);
+    },
+    'fin.editBudget': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_orcamentos', el.dataset.id) : null;
+      const parents = F.cats().filter((c) => c.tipo === 'despesa' && !c.pai_id);
+      ui.editSheet({ table: 'fin_orcamentos', row, title: row ? 'Editar orçamento' : 'Orçamento da categoria', defaults: { competencia: st.month },
+        fields: [{ k: 'categoria_id', l: 'Categoria', t: 'select', req: true, opts: parents.map((c) => [c.id, c.nome]) }, { k: 'valor_planejado', l: 'Quanto quer gastar no mês', t: 'money', req: true }, { k: 'rollover', l: 'Levar sobra para o mês seguinte', t: 'toggle' }],
+        beforeSave: (r) => ({ ...r, competencia: row ? row.competencia : st.month }), deleteLabel: 'Orçamento removido' });
+    },
+    'fin.copyBudget': async () => { const r = await S.route('fin.copyBudget', { de: D.shiftMonth(st.month, -1), para: st.month }); ui.toast(r.copiados ? `${r.copiados} categoria(s) copiada(s)` : 'Nada para copiar do mês anterior'); },
+    'fin.genRec': async () => { const r = await S.route('fin.generateRecurring', {}, { timeout: 200000 }); ui.toast(r.criados ? `${r.criados} lançamento(s) gerado(s)` : 'Tudo já estava gerado'); },
+    'fin.toggleRec': (el) => { const r = S.get('fin_recorrencias', el.dataset.id); if (r) S.save('fin_recorrencias', { id: r.id, ativa: el.checked }, { toast: el.checked ? 'Recorrência ativada' : 'Recorrência pausada' }); },
+    'fin.editRec': (el) => {
+      const r = S.get('fin_recorrencias', el.dataset.id); const m = r.modelo_json || {};
+      ui.editSheet({ table: 'fin_recorrencias', row: { ...r, valor: m.valor }, title: 'Recorrência',
+        fields: [{ k: 'descricao', l: 'Descrição', t: 'text', req: true }, { k: 'valor', l: 'Valor', t: 'money', req: true, half: true }, { k: 'frequencia', l: 'Frequência', t: 'select', req: true, half: true, opts: [['mensal', 'Mensal'], ['semanal', 'Semanal'], ['anual', 'Anual'], ['diaria', 'Diária']] },
+          { k: 'proxima_geracao', l: 'Próxima data', t: 'date', req: true, half: true }, { k: 'fim', l: 'Termina em', t: 'date', half: true }],
+        beforeSave: (row) => { const out = { ...row, modelo_json: { ...m, valor: row.valor, descricao: row.descricao } }; delete out.valor; return out; }, deleteText: 'Lançamentos já gerados continuam.' });
+    },
+    'fin.editReserva': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_reservas', el.dataset.id) : null;
+      ui.editSheet({ table: 'fin_reservas', row, title: row ? 'Editar reserva' : 'Nova reserva', defaults: { cor: '#F2B705', saldo_atual: 0 },
+        fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true, ph: 'Ex.: Reserva de emergência' }, { k: 'valor_alvo', l: 'Valor alvo', t: 'money', half: true }, { k: 'rendimento_pct', l: 'Rendimento ao mês', t: 'num', unit: '%', half: true },
+          { k: 'saldo_atual', l: 'Saldo atual', t: 'money', show: () => !row, hint: 'Valor já guardado antes de usar o Prumo' }, { k: 'conta_id', l: 'Conta onde fica guardado', t: 'select', opts: F.contas().map((c) => [c.id, c.nome]) },
+          { k: 'meta_id', l: 'Meta vinculada', t: 'select', opts: S.where('met_metas', (m) => m.status === 'ativa').map((m) => [m.id, m.titulo]) }, { k: 'cor', l: 'Cor', t: 'color' }],
+        extra: !row ? h`<label class="row between mt-2"><span style="font-weight:600">Criar meta financeira junto</span><span class="toggle"><input type="checkbox" data-mkgoal checked><span></span></span></label>` : '',
+        mount(sh) { sh._mk = () => { const c = sh.$('[data-mkgoal]'); return c && c.checked; }; },
+        save: async (r, sh) => {
+          const saved = await S.save('fin_reservas', r, { silentError: true });
+          if (!row && sh._mk() && !r.meta_id && r.valor_alvo) {
+            const meta = await S.save('met_metas', { titulo: r.nome, area: 'financeira', horizonte: 'medio', data_inicio: D.today(), prazo: D.addMonths(D.today(), 12), medicao: 'automatica', origem_metrica: 'fin_reserva', origem_id: saved.id, valor_inicial: 0, valor_atual: r.saldo_atual || 0, valor_alvo: r.valor_alvo, unidade: 'R$', status: 'ativa', cor: r.cor });
+            await S.save('fin_reservas', { id: saved.id, meta_id: meta.id });
+            ui.toast('Meta criada e vinculada', { action: { label: 'Ver', fn: () => P.router.go('met/meta/' + meta.id) } });
+          }
+          return saved;
+        } });
+    },
+    'fin.aporte': (el) => {
+      const r = S.get('fin_reservas', el.dataset.id), sign = +el.dataset.v;
+      ui.editSheet({ title: sign > 0 ? `Aportar em ${r.nome}` : `Resgatar de ${r.nome}`, deletable: false, createLabel: sign > 0 ? 'Aportar' : 'Resgatar',
+        fields: [{ k: 'valor', l: 'Valor', t: 'money', req: true, focus: true }, { k: 'conta_id', l: sign > 0 ? 'Sai da conta' : 'Vai para a conta', t: 'select', opts: F.contas().map((c) => [c.id, `${c.nome} · ${fmt.money(F.balance(c.id))}`]), ph: 'Não movimentar conta' }, { k: 'data', l: 'Data', t: 'date', req: true }],
+        defaults: { data: D.today(), conta_id: r.conta_id && r.conta_id !== (F.contas().find((c) => c.tipo === 'poupanca') || {}).id ? r.conta_id : (F.contas()[0] || {}).id },
+        save: (row) => S.route('fin.aporte', { reserva_id: r.id, conta_id: row.conta_id, valor: sign * row.valor, data: row.data }), savedMsg: sign > 0 ? 'Aporte registrado' : 'Resgate registrado' });
+    },
+    'fin.editInv': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_investimentos', el.dataset.id) : null;
+      ui.editSheet({ table: 'fin_investimentos', row, title: row ? 'Editar investimento' : 'Novo investimento', defaults: { tipo: 'renda_fixa', data_aplicacao: D.today() },
+        fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true, ph: 'Ex.: CDB 110% CDI' }, { k: 'tipo', l: 'Tipo', t: 'select', req: true, half: true, opts: [['renda_fixa', 'Renda fixa'], ['tesouro', 'Tesouro Direto'], ['acoes', 'Ações'], ['fii', 'FII'], ['fundos', 'Fundos'], ['cripto', 'Cripto'], ['previdencia', 'Previdência'], ['outro', 'Outro']] },
+          { k: 'instituicao', l: 'Instituição', t: 'text', half: true }, { k: 'valor_aplicado', l: 'Valor aplicado', t: 'money', req: true, half: true }, { k: 'valor_atual', l: 'Valor atual', t: 'money', half: true },
+          { k: 'data_aplicacao', l: 'Aplicado em', t: 'date', half: true }, { k: 'vencimento', l: 'Vencimento', t: 'date', half: true }],
+        beforeSave: (r) => ({ ...r, rentabilidade: r.valor_aplicado ? P.round(((((r.valor_atual ?? r.valor_aplicado) - r.valor_aplicado) / r.valor_aplicado) * 100), 2) : null }) });
+    },
+    'fin.editDivida': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_dividas', el.dataset.id) : null;
+      ui.editSheet({ table: 'fin_dividas', row, title: row ? 'Editar dívida' : 'Nova dívida', defaults: { status: 'ativa', juros_mensal_pct: 0 },
+        fields: [{ k: 'credor', l: 'Credor / descrição', t: 'text', req: true, focus: true }, { k: 'valor_original', l: 'Valor original', t: 'money', half: true }, { k: 'saldo_devedor', l: 'Saldo devedor', t: 'money', req: true, half: true },
+          { k: 'juros_mensal_pct', l: 'Juros ao mês', t: 'num', unit: '%', half: true }, { k: 'valor_parcela', l: 'Parcela', t: 'money', half: true }, { k: 'parcelas', l: 'Parcelas restantes', t: 'int', half: true }, { k: 'proximo_vencimento', l: 'Próximo vencimento', t: 'date', half: true },
+          { k: 'status', l: 'Situação', t: 'seg', opts: [['ativa', 'Ativa'], ['negociando', 'Negociando'], ['quitada', 'Quitada']] }] });
+    },
+    'fin.debtStrategy': (el) => { st.debtStrategy = el.dataset.v; reRender(); },
+    'fin.debtExtra': (el) => { st.debtExtra = Math.max(0, P.parseNum(el.value) || 0); reRender(); },
+    'fin.relPeriodo': (el) => { st.relPeriodo = +el.dataset.v; reRender(); },
+    'fin.catTipo': (el) => { st.catTipo = el.dataset.v; reRender(); },
+    'fin.editCat': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_categorias', el.dataset.id) : null;
+      const kids = row ? S.where('fin_categorias', (c) => c.pai_id === row.id) : [];
+      ui.editSheet({ table: 'fin_categorias', row, title: row ? 'Editar categoria' : 'Nova categoria', defaults: { tipo: st.catTipo, cor: '#F2B705', icone: 'dots' },
+        fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true }, { k: 'tipo', l: 'Tipo', t: 'seg', opts: [['despesa', 'Despesa'], ['receita', 'Receita']] },
+          { k: 'pai_id', l: 'Subcategoria de', t: 'select', ph: 'Nenhuma (principal)', opts: (v) => F.cats().filter((c) => !c.pai_id && c.tipo === (v.tipo || st.catTipo) && (!row || c.id !== row.id)).map((c) => [c.id, c.nome]) },
+          { k: 'icone', l: 'Ícone', t: 'select', opts: CAT_ICONS.map((i) => [i, i]) }, { k: 'cor', l: 'Cor', t: 'color' }, { k: 'arquivada', l: 'Arquivar', t: 'toggle', show: () => !!row }],
+        extra: kids.length ? h`<div class="field"><span class="label">Subcategorias</span><div class="row-sm wrap">${kids.map((k) => h`<button type="button" class="chip lg" data-act="fin.editCat" data-id="${k.id}" data-close>${k.nome}</button>`)}</div></div>` : '' });
+    },
+    'fin.editRegra': (el) => {
+      const row = el && el.dataset.id ? S.get('fin_regras', el.dataset.id) : null;
+      ui.editSheet({ table: 'fin_regras', row, title: row ? 'Editar regra' : 'Nova regra', fields: [{ k: 'padrao', l: 'Quando o estabelecimento contiver', t: 'text', req: true, ph: 'ex.: posto avenida' }, { k: 'categoria_id', l: 'Usar a categoria', t: 'select', req: true, opts: F.catOptions() }],
+        beforeSave: (r) => ({ ...r, padrao: P.norm(r.padrao) }) });
+    },
+    'fin.impTarget': (el) => { imp.target = el.value; },
+    'fin.impPick': async () => {
+      const file = await P.files.pick({ accept: '.csv,.ofx,.txt,text/csv' }); if (!file) return;
+      let text = await P.files.readText(file);
+      if (/Ã§|Ã£|Ã©/.test(text) === false && /\uFFFD/.test(text)) { const buf = await file.arrayBuffer(); text = new TextDecoder('windows-1252').decode(buf); }
+      imp.file = file.name; imp.csv = null; imp.rows = [];
+      if (/<OFX>|<STMTTRN>/i.test(text)) imp.rows = parseOfx(text);
+      else {
+        imp.csv = parseCsv(text);
+        const head = (imp.csv[0] || []).map(P.norm);
+        const find = (re, def) => { const i = head.findIndex((x) => re.test(x)); return i >= 0 ? i : def; };
+        imp.map = { header: head.some((x) => /data|descri|valor|hist/.test(x)), data: find(/data|date/, 0), desc: find(/descri|hist|lancamento|memo/, 1), valor: find(/valor|amount|quantia/, 2) };
+        applyCsvMap();
+      }
+      reRender();
+    },
+    'fin.impMap': (el) => { imp.map[el.dataset.k] = +el.value; applyCsvMap(); document.getElementById('imp-prev').innerHTML = P.toHtml(importPreview()); },
+    'fin.impHeader': (el) => { imp.map.header = el.checked; applyCsvMap(); reRender(); },
+    'fin.impInvert': (el) => { imp.invert = el.checked; document.getElementById('imp-prev').innerHTML = P.toHtml(importPreview()); },
+    'fin.doImport': async (el) => {
+      el.classList.add('loading');
+      const [kind, id] = imp.target.split(':');
+      const rows = imp.ready.map((r) => ({ data: r.data, descricao: r.descricao, valor: r.valor, id_externo: r.id_externo }));
+      try {
+        const res = await S.route('fin.import', { rows, conta_id: kind === 'c' ? id : null, cartao_id: kind === 'k' ? id : null }, { timeout: 280000 });
+        ui.toast(`${res.importados} importado(s) · ${res.duplicados} duplicado(s) ignorado(s)`);
+        Object.assign(imp, { rows: [], csv: null, file: '', ready: [] });
+        P.router.go('fin/lancamentos');
+      } catch (e) { el.classList.remove('loading'); ui.toast(e.message, { error: true }); }
+    }
+  });
+
+  P.module({
+    id: 'fin', name: 'Finanças', icon: 'wallet', home: 'fin', plusLabel: 'Novo lançamento', plus: () => F.openTx(),
+    blurb: () => `${fmt.moneyShort(F.monthStats(D.month(D.today())).saldo)} no mês`,
+    tabs: [{ id: 'resumo', label: 'Resumo', icon: 'pie', route: 'fin' }, { id: 'lancamentos', label: 'Lançamentos', icon: 'list', route: 'fin/lancamentos' }, { id: 'cartoes', label: 'Cartões', icon: 'card', route: 'fin/cartoes' }, { id: 'mais', label: 'Mais', icon: 'grid', more: true }],
+    more: [{ id: 'contas', label: 'Contas', icon: 'landmark', route: 'fin/contas' }, { id: 'orcamento', label: 'Orçamento', icon: 'target', route: 'fin/orcamento' }, { id: 'agenda', label: 'Contas a pagar', icon: 'calendar', route: 'fin/agenda' },
+      { id: 'reservas', label: 'Reservas e investimentos', icon: 'piggy', route: 'fin/reservas' }, { id: 'dividas', label: 'Dívidas', icon: 'scale', route: 'fin/dividas' }, { id: 'relatorios', label: 'Relatórios', icon: 'chart', route: 'fin/relatorios' },
+      { id: 'categorias', label: 'Categorias e regras', icon: 'tag', route: 'fin/categorias' }, { id: 'importar', label: 'Importar extrato', icon: 'upload', route: 'fin/importar' }]
+  });
+})();
+</script>

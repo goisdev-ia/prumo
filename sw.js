@@ -1,6 +1,6 @@
 /* Prumo · service worker: guarda a casca do app para abrir rápido/offline e mostra as notificações push. */
 importScripts('config.js');
-const CACHE = 'prumo-shell-v1';
+const CACHE = 'prumo-shell-v2';
 const SHELL = ['./', 'index.html', 'config.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/badge-72.png', 'icons/favicon.png'];
 
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())); });
@@ -40,7 +40,10 @@ self.addEventListener('push', (e) => {
     } catch (err) { itens = null; }
     if (itens === null) return self.registration.showNotification('Prumo', { body: 'Você tem novidades no Prumo.', icon: ICON, badge: BADGE, tag: 'prumo-geral', data: { link: '#/' } });
     for (const n of itens) {
-      await self.registration.showNotification(n.titulo || 'Prumo', { body: n.corpo || '', icon: ICON, badge: BADGE, tag: 'prumo-' + n.id, data: { link: n.link || '#/' }, vibrate: [60, 40, 60], timestamp: Date.now() });
+      // Alarme: fica na tela até a pessoa tocar e vibra mais forte
+      const alarme = n.tipo === 'alarme';
+      await self.registration.showNotification(n.titulo || 'Prumo', { body: n.corpo || '', icon: ICON, badge: BADGE, tag: 'prumo-' + n.id, data: { link: n.link || '#/' },
+        vibrate: alarme ? [500, 200, 500, 200, 500, 200, 800] : [60, 40, 60], requireInteraction: alarme, renotify: alarme, timestamp: Date.now() });
     }
   })());
 });

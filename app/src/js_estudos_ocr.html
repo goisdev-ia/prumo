@@ -1,0 +1,211 @@
+<script>
+/* Prumo · Estudos: OCR de PDF digitalizado.
+   Decide por página se precisa de OCR (sem camada de texto), renderiza a página em 200 dpi, pré-processa
+   (tons de cinza, contraste por percentis e, a partir de 3 graus, correção de inclinação pelo perfil de projeção;
+   abaixo disso o próprio Tesseract corrige e a rotação piorou o resultado na medição), reconhece com
+   Tesseract.js (idioma por) no próprio aparelho ou, como alternativa, pelo OCR do Google Drive no servidor,
+   e faz um pós-processamento conservador (ligaduras, hifenização no fim da linha, espaços, cabeçalho e rodapé
+   repetidos). Não corrige palavras por dicionário. As palavras saem com coordenadas da página para a camada de
+   texto invisível do leitor e para os leitores de questões e de edital.
+   As funções de imagem e de texto são puras e rodam também no Node (testes e medição). */
+(function (root) {
+  'use strict';
+  const TJS = '7.0.0';
+  const CDN = {
+    lib: 'https://cdn.jsdelivr.net/npm/tesseract.js@' + TJS + '/dist/tesseract.min.js',
+    worker: 'https://cdn.jsdelivr.net/npm/tesseract.js@' + TJS + '/dist/worker.min.js',
+    core: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@' + TJS,
+    lang: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/por/4.0.0_best_int'
+  };
+  const DPI = 200;
+  const DESKEW_MIN = 3;
+
+  // ================= imagem =================
+  /** RGBA (ImageData) para cinza (luminância). */
+  function toGray(img) {
+    const n = img.width * img.height, g = new Uint8ClampedArray(n), d = img.data;
+    for (let i = 0, j = 0; i < n; i++, j += 4) g[i] = (d[j] * 299 + d[j + 1] * 587 + d[j + 2] * 114) / 1000;
+    return { w: img.width, h: img.height, g };
+  }
+  /** Estica o contraste entre os percentis 1 e 99 (papel amarelado e tinta clara viram branco e preto). */
+  function stretch(G, lo = 0.01, hi = 0.99) {
+    const hist = new Uint32Array(256), n = G.g.length; for (let i = 0; i < n; i++) hist[G.g[i]]++;
+    let a = 0, b = 255, acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * lo) { a = v; break; } }
+    acc = 0; for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= n * (1 - hi)) { b = v; break; } }
+    if (b - a < 16) return { ...G, lo: a, hi: b };
+    const k = 255 / (b - a), g = new Uint8ClampedArray(n); for (let i = 0; i < n; i++) g[i] = (G.g[i] - a) * k;
+    return { w: G.w, h: G.h, g, lo: a, hi: b };
+  }
+  function otsu(G) {
+    const hist = new Float64Array(256), n = G.g.length; for (let i = 0; i < n; i++) hist[G.g[i]]++;
+    let sum = 0; for (let v = 0; v < 256; v++) sum += v * hist[v];
+    let sB = 0, wB = 0, best = 0, t = 128;
+    for (let v = 0; v < 256; v++) { wB += hist[v]; if (!wB) continue; const wF = n - wB; if (!wF) break; sB += v * hist[v]; const mB = sB / wB, mF = (sum - sB) / wF, s = wB * wF * (mB - mF) * (mB - mF); if (s > best) { best = s; t = v; } }
+    return t;
+  }
+  /** Ângulo de inclinação do texto em graus (positivo = linhas subindo para a direita), pelo perfil de projeção. */
+  function skewAngle(G, max = 5) {
+    const t = otsu(G), step = Math.max(1, Math.round(Math.max(G.w, G.h) / 1400)), pts = [];
+    for (let y = 0; y < G.h; y += step) for (let x = 0; x < G.w; x += step) if (G.g[y * G.w + x] < t) pts.push(x, y);
+    if (pts.length < 200) return 0;
+    const score = (deg) => {
+      const tg = Math.tan(deg * Math.PI / 180), rows = new Float64Array(Math.ceil((G.h + G.w * Math.abs(tg)) / step) + 2), off = G.w * Math.max(0, tg);
+      for (let i = 0; i < pts.length; i += 2) rows[Math.floor((pts[i + 1] - pts[i] * tg + off) / step)]++;
+      let s = 0, m = 0; for (const r of rows) { s += r * r; m += r; } return s / (m || 1);
+    };
+    let best = 0, bs = score(0);
+    for (let a = -max; a <= max + 1e-9; a += 0.5) { const s = score(a); if (s > bs * 1.0005) { bs = s; best = a; } }
+    const c = best; for (let a = c - 0.5; a <= c + 0.5 + 1e-9; a += 0.1) { const s = score(a); if (s > bs * 1.0005) { bs = s; best = a; } }
+    return Math.round(best * 10) / 10;
+  }
+  /** Gira a imagem cinza (bilinear, fundo branco). rotate(G, skewAngle(G)) deixa as linhas retas. */
+  function rotate(G, deg) {
+    if (!deg) return G;
+    const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r), cx = G.w / 2, cy = G.h / 2, g = new Uint8ClampedArray(G.w * G.h);
+    for (let y = 0; y < G.h; y++) for (let x = 0; x < G.w; x++) {
+      const dx = x - cx, dy = y - cy, sx = c * dx - s * dy + cx, sy = s * dx + c * dy + cy, x0 = Math.floor(sx), y0 = Math.floor(sy);
+      if (x0 < 0 || y0 < 0 || x0 >= G.w - 1 || y0 >= G.h - 1) { g[y * G.w + x] = 255; continue; }
+      const fx = sx - x0, fy = sy - y0, i = y0 * G.w + x0;
+      g[y * G.w + x] = (G.g[i] * (1 - fx) + G.g[i + 1] * fx) * (1 - fy) + (G.g[i + G.w] * (1 - fx) + G.g[i + G.w + 1] * fx) * fy;
+    }
+    return { w: G.w, h: G.h, g };
+  }
+  /** Pré-processamento completo: cinza, contraste e inclinação. Devolve RGBA para o reconhecedor. */
+  function prep(img, o = {}) {
+    let G = stretch(toGray(img));
+    const ang = o.deskew === false ? 0 : skewAngle(G), min = o.deskewMin != null ? o.deskewMin : DESKEW_MIN;
+    if (Math.abs(ang) >= min) G = rotate(G, ang);
+    const out = new Uint8ClampedArray(G.w * G.h * 4);
+    for (let i = 0, j = 0; i < G.g.length; i++, j += 4) { out[j] = out[j + 1] = out[j + 2] = G.g[i]; out[j + 3] = 255; }
+    return { width: G.w, height: G.h, data: out, angulo: Math.abs(ang) >= min ? ang : 0, inclinacao: ang };
+  }
+
+  // ================= texto =================
+  const LIG = { 'ﬀ': 'ff', 'ﬁ': 'fi', 'ﬂ': 'fl', 'ﬃ': 'ffi', 'ﬄ': 'ffl', 'ﬅ': 'st', 'ﬆ': 'st' };
+  const LOW = 'a-zà-öø-ÿ';
+  /** Pós-processamento conservador: ligaduras, hifenização no fim da linha entre minúsculas, espaços. */
+  function post(t) {
+    return String(t || '').replace(/\r/g, '')
+      .replace(/[ﬀ-ﬆ]/g, (c) => LIG[c] || c)
+      .replace(new RegExp('([' + LOW + '])[-­‐]\\s*\\n\\s*([' + LOW + '])', 'g'), '$1$2')
+      .replace(/[ \t ]+/g, ' ')
+      .replace(/ +([,.;:!?)\]])/g, '$1').replace(/([(\[]) +/g, '$1')
+      .replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+  const keyOf = (l) => String(l).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\d+/g, '#').replace(/[^a-z#]+/g, ' ').trim();
+  /** Tira cabeçalho e rodapé que se repetem (2 primeiras e 2 últimas linhas) em pelo menos metade das páginas (mínimo 3). */
+  function stripRepeated(pages) {
+    const ks = Object.keys(pages), cnt = {};
+    if (ks.length < 3) return { ...pages };
+    const ends = (lines) => [...new Set([0, 1, lines.length - 2, lines.length - 1].filter((i) => i >= 0 && i < lines.length))];
+    ks.forEach((k) => { const L = String(pages[k] || '').split('\n'), seen = new Set(); ends(L).forEach((i) => { const kk = keyOf(L[i]); if (kk.length >= 3 && !seen.has(kk)) { seen.add(kk); cnt[kk] = (cnt[kk] || 0) + 1; } }); });
+    const min = Math.max(3, Math.ceil(ks.length / 2)), out = {};
+    ks.forEach((k) => { const L = String(pages[k] || '').split('\n'), drop = new Set(ends(L).filter((i) => (cnt[keyOf(L[i])] || 0) >= min)); out[k] = L.filter((_, i) => !drop.has(i)).join('\n').trim(); });
+    return out;
+  }
+  const toks = (s) => String(s || '').normalize('NFC').toLowerCase().replace(/[^0-9a-zà-öø-ÿ]+/g, ' ').trim().split(' ').filter(Boolean);
+  /** Taxa de erro de palavras (distância de edição por palavra / palavras da referência). */
+  function wer(ref, hyp) {
+    const a = toks(ref), b = toks(hyp); if (!a.length) return b.length ? 1 : 0;
+    let prev = new Uint32Array(b.length + 1), cur = new Uint32Array(b.length + 1);
+    for (let j = 0; j <= b.length; j++) prev[j] = j;
+    for (let i = 1; i <= a.length; i++) { cur[0] = i; for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); [prev, cur] = [cur, prev]; }
+    return prev[b.length] / a.length;
+  }
+  /** A página precisa de OCR? Sem camada de texto (menos de 40 letras) é sim. */
+  function needsOcr(chars) { return (Number(chars) || 0) < 40; }
+  /** Palavras do OCR (pixels, origem no topo) para itens no formato do PDF.js (pontos, y para cima). */
+  function wordsToItems(words, scale, pageH) {
+    return (words || []).filter((w) => String(w.t || '').trim()).map((w) => ({ str: w.t, x: w.x / scale, y: pageH - (w.y + w.h * 0.8) / scale, w: w.w / scale, size: Math.max(4, w.h / scale), rot: 0 }));
+  }
+  /** Palavras compactas para guardar: [texto, x, y, largura, altura] em pontos da página (y a partir do topo). */
+  function pack(words, scale) { return (words || []).map((w) => [w.t, +(w.x / scale).toFixed(1), +(w.y / scale).toFixed(1), +(w.w / scale).toFixed(1), +(w.h / scale).toFixed(1)]); }
+  function unpack(arr) { return (arr || []).map((a) => ({ t: a[0], x: a[1], y: a[2], w: a[3], h: a[4] })); }
+  /** Junta as palavras em linhas de texto (pela linha do Tesseract ou pela altura). */
+  function linesOf(words) {
+    const out = []; let cur = null;
+    (words || []).forEach((w) => { if (cur && (w.l != null ? w.l === cur.l : Math.abs(w.y - cur.y) < Math.max(w.h, cur.h) * 0.6)) cur.t.push(w.t); else { cur = { l: w.l, y: w.y, h: w.h, t: [w.t] }; out.push(cur); } });
+    return out.map((l) => l.t.join(' ')).join('\n');
+  }
+  /** Palavras de um resultado do Tesseract.js (blocks → paragraphs → lines → words). */
+  function wordsOf(data) {
+    const out = []; let ln = 0;
+    (data.blocks || []).forEach((b) => (b.paragraphs || []).forEach((p) => (p.lines || []).forEach((l) => { ln++; (l.words || []).forEach((w) => { const t = String(w.text || '').trim(); if (t) out.push({ t, x: w.bbox.x0, y: w.bbox.y0, w: w.bbox.x1 - w.bbox.x0, h: w.bbox.y1 - w.bbox.y0, c: w.confidence, l: ln }); }); })));
+    return out;
+  }
+
+  const api = { DPI, DESKEW_MIN, CDN, toGray, stretch, otsu, skewAngle, rotate, prep, post, stripRepeated, wer, needsOcr, wordsToItems, pack, unpack, linesOf, wordsOf };
+  if (typeof module !== 'undefined' && module.exports) { module.exports = api; return; }
+
+  // ================= navegador =================
+  const P = root.Prumo, E = P.est;
+  let worker = null, workerP = null, busy = Promise.resolve();
+  function lib() {
+    if (root.Tesseract) return Promise.resolve(root.Tesseract);
+    return new Promise((res, rej) => { const s = document.createElement('script'); s.src = (E.OCR_BASE ? E.OCR_BASE + 'tesseract.min.js' : CDN.lib); s.onload = () => res(root.Tesseract); s.onerror = () => rej(new Error('Não foi possível carregar o OCR do aparelho. Verifique a conexão ou use o OCR do Google Drive.')); document.head.appendChild(s); });
+  }
+  async function engine() {
+    if (worker) return worker;
+    if (!workerP) workerP = (async () => {
+      const T = await lib(), B = E.OCR_BASE;
+      worker = await T.createWorker('por', 1, { workerPath: B ? B + 'worker.min.js' : CDN.worker, corePath: B ? B + 'core' : CDN.core, langPath: B ? B + 'lang' : CDN.lang, gzip: true, cacheMethod: 'write' });
+      return worker;
+    })().catch((e) => { workerP = null; throw e; });
+    return workerP;
+  }
+  function canvasOf(img) { const c = document.createElement('canvas'); c.width = img.width; c.height = img.height; c.getContext('2d').putImageData(new ImageData(img.data, img.width, img.height), 0, 0); return c; }
+  /** Renderiza a página do PDF.js na resolução do OCR e devolve o ImageData. */
+  async function render(page, dpi = DPI) {
+    const vp = page.getViewport({ scale: dpi / 72 }), c = document.createElement('canvas'); c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
+    const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    return { img: ctx.getImageData(0, 0, c.width, c.height), scale: dpi / 72, w: vp.width / (dpi / 72), h: vp.height / (dpi / 72), canvas: c };
+  }
+  /** OCR de uma página. motor: 'aparelho' (Tesseract.js) ou 'drive' (servidor, sem coordenadas). */
+  function page(pdfPage, o = {}) {
+    const job = busy.then(async () => {
+      const t0 = Date.now(), R = await render(pdfPage, o.dpi || DPI);
+      if (o.motor === 'drive') {
+        const png = R.canvas.toDataURL('image/png').split(',')[1];
+        const r = await P.api.call('est.ocrPage', { material_id: o.material_id, pagina: o.pagina, png }, { timeout: 120000 });
+        return { texto: post(r.texto || ''), palavras: [], motor: 'drive', conf: null, ms: Date.now() - t0, angulo: 0, w: R.w, h: R.h };
+      }
+      const pre = prep(R.img), wk = await engine();
+      const r = await wk.recognize(canvasOf(pre), {}, { blocks: true, text: true });
+      let ws = wordsOf(r.data);
+      if (pre.angulo) { const a = pre.angulo * Math.PI / 180, cx = pre.width / 2, cy = pre.height / 2, c = Math.cos(a), s = Math.sin(a); ws = ws.map((w) => { const mx = w.x + w.w / 2 - cx, my = w.y + w.h / 2 - cy, nx = c * mx - s * my + cx, ny = s * mx + c * my + cy; return { ...w, x: nx - w.w / 2, y: ny - w.h / 2 }; }); }
+      root.__ocrRuns = (root.__ocrRuns || 0) + 1;
+      return { texto: post(linesOf(ws)), palavras: pack(ws, R.scale), motor: 'tesseract.js ' + TJS + ' por', conf: Math.round(r.data.confidence || 0), ms: Date.now() - t0, angulo: pre.angulo, w: R.w, h: R.h };
+    });
+    busy = job.catch(() => {});
+    return job;
+  }
+  async function stop() { const w = worker; worker = null; workerP = null; if (w) try { await w.terminate(); } catch (e) { } }
+  /**
+   * OCR para leitores de documento inteiro (questões, edital): devolve fn(pdfPage, n) que usa o OCR já guardado do
+   * material quando existe e roda o OCR só nas páginas que faltam; save() guarda o que foi lido.
+   */
+  async function forDoc(o = {}) {
+    const mat = o.material, cache = {}, novos = {};
+    if (mat && mat.id) {
+      try { const r = await P.api.call('est.textGet', { material_id: mat.id, ocr: true }, { timeout: 60000 }); Object.entries(r.ocr || {}).forEach(([n, x]) => { cache[n] = { texto: (r.paginas || {})[n] || '', palavras: x.palavras, motor: x.motor, cache: true }; }); } catch (e) { /* sem cache */ }
+    }
+    const motor = P.settings.get('est.ocr_motor', 'aparelho');
+    return {
+      cache,
+      fn: async (pg, n) => {
+        if (cache[n]) return cache[n];
+        if (o.signal && o.signal.parado) throw new Error('Leitura cancelada.');
+        const r = await page(pg, { motor, material_id: mat && mat.id, pagina: n }); novos[n] = r; return r;
+      },
+      async save(total) {
+        const ks = Object.keys(novos); if (!mat || !mat.id || !mat.arquivo_id || !ks.length) return 0;
+        const paginas = {}, ocr = {}; ks.forEach((n) => { paginas[n] = novos[n].texto; ocr[n] = { motor: novos[n].motor, conf: novos[n].conf, angulo: novos[n].angulo, palavras: novos[n].palavras }; });
+        try { await P.api.call('est.textSave', { material_id: mat.id, arquivo_id: mat.arquivo_id, paginas, ocr, total }, { mutation: true, timeout: 120000 }); } catch (e) { return 0; }
+        return ks.length;
+      }
+    };
+  }
+  P.estOcr = { ...api, page, engine, stop, render, forDoc };
+})(typeof window !== 'undefined' ? window : this);
+</script>

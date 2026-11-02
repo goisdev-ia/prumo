@@ -1,0 +1,138 @@
+<script>
+/* Prumo · Estudos: discursivas com IA (opcional).
+   Revisar e corrigir: saída estruturada (a) nota por critério com justificativa, (b) pontos fortes, (c) problemas
+   por trecho, (d) trechos reescritos sugeridos, (e) plano de reescrita; fica registrada como avaliação "sugestão
+   de IA" na versão atual, e só os trechos que a pessoa aceitar viram uma nova versão do texto.
+   Gerar temas e propostas (marcados como sugestão da IA, sem estatística inventada), texto de exemplo (material
+   de referência "Gerado por IA", guardado como anotação) e o botão Treinar (proposta + cronômetro). */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, ui } = P;
+  const S = P.store, E = P.est;
+  const TIPOS = [['dissertativa', 'Dissertativa'], ['peca', 'Peça'], ['estudo_caso', 'Estudo de caso'], ['parecer', 'Parecer'], ['redacao', 'Redação'], ['outra', 'Outra']];
+  const call = async (payload, btn) => {
+    if (btn) btn.classList.add('loading');
+    try { const s = E.aiSel(); const r = await P.api.call('est.aiDisc', { ...payload, provedor: s.provedor, modelo: s.modelo }, { mutation: true, timeout: 240000 }); if (E.ia) E.ia.uso_hoje = (+E.ia.uso_hoje || 0) + 1; return r; }
+    catch (e) { ui.toast(e.message, { error: true, duration: 7000 }); return null; }
+    finally { if (btn) btn.classList.remove('loading'); }
+  };
+  const chipIa = (m, extra) => h`<span class="chip info">Gerado por IA${m && m.provedor ? ' · ' + m.provedor : ''}${m && m.modelo ? ' · ' + m.modelo : ''} · ${extra || 'confira'}</span>`;
+
+  /** Aplica os trechos aceitos (troca a primeira ocorrência exata de cada um). */
+  function aplicar(texto, reescritas, ids) {
+    let t = String(texto || ''), n = 0;
+    reescritas.filter((r) => ids.includes(r.id) && r.original && t.includes(r.original)).forEach((r) => { t = t.replace(r.original, () => r.sugerido); n++; });
+    return { texto: t, aplicados: n };
+  }
+
+  async function corrigir(d, btn) {
+    if (!E.aiOn()) { ui.toast('O assistente de IA está desligado.', { error: true }); return; }
+    if (String(d.texto || '').trim().length < 40) { ui.toast('Escreva e salve o texto antes de pedir a correção.', { error: true }); return; }
+    const r = await call({ acao: 'corrigir', id: d.id }, btn); if (!r) return;
+    S.put('est_discursivas', r.discursiva);
+    mostrar(r.discursiva, r.discursiva.avaliacoes_json.length - 1);
+  }
+
+  /** Mostra uma correção da IA (a–e) e permite aplicar trechos como nova versão. */
+  function mostrar(d, idx) {
+    d = S.get('est_discursivas', d.id) || d;
+    const av = (d.avaliacoes_json || [])[idx], ia = (av && av.ia) || {}, crit = d.criterios_json || [];
+    if (!av) return;
+    const rs = (ia.reescritas || []), mesmaVersao = Number(av.versao) === Number(d.versao);
+    ui.sheet({ title: 'Correção sugerida · ' + d.titulo, size: 'full', wide: true,
+      body: h`<div class="stack"><div class="row-sm wrap">${chipIa(ia, 'sugestão, não é nota oficial')}<span class="chip">versão ${av.versao} do texto</span><span class="chip acc">${fmt.num(av.total, 1)} / ${fmt.num(av.max, 1)}</span></div>
+        <div class="card pad-lg"><b>a) Nota por critério</b><div class="list mt-2">${crit.map((c, i) => h`<div class="li"><span class="main"><span class="t">${c.nome}: ${fmt.num((av.notas || [])[i] || 0, 1)} / ${fmt.num(c.max, 1)}</span><span class="s" style="white-space:normal">${(ia.justificativas || [])[i] || ''}</span></span></div>`)}</div></div>
+        <div class="card pad-lg"><b>b) Pontos fortes</b>${(ia.fortes || []).length ? h`<ul class="disc-ul">${ia.fortes.map((x) => h`<li>${x}</li>`)}</ul>` : h`<p class="faint mt-2" style="font-size:13px">Nenhum apontado.</p>`}</div>
+        <div class="card pad-lg"><b>c) Problemas</b>${(av.comentarios || []).length ? h`<div class="list mt-2">${av.comentarios.map((c) => h`<div class="li"><span class="main"><span class="t">"${c.trecho}"${c.achado === false ? h` <span class="chip down">trecho não encontrado no texto</span>` : ''}</span><span class="s" style="white-space:normal">${c.tipo ? c.tipo + ' · ' : ''}${c.comentario}</span></span></div>`)}</div>` : h`<p class="faint mt-2" style="font-size:13px">Nenhum apontado.</p>`}</div>
+        <div class="card pad-lg"><b>d) Trechos reescritos sugeridos</b>${rs.length ? h`<p class="faint mt-1" style="font-size:12px">${mesmaVersao ? 'Marque os que quer aceitar: eles viram uma nova versão do texto (a atual fica no histórico).' : 'Esta correção é de uma versão anterior: os trechos podem não existir mais no texto atual.'}</p><div class="stack-sm mt-2">${rs.map((x) => h`<label class="disc-rw ${x.achado ? '' : 'off'}"><input type="checkbox" data-rw="${x.id}" ${raw(x.achado && mesmaVersao ? '' : 'disabled')}><span><s>${x.original}</s><br><b>${x.sugerido}</b>${x.motivo ? h`<br><small class="faint">${x.motivo}</small>` : ''}${x.achado ? '' : h`<br><small class="t-danger">trecho original não encontrado no texto: não pode ser aplicado</small>`}</span></label>`)}</div>` : h`<p class="faint mt-2" style="font-size:13px">Nenhuma sugestão.</p>`}</div>
+        <div class="card pad-lg"><b>e) Plano para a reescrita</b><p class="mt-2" style="white-space:pre-wrap;font-size:13.5px">${ia.plano || av.comentario || '—'}</p></div></div>`,
+      foot: h`<span class="grow"></span>${rs.some((x) => x.achado) && mesmaVersao ? h`<button type="button" class="btn btn-primary" data-apl>${icon('check', 'sm')}Aplicar selecionados como nova versão</button>` : ''}`,
+      onMount(sh) {
+        const b = sh.$('[data-apl]'); if (!b) return;
+        b.onclick = async () => {
+          const ids = [...sh.el.querySelectorAll('[data-rw]:checked')].map((x) => x.dataset.rw);
+          if (!ids.length) { ui.toast('Marque pelo menos um trecho.', { error: true }); return; }
+          const cur = S.get('est_discursivas', d.id), a = aplicar(cur.texto, rs, ids);
+          if (!a.aplicados) { ui.toast('Os trechos não foram encontrados no texto atual.', { error: true }); return; }
+          b.classList.add('loading');
+          try {
+            const r = await P.api.call('est.discSave', { id: d.id, texto: a.texto, nova_versao: true, base_versao: cur.versao }, { mutation: true });
+            S.put('est_discursivas', r.discursiva); sh.close();
+            ui.toast(`${a.aplicados} trecho(s) aplicado(s): versão ${r.discursiva.versao}`, { action: { label: 'Abrir', fn: () => E.discEdit(r.discursiva) } });
+          } catch (e) { b.classList.remove('loading'); ui.toast(e.code === 'CONFLICT' ? 'O texto mudou em outro aparelho. Reabra a discursiva.' : e.message, { error: true }); }
+        };
+      } });
+  }
+
+  async function exemplo(d, btn) {
+    const r = await call({ acao: 'exemplo', id: d.id }, btn); if (!r) return;
+    S.put('est_anotacoes', r.nota);
+    ui.sheet({ title: 'Texto de exemplo', size: 'full', wide: true, body: h`<div class="stack"><div class="row-sm wrap">${chipIa(r.ia, 'material de referência, não é a resposta oficial')}</div><div class="note-preview card pad-lg">${raw(E.md(r.texto))}</div><p class="faint" style="font-size:12px">Guardado em Resumos e anotações como rascunho ("${r.nota.titulo}"). Use para comparar estrutura e argumentos; escreva o seu texto com as suas palavras.</p></div>`,
+      foot: h`<span class="grow"></span><button type="button" class="btn btn-ghost" data-ver>Abrir a anotação</button>`, onMount(sh) { sh.$('[data-ver]').onclick = () => { sh.close(); E.noteEdit(S.get('est_anotacoes', r.nota.id)); }; } });
+  }
+
+  async function criar(t, o = {}) {
+    const row = { titulo: t.titulo, proposta: t.proposta, tipo: t.tipo || 'dissertativa', concurso_id: t.concurso_id || null, criterios_json: t.criterios_json, limite_linhas: t.limite_linhas || null, tempo_min: t.tempo_min || null, status: 'rascunho', gerado_ia: !!o.ia, ia_meta: o.ia ? { proposta_por: 'ia', provedor: o.ia.provedor, modelo: o.ia.modelo } : null };
+    const r = await P.api.call('est.discSave', row, { mutation: true });
+    S.put('est_discursivas', r.discursiva);
+    return r.discursiva;
+  }
+
+  /** Gerar temas e propostas (sugestões da IA). */
+  function temas(o = {}) {
+    if (!E.aiOn()) { ui.toast('O assistente de IA está desligado.', { error: true }); return; }
+    const conc = E.concursos();
+    const s = ui.sheet({ title: 'Gerar temas e propostas', wide: true, body: h`<div class="form">
+        <div class="field half"><label>Concurso</label><select class="input" data-c><option value="">Geral</option>${conc.map((c) => h`<option value="${c.id}" ${raw(c.principal ? 'selected' : '')}>${c.nome}</option>`)}</select></div>
+        <div class="field half"><label>Tipo</label><select class="input" data-t>${TIPOS.map(([k, l]) => h`<option value="${k}">${l}</option>`)}</select></div>
+        <div class="field half"><label>Tema (opcional)</label><input class="input" data-tema maxlength="300" placeholder="Ex.: inclusão financeira"></div>
+        <div class="field half"><label>Quantidade</label><select class="input" data-n>${[1, 2, 3, 4, 5].map((n) => h`<option ${raw(n === 3 ? 'selected' : '')}>${n}</option>`)}</select></div>
+        <div class="field full"><label>Modelo</label>${E.aiPicker()}</div></div><div data-res class="stack mt-3"></div>`,
+      foot: h`<span class="grow"></span><button type="button" class="btn btn-primary" data-go>${icon('zap', 'sm')}Gerar</button>`,
+      onMount(sh) {
+        sh.$('[data-go]').onclick = async (ev) => {
+          const r = await call({ acao: 'temas', concurso_id: sh.$('[data-c]').value || null, tipo: sh.$('[data-t]').value, tema: sh.$('[data-tema]').value, n: +sh.$('[data-n]').value }, ev.currentTarget); if (!r) return;
+          const box = sh.$('[data-res]'); st.temas = r;
+          box.innerHTML = P.toHtml(h`<div class="row-sm wrap">${chipIa(r.ia, 'sugestão de tema: a banca não necessariamente cobrou')}</div>${r.temas.map((t, i) => h`<div class="card pad-lg"><b>${t.titulo}</b><p class="mt-2" style="white-space:pre-wrap;font-size:13px">${t.proposta}</p><p class="faint mt-2" style="font-size:12px">${t.criterios_json.map((c) => c.nome + ' (' + c.max + ')').join(' · ')} · ${t.limite_linhas} linhas · ${t.tempo_min} min</p><div class="row-sm wrap mt-2"><button type="button" class="btn btn-ghost btn-sm" data-usar="${i}">${icon('plus', 'sm')}Criar discursiva</button><button type="button" class="btn btn-ghost btn-sm" data-treinar="${i}">${icon('timer', 'sm')}Treinar agora</button></div></div>`)}`);
+          box.querySelectorAll('[data-usar],[data-treinar]').forEach((b) => { b.onclick = async () => { const t = st.temas.temas[+(b.dataset.usar || b.dataset.treinar)]; b.classList.add('loading'); try { const d = await criar(t, { ia: st.temas.ia }); sh.close(); E.discEdit(d, { treino: !!b.dataset.treinar }); } catch (e) { b.classList.remove('loading'); ui.toast(e.message, { error: true }); } }; });
+        };
+      } });
+    const st = {};
+    return s;
+  }
+
+  /** Treinar: proposta (gerada pela IA ou uma das suas) e cronômetro já rodando. */
+  function treinar() {
+    const minhas = S.all('est_discursivas').filter((d) => String(d.proposta || '').trim());
+    const conc = E.concursos();
+    ui.sheet({ title: 'Treinar discursiva', body: h`<div class="form">
+        <p class="muted full" style="font-size:13px">Abre uma discursiva nova com a proposta, o limite e o cronômetro já rodando. Depois, avalie por critério${E.aiOn() ? ' ou peça a correção da IA' : ''}.</p>
+        <div class="field full"><label>De onde vem a proposta</label><select class="input" data-o>${E.aiOn() ? h`<option value="ia">Nova proposta sugerida pela IA</option>` : ''}${minhas.length ? h`<option value="minha">Uma das minhas propostas (sorteada)</option>` : ''}</select></div>
+        <div class="field half"><label>Concurso</label><select class="input" data-c><option value="">Geral</option>${conc.map((c) => h`<option value="${c.id}" ${raw(c.principal ? 'selected' : '')}>${c.nome}</option>`)}</select></div>
+        <div class="field half"><label>Tipo</label><select class="input" data-t>${TIPOS.map(([k, l]) => h`<option value="${k}">${l}</option>`)}</select></div></div>`,
+      foot: h`<span class="grow"></span><button type="button" class="btn btn-primary" data-go>${icon('timer', 'sm')}Começar</button>`,
+      onMount(sh) {
+        if (!E.aiOn() && !minhas.length) { sh.$('[data-go]').disabled = true; sh.$('[data-o]').outerHTML = P.toHtml(h`<p class="faint" style="font-size:13px">Cadastre uma discursiva com proposta (ou ligue o assistente de IA) para treinar.</p>`); return; }
+        sh.$('[data-go]').onclick = async (ev) => {
+          const o = sh.$('[data-o]').value, btn = ev.currentTarget;
+          if (o === 'minha') {
+            const base = minhas[Math.floor(Math.random() * minhas.length)];
+            btn.classList.add('loading');
+            try { const d = await criar({ titulo: 'Treino · ' + base.titulo, proposta: base.proposta, tipo: base.tipo, concurso_id: base.concurso_id, criterios_json: base.criterios_json, limite_linhas: base.limite_linhas, tempo_min: base.tempo_min }); sh.close(); E.discEdit(d, { treino: true }); }
+            catch (e) { btn.classList.remove('loading'); ui.toast(e.message, { error: true }); }
+            return;
+          }
+          const r = await call({ acao: 'temas', concurso_id: sh.$('[data-c]').value || null, tipo: sh.$('[data-t]').value, n: 1 }, btn); if (!r || !r.temas.length) return;
+          try { const d = await criar(r.temas[0], { ia: r.ia }); sh.close(); E.discEdit(d, { treino: true }); } catch (e) { ui.toast(e.message, { error: true }); }
+        };
+      } });
+  }
+
+  Object.assign(E, { discAi: { corrigir, mostrar, exemplo, temas, treinar, aplicar } });
+  Object.assign(P.act, {
+    'est.discTemas': () => temas(),
+    'est.discTreinar': () => treinar()
+  });
+})();
+</script>

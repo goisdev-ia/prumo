@@ -1,0 +1,862 @@
+<script>
+/* Prumo · Estudos: leitor e editor de anotações de PDF.
+   Geometria sempre em pontos do PDF (espaço da página, sem rotação de visualização), então a marca fica no mesmo
+   lugar com qualquer zoom, rotação ou tamanho de tela. Gravação: aparelho (IndexedDB) → servidor (JSON versionado
+   no Drive, revisão por página). Exportação: pdf-lib desenha as marcações sobre o original e registra a revisão exata. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, ui } = P;
+  const S = P.store, E = P.est;
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const CORES = ['#F2B705', '#FF6B6B', '#4ADE80', '#60A5FA', '#C084FC', '#FB923C', '#1A1A1A', '#FFFFFF'];
+  const TIPOS = { marca_texto: 'Marca-texto', marca: 'Destaque de área', sublinhado: 'Sublinhado', riscado: 'Riscado', caneta: 'Caneta', pincel: 'Pincel', linha: 'Linha', seta: 'Seta', retangulo: 'Retângulo', elipse: 'Elipse', texto: 'Caixa de texto', comentario: 'Comentário' };
+  const TOOLS = [['ler', 'cursor-text', 'Ler e selecionar texto'], ['selecionar', 'pointer', 'Selecionar e mover'], ['marca_texto', 'highlighter', 'Marca-texto (selecione o texto)'], ['marca', 'square', 'Destacar área'], ['sublinhado', 'underline', 'Sublinhar (selecione o texto)'], ['riscado', 'strike', 'Riscar (selecione o texto)'], ['caneta', 'pen', 'Caneta'], ['pincel', 'brush', 'Pincel (marcador livre)'], ['linha', 'line', 'Linha'], ['seta', 'arrow-ur', 'Seta'], ['retangulo', 'square', 'Retângulo'], ['elipse', 'circle', 'Elipse'], ['texto', 'type', 'Caixa de texto'], ['comentario', 'comment', 'Comentário'], ['borracha', 'eraser', 'Borracha (apaga a marcação tocada)']];
+  const DRAW = new Set(['selecionar', 'marca', 'caneta', 'pincel', 'linha', 'seta', 'retangulo', 'elipse', 'texto', 'comentario', 'borracha']);
+  const TEXTUAL = new Set(['marca_texto', 'sublinhado', 'riscado']);
+  const ROT = { 0: { R: [1, 0], D: [0, -1] }, 90: { R: [0, 1], D: [1, 0] }, 180: { R: [-1, 0], D: [0, 1] }, 270: { R: [0, -1], D: [-1, 0] } };
+  const visitMap = {};
+
+  // ================= IndexedDB (cache de arquivos e fila de anotações pendentes) =================
+  const idb = (() => {
+    let dbp = null; const mem = { files: new Map(), pend: new Map() };
+    const open = () => dbp || (dbp = new Promise((res) => { try { const rq = indexedDB.open('prumo-estudos', 1); rq.onupgradeneeded = () => { rq.result.createObjectStore('files'); rq.result.createObjectStore('pend'); }; rq.onsuccess = () => res(rq.result); rq.onerror = () => res(null); } catch (e) { res(null); } }));
+    const tx = async (store, mode, fn) => { const db = await open(); if (!db) return fn(null); return new Promise((res) => { try { const t = db.transaction(store, mode), st = t.objectStore(store); const rq = fn(st); t.oncomplete = () => res(rq && rq.result); t.onerror = () => res(undefined); } catch (e) { res(undefined); } }); };
+    return {
+      get: async (store, k) => { const v = await tx(store, 'readonly', (st) => (st ? st.get(k) : null)); return v === undefined || v === null ? mem[store].get(k) || null : v; },
+      put: async (store, k, v) => { mem[store].set(k, v); if (store === 'pend') try { localStorage.setItem('prumo.estpend.' + k, '1'); } catch (e) { /* cheio */ } await tx(store, 'readwrite', (st) => (st ? st.put(v, k) : null)); },
+      del: async (store, k) => { mem[store].delete(k); if (store === 'pend') try { localStorage.removeItem('prumo.estpend.' + k); } catch (e) { /* ok */ } await tx(store, 'readwrite', (st) => (st ? st.delete(k) : null)); },
+      keys: async (store) => { const v = await tx(store, 'readonly', (st) => (st ? st.getAllKeys() : null)); return Array.from(new Set([...(v || []), ...mem[store].keys()])); }
+    };
+  })();
+
+  // ================= bibliotecas =================
+  let libP = null;
+  function loadLib() {
+    if (libP) return libP;
+    libP = E.lib('pdfjs').then(async (lib) => {
+      if (!lib.GlobalWorkerOptions.workerSrc) {
+        const url = (E.LIB_BASE || 'https://cdnjs.cloudflare.com/ajax/libs/') + 'pdf.js/3.11.174/pdf.worker.min.js';
+        // O app roda num iframe de outra origem: o worker precisa vir de um blob local.
+        try { const txt = await (await fetch(url)).text(); lib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([txt], { type: 'text/javascript' })); }
+        catch (e) { lib.GlobalWorkerOptions.workerSrc = url; }
+      }
+      return lib;
+    }).catch((e) => { libP = null; throw e; });
+    return libP;
+  }
+
+  /** Bytes do arquivo (Drive → servidor em blocos), com cache no aparelho. */
+  async function fetchBytes(arquivoId, onProgress) {
+    const c = await idb.get('files', arquivoId);
+    if (c && c.bytes) return new Uint8Array(c.bytes);
+    const parts = []; let start = 0, total = null;
+    for (;;) {
+      const r = await P.api.call('est.fileChunk', { arquivo_id: arquivoId, start, len: 3 * 1024 * 1024 }, { timeout: 180000 });
+      total = r.total;
+      if (!r.base64) break;
+      const bin = atob(r.base64), u = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+      parts.push(u); start += u.length;
+      if (onProgress && total) onProgress(Math.min(1, start / total));
+      if (!total || start >= total) break;
+    }
+    const out = new Uint8Array(start); let o = 0; parts.forEach((p) => { out.set(p, o); o += p.length; });
+    if (out.length <= 60 * 1024 * 1024) idb.put('files', arquivoId, { bytes: out.buffer.slice(0), at: Date.now() });
+    return out;
+  }
+
+  // ================= geometria =================
+  const bboxOf = (a) => {
+    if (a.rect) return a.rect;
+    if (a.rects && a.rects.length) return a.rects.reduce((b, r) => [Math.min(b[0], r[0]), Math.min(b[1], r[1]), Math.max(b[2], r[2]), Math.max(b[3], r[3])], [1e9, 1e9, -1e9, -1e9]);
+    if (a.pts && a.pts.length) { let b = [1e9, 1e9, -1e9, -1e9]; for (let i = 0; i < a.pts.length; i += 2) b = [Math.min(b[0], a.pts[i]), Math.min(b[1], a.pts[i + 1]), Math.max(b[2], a.pts[i]), Math.max(b[3], a.pts[i + 1])]; const w = (a.espessura || 2) / 2; return [b[0] - w, b[1] - w, b[2] + w, b[3] + w]; }
+    return [0, 0, 0, 0];
+  };
+  const normRect = (a, b) => [r2(Math.min(a[0], b[0])), r2(Math.min(a[1], b[1])), r2(Math.max(a[0], b[0])), r2(Math.max(a[1], b[1]))];
+  /** Bordas de um retângulo de texto conforme a rotação própria da página (para sublinhar e riscar). */
+  function edges(r, rot) {
+    const { R, D } = ROT[((rot % 360) + 360) % 360] || ROT[0];
+    const c = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]];
+    const dot = (p, v) => p[0] * v[0] + p[1] * v[1];
+    const byD = c.slice().sort((a, b) => dot(b, D) - dot(a, D));
+    const bottom = byD.slice(0, 2).sort((a, b) => dot(a, R) - dot(b, R)), top = byD.slice(2).sort((a, b) => dot(a, R) - dot(b, R));
+    const mid = [0, 1].map((i) => [(bottom[i][0] + top[i][0]) / 2, (bottom[i][1] + top[i][1]) / 2]);
+    return { bottom, top, mid };
+  }
+  const translate = (a, dx, dy) => {
+    if (a.rect) a.rect = [r2(a.rect[0] + dx), r2(a.rect[1] + dy), r2(a.rect[2] + dx), r2(a.rect[3] + dy)];
+    if (a.rects) a.rects = a.rects.map((r) => [r2(r[0] + dx), r2(r[1] + dy), r2(r[2] + dx), r2(r[3] + dy)]);
+    if (a.pts) a.pts = a.pts.map((v, i) => r2(v + (i % 2 ? dy : dx)));
+  };
+  const winAnsi = (s) => String(s || '').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[^\x0A\x20-\x7E\xA0-\xFF–—•…€]/g, '?');
+  const hexRgb = (hx) => { const m = String(hx || '#F2B705').replace('#', ''); const n = parseInt(m.length === 3 ? m.split('').map((c) => c + c).join('') : m.slice(0, 6), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; };
+  function toRanges(set) { const a = [...set].map(Number).sort((x, y) => x - y), out = []; for (let i = 0; i < a.length; i++) { let j = i; while (j + 1 < a.length && a[j + 1] === a[j] + 1) j++; out.push(j > i ? `${a[i]}-${a[j]}` : `${a[i]}`); i = j; } return out.join(', '); }
+
+  // ================= leitor =================
+  function open(m, o = {}) {
+    if (!m || !m.arquivo_id) { ui.toast('Este material não tem arquivo.', { error: true }); return; }
+    const key = m.id + '|' + m.arquivo_id;
+    const V = { m, key, doc: null, n: 0, scale: 1, rot: 0, pages: [], ann: {}, revs: {}, rev: 0, favs: { lista: [], rev: 0 }, dirty: new Set(), favDirty: false, pend: null, hist: [], fut: [], tool: 'ler', cor: P.ls.get('est.pdf_cor', '#F2B705'), esp: 2, opa: 1, show: true, sel: null, state: 'carregando', cur: 1, alive: true, changed: false, txt: {}, ocr: {}, ocrQ: [], ocrRun: false, ocrStop: false, ocrSave: {}, side: null, filt: { tipo: '', cor: '', q: '' }, search: { q: '', hits: [] }, readT: null, visit: (visitMap[m.id] = visitMap[m.id] || new Set()) };
+    const sh = ui.sheet({ title: m.titulo, size: 'full', wide: true, body: h`<div class="pdfv" data-v>
+        <div class="pv-top"><button class="btn-icon sm" data-close aria-label="Fechar leitor">${icon('chev-l')}</button><div class="pv-title"><b class="ellipsis">${m.codigo} · ${m.titulo}</b><small data-state>carregando…</small><small class="pv-ocr" data-ocrst hidden></small></div>
+          <button class="btn-icon sm" data-a="undo" aria-label="Desfazer" title="Desfazer (Ctrl+Z)">${icon('undo', 'sm')}</button><button class="btn-icon sm" data-a="redo" aria-label="Refazer" title="Refazer (Ctrl+Shift+Z)">${icon('redo', 'sm')}</button>
+          <button class="btn-icon sm" data-a="side" data-p="busca" aria-label="Buscar no documento">${icon('search', 'sm')}</button><button class="btn-icon sm" data-a="side" data-p="marcas" aria-label="Painel lateral">${icon('panel', 'sm')}</button><button class="btn-icon sm" data-a="menu" aria-label="Mais opções">${icon('dots', 'sm')}</button></div>
+        <div class="pv-tools" role="toolbar" aria-label="Ferramentas">${TOOLS.map(([k, ic, l]) => h`<button class="pv-tool ${k === 'ler' ? 'on' : ''}" data-tool="${k}" title="${l}" aria-label="${l}">${icon(ic, 'sm')}</button>`)}<span class="pv-sep"></span>
+          ${CORES.map((c) => h`<button class="pv-sw ${c === V.cor ? 'on' : ''}" data-cor="${c}" style="background:${c}" aria-label="Cor ${c}"></button>`)}<span class="pv-sep"></span>
+          <label class="pv-mini">Traço<select data-esp>${[[0.75, 'fino'], [2, 'médio'], [4, 'grosso'], [8, 'extra']].map(([v, l]) => h`<option value="${v}" ${raw(v === 2 ? 'selected' : '')}>${l}</option>`)}</select></label>
+          <label class="pv-mini">Opacidade<input type="range" min="15" max="100" value="100" data-opa></label></div>
+        <div class="pv-body"><aside class="pv-side" data-side hidden></aside><div class="pv-scroll" data-scroll tabindex="0"><div class="pv-pages" data-pages><div class="skel" style="height:60vh;margin:24px"></div></div></div></div>
+        <div class="pv-bottom"><button class="btn-icon sm" data-a="zout" aria-label="Diminuir zoom">${icon('zoom-out', 'sm')}</button><span class="num pv-z" data-z>100%</span><button class="btn-icon sm" data-a="zin" aria-label="Aumentar zoom">${icon('zoom-in', 'sm')}</button>
+          <button class="btn-icon sm" data-a="fitw" aria-label="Ajustar à largura" title="Ajustar à largura">${icon('fit-w', 'sm')}</button><button class="btn-icon sm" data-a="fitp" aria-label="Página inteira" title="Página inteira">${icon('maximize', 'sm')}</button><button class="btn-icon sm" data-a="rot" aria-label="Girar visualização">${icon('rotate', 'sm')}</button>
+          <span class="grow"></span><input class="input sm num pv-pg" data-pg inputmode="numeric" aria-label="Página atual" value="1"><span class="faint" data-n>/ –</span><span class="grow"></span>
+          <button class="btn-icon sm" data-a="fav" aria-label="Favoritar página">${icon('bookmark', 'sm')}</button><button class="btn-icon sm" data-a="eye" aria-label="Mostrar ou ocultar marcações">${icon('eye', 'sm')}</button><button class="btn-icon sm" data-a="read" aria-label="Modo leitura">${icon('book', 'sm')}</button></div>
+        <div class="pv-pop" data-selmenu hidden></div><div class="pv-pop" data-objmenu hidden></div></div>`,
+      onClose: () => close() });
+    sh.root.classList.add('pdfv-sheet'); window.__estV = V;
+    const $ = (s) => sh.el.querySelector(s), root = $('[data-v]'), scroller = $('[data-scroll]'), pagesEl = $('[data-pages]');
+    const setState = (s, extra) => { V.state = s; const L = { carregando: 'carregando…', local: 'salvo neste aparelho', aguardando: 'aguardando envio', salvando: 'salvando…', salvo: 'salvo', falha: 'falha ao salvar: tentando de novo', conflito: 'conflito: escolha uma versão', offline: 'sem conexão: salvo neste aparelho' }; const el = $('[data-state]'); if (el) { el.textContent = (L[s] || s) + (extra ? ' · ' + extra : ''); el.className = 'st-' + s; } };
+
+    // ---------- carregamento ----------
+    (async () => {
+      try {
+        const [lib, bytes, g, pend] = await Promise.all([loadLib(), fetchBytes(m.arquivo_id, (p) => setState('carregando', Math.round(p * 100) + '%')), P.api.call('est.annGet', { material_id: m.id, arquivo_id: m.arquivo_id }, { timeout: 90000 }), idb.get('pend', key)]);
+        if (!V.alive) return;
+        V.doc = await lib.getDocument({ data: bytes.slice(0) }).promise; V.n = V.doc.numPages;
+        V.rev = g.doc.revisao || 0; V.favs = { lista: g.doc.favoritos || [], rev: g.doc.favoritos_rev || 0 };
+        Object.entries(g.doc.paginas || {}).forEach(([pg, x]) => { V.ann[pg] = { itens: x.itens || [] }; V.revs[pg] = x.rev; });
+        V.exps = g.exportacoes || [];
+        if (pend && pend.paginas) { V.pend = pend; Object.entries(pend.paginas).forEach(([pg, its]) => { V.ann[pg] = { itens: its }; }); if (pend.favoritos) V.favs.lista = pend.favoritos.lista; setState('aguardando'); send(); } else setState('salvo');
+        const leit = E.readOf(m);
+        V.cur = Math.min(V.n, Math.max(1, +o.pagina || (leit && +leit.pagina) || +localStorage.getItem('prumo.estpg.' + m.id) || 1));
+        const p1 = await V.doc.getPage(1); V.base = p1.getViewport({ scale: 1 });
+        V.scale = Math.min(1.6, Math.max(0.5, (scroller.clientWidth - 24) / V.base.width));
+        $('[data-n]').textContent = '/ ' + V.n; $('[data-z]').textContent = Math.round(V.scale * 100) + '%';
+        await layout(); goto(V.cur, true);
+        if (o.pagina && leit && +leit.pagina && +leit.pagina !== +o.pagina) ui.toast(`Aberto na página ${o.pagina}. Você tinha parado na ${leit.pagina}.`, { action: { label: 'Voltar para ' + leit.pagina, fn: () => goto(+leit.pagina) }, duration: 8000 });
+        ocrInit();
+        setTimeout(() => extractText(), 4000);
+      } catch (e) { console.error(e); pagesEl.innerHTML = P.toHtml(ui.empty({ ill: 'alert', title: 'Não consegui abrir o PDF', text: e.message || String(e), small: true })); setState('falha', 'abertura'); }
+    })();
+
+    // ---------- layout e renderização preguiçosa ----------
+    let io = null;
+    async function layout() {
+      const keep = V.cur;
+      pagesEl.innerHTML = '';
+      if (io) io.disconnect();
+      io = new IntersectionObserver((ents) => ents.forEach((en) => { const pg = V.pages[+en.target.dataset.pg - 1]; if (!pg) return; pg.vis = en.isIntersecting; if (en.isIntersecting) render(pg); else if (V.n > 24) unrender(pg); }), { root: scroller, rootMargin: '800px 0px' });
+      V.pages = [];
+      for (let i = 1; i <= V.n; i++) {
+        const el = document.createElement('div'); el.className = 'pv-page'; el.dataset.pg = i;
+        const pg = { i, el, page: null, vp: null, rendered: false, task: null };
+        // tamanho provisório pela 1ª página; corrige ao carregar a página real
+        const vb = V.base, r = (V.rot % 180) ? [vb.height, vb.width] : [vb.width, vb.height];
+        el.style.width = r[0] * V.scale + 'px'; el.style.height = r[1] * V.scale + 'px';
+        el.innerHTML = `<canvas class="pv-cv"></canvas><div class="textLayer"></div><svg class="pv-svg" xmlns="http://www.w3.org/2000/svg"></svg><div class="pv-html"></div><div class="pv-ink"></div><span class="pv-num">${i}</span>`;
+        pagesEl.appendChild(el); V.pages.push(pg); io.observe(el);
+      }
+      V.cur = keep;
+    }
+    async function ensurePage(pg) {
+      if (!pg.page) pg.page = await V.doc.getPage(pg.i);
+      const rot = ((pg.page.rotate || 0) + V.rot) % 360;
+      pg.vp = pg.page.getViewport({ scale: V.scale, rotation: rot }); pg.prot = pg.page.rotate || 0;
+      pg.el.style.width = pg.vp.width + 'px'; pg.el.style.height = pg.vp.height + 'px';
+      const svg = pg.el.querySelector('svg'); svg.setAttribute('viewBox', `0 0 ${pg.vp.width} ${pg.vp.height}`); svg.setAttribute('width', pg.vp.width); svg.setAttribute('height', pg.vp.height);
+      return pg;
+    }
+    async function render(pg) {
+      if (pg.rendered || pg.busy) return; pg.busy = true;
+      try {
+        await ensurePage(pg); if (!V.alive) return;
+        const dpr = Math.min(2, window.devicePixelRatio || 1), cv = pg.el.querySelector('canvas'), vp = pg.vp;
+        cv.width = Math.floor(vp.width * dpr); cv.height = Math.floor(vp.height * dpr); cv.style.width = vp.width + 'px'; cv.style.height = vp.height + 'px';
+        if (pg.task) try { pg.task.cancel(); } catch (e) { /* ok */ }
+        pg.task = pg.page.render({ canvasContext: cv.getContext('2d'), viewport: vp, transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null });
+        await pg.task.promise.catch((e) => { if (e && e.name !== 'RenderingCancelledException') throw e; });
+        const tl = pg.el.querySelector('.textLayer'); tl.innerHTML = ''; tl.style.setProperty('--scale-factor', V.scale);
+        const tc = V.txt[pg.i] ? V.txt[pg.i].tc : await pg.page.getTextContent();
+        if (!V.txt[pg.i]) V.txt[pg.i] = { tc, s: tc.items.map((x) => x.str).join(' ') };
+        const lib = await loadLib();
+        if (V.ocr[pg.i]) ocrLayer(pg); else await lib.renderTextLayer({ textContentSource: tc, container: tl, viewport: vp, textDivs: [] }).promise.catch(() => {});
+        pg.rendered = true; drawAnn(pg); markHits(pg);
+        if (!V.ocr[pg.i] && O.needsOcr(V.txt[pg.i].s.replace(/\s/g, '').length)) ocrWant(pg.i);
+      } catch (e) { console.warn('render', pg.i, e); } finally { pg.busy = false; }
+    }
+    function unrender(pg) { if (!pg.rendered) return; const cv = pg.el.querySelector('canvas'); cv.width = 0; cv.height = 0; pg.el.querySelector('.textLayer').innerHTML = ''; pg.rendered = false; }
+    async function relayout(keepPg) {
+      const pgN = keepPg || V.cur; V.pages.forEach((p) => { p.rendered = false; p.vp = null; });
+      $('[data-z]').textContent = Math.round(V.scale * 100) + '%';
+      for (const p of V.pages) { const vb = p.page ? p.page.getViewport({ scale: V.scale, rotation: ((p.page.rotate || 0) + V.rot) % 360 }) : null; const r = vb ? [vb.width, vb.height] : ((V.rot % 180) ? [V.base.height * V.scale, V.base.width * V.scale] : [V.base.width * V.scale, V.base.height * V.scale]); p.el.style.width = r[0] + 'px'; p.el.style.height = r[1] + 'px'; }
+      goto(pgN, true); V.pages.filter((p) => p.vis).forEach(render);
+    }
+    function goto(n, instant) { n = Math.max(1, Math.min(V.n, +n || 1)); const pg = V.pages[n - 1]; if (!pg) return; scroller.scrollTo({ top: pg.el.offsetTop - 8, behavior: instant ? 'auto' : 'smooth' }); setCur(n); }
+    function setCur(n) {
+      if (n === V.cur && V._curSet) return; V.cur = n; V._curSet = true; const inp = $('[data-pg]'); if (inp && document.activeElement !== inp) inp.value = n;
+      try { localStorage.setItem('prumo.estpg.' + m.id, n); } catch (e) { /* ok */ }
+      clearTimeout(V.visitT); V.visitT = setTimeout(() => V.visit.add(n), 1500);
+      clearTimeout(V.readT); V.readT = setTimeout(saveReading, 6000);
+      const fb = $('[data-a="fav"]'); if (fb) fb.classList.toggle('on', V.favs.lista.some((f) => +f.pagina === n));
+    }
+    const saveReading = () => P.api.call('est.readingSave', { material_id: m.id, pagina: V.cur, zoom: r2(V.scale), total_paginas: V.n }, { mutation: true }).then((r) => S.put('est_leitura', r.leitura)).catch(() => {});
+    scroller.addEventListener('scroll', () => { if (!V.pages.length) return; const mid = scroller.scrollTop + scroller.clientHeight / 3; let best = 1; for (const p of V.pages) { if (p.el.offsetTop <= mid) best = p.i; else break; } setCur(best); hidePops(); }, { passive: true });
+
+    // ---------- desenho das marcações ----------
+    const pv = (pg, x, y) => pg.vp.convertToViewportPoint(x, y);
+    const pp = (pg, x, y) => { const q = pg.vp.convertToPdfPoint(x, y); return [r2(q[0]), r2(q[1])]; };
+    const vrect = (pg, r) => { const a = pv(pg, r[0], r[1]), b = pv(pg, r[2], r[3]); return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1])]; };
+    const itens = (n) => (V.ann[n] = V.ann[n] || { itens: [] }).itens;
+    function svgOf(pg, a, sel) {
+      const s = V.scale, c = P.esc(a.cor || '#F2B705'), op = a.opacidade || 1, w = Math.max(0.8, (a.espessura || 2) * s), id = P.esc(a.id);
+      const line = (p, q, ww) => `<line x1="${p[0]}" y1="${p[1]}" x2="${q[0]}" y2="${q[1]}" stroke="${c}" stroke-width="${ww}" stroke-linecap="round" opacity="${op}"/>`;
+      let out = '';
+      if (a.tipo === 'marca' || a.tipo === 'marca_texto') { (a.rects || [a.rect]).forEach((r) => { const v = vrect(pg, r); out += `<rect x="${v[0]}" y="${v[1]}" width="${v[2]}" height="${v[3]}" fill="${c}" opacity="${a.tipo === 'marca' || a.tipo === 'marca_texto' ? Math.min(op, 0.4) : op}" class="mul"/>`; }); }
+      else if (a.tipo === 'sublinhado' || a.tipo === 'riscado') { (a.rects || []).forEach((r) => { const e = edges(r, pg.prot), seg = a.tipo === 'sublinhado' ? e.bottom : e.mid; out += line(pv(pg, ...seg[0]), pv(pg, ...seg[1]), Math.max(1, (a.espessura || 1.2) * s)); }); }
+      else if (a.tipo === 'caneta' || a.tipo === 'pincel') { let d = ''; for (let i = 0; i < a.pts.length; i += 2) { const q = pv(pg, a.pts[i], a.pts[i + 1]); d += (i ? 'L' : 'M') + r2(q[0]) + ' ' + r2(q[1]); } out += `<path d="${d}" fill="none" stroke="${c}" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round" opacity="${a.tipo === 'pincel' ? Math.min(op, 0.5) : op}" ${a.tipo === 'pincel' ? 'class="mul"' : ''}/>`; }
+      else if (a.tipo === 'linha' || a.tipo === 'seta') { const p = pv(pg, a.pts[0], a.pts[1]), q = pv(pg, a.pts[2], a.pts[3]); out += line(p, q, w); if (a.tipo === 'seta') { const ang = Math.atan2(q[1] - p[1], q[0] - p[0]), L = Math.max(8, w * 4); [0.45, -0.45].forEach((k) => { out += line(q, [q[0] - L * Math.cos(ang + k), q[1] - L * Math.sin(ang + k)], w); }); } }
+      else if (a.tipo === 'retangulo') { const v = vrect(pg, a.rect); out += `<rect x="${v[0]}" y="${v[1]}" width="${v[2]}" height="${v[3]}" fill="none" stroke="${c}" stroke-width="${w}" opacity="${op}"/>`; }
+      else if (a.tipo === 'elipse') { const v = vrect(pg, a.rect); out += `<ellipse cx="${v[0] + v[2] / 2}" cy="${v[1] + v[3] / 2}" rx="${v[2] / 2}" ry="${v[3] / 2}" fill="none" stroke="${c}" stroke-width="${w}" opacity="${op}"/>`; }
+      if (sel) { const v = vrect(pg, bboxOf(a)); out += `<rect x="${v[0] - 4}" y="${v[1] - 4}" width="${v[2] + 8}" height="${v[3] + 8}" fill="none" stroke="#60A5FA" stroke-width="1.5" stroke-dasharray="5 4"/>`; }
+      return `<g data-aid="${id}">${out}</g>`;
+    }
+    function drawAnn(pg) {
+      if (!pg.vp) return;
+      const svg = pg.el.querySelector('svg'), html = pg.el.querySelector('.pv-html'), its = V.ann[pg.i] ? V.ann[pg.i].itens : [];
+      const vis = V.show ? its.slice().sort((a, b) => (a.ordem || 0) - (b.ordem || 0)) : [];
+      svg.innerHTML = vis.map((a) => svgOf(pg, a, V.sel && V.sel.pg === pg.i && V.sel.id === a.id)).join('');
+      html.innerHTML = vis.filter((a) => a.tipo === 'texto' || a.tipo === 'comentario').map((a) => {
+        const v = vrect(pg, a.rect), sel = V.sel && V.sel.pg === pg.i && V.sel.id === a.id ? ' sel' : '';
+        if (a.tipo === 'texto') return `<div class="pv-tx${sel}" data-aid="${P.esc(a.id)}" style="left:${v[0]}px;top:${v[1]}px;width:${v[2]}px;min-height:${v[3]}px;font-size:${(a.fonte || 12) * V.scale}px;color:${P.esc(a.cor)};text-align:${P.esc(a.alinhamento || 'left')};opacity:${a.opacidade || 1}">${P.esc(a.texto || '')}</div>`;
+        return `<button class="pv-cm${sel}" data-aid="${P.esc(a.id)}" style="left:${v[0]}px;top:${v[1]}px;width:${Math.max(18, v[2])}px;height:${Math.max(18, v[3])}px;background:${P.esc(a.cor)}" title="${P.esc(a.texto || '')}" aria-label="Comentário: ${P.esc(a.texto || '')}">${P.toHtml(icon('comment', 'xs'))}</button>`;
+      }).join('');
+    }
+    const redraw = (n) => { const pg = V.pages[n - 1]; if (pg && pg.rendered) drawAnn(pg); if (V.side === 'marcas') side(); };
+
+    // ---------- histórico e gravação ----------
+    function mutate(n, fn) {
+      const before = clone(itens(n));
+      fn(itens(n));
+      V.hist.push({ n, before, after: clone(itens(n)) }); if (V.hist.length > 200) V.hist.shift(); V.fut = [];
+      dirty(n); redraw(n);
+    }
+    function undo() { const x = V.hist.pop(); if (!x) return; V.fut.push(x); V.ann[x.n].itens = clone(x.before); V.sel = null; dirty(x.n); redraw(x.n); goto(x.n); }
+    function redo() { const x = V.fut.pop(); if (!x) return; V.hist.push(x); V.ann[x.n].itens = clone(x.after); dirty(x.n); redraw(x.n); goto(x.n); }
+    function dirty(n) { V.dirty.add(String(n)); V.changed = true; setState('aguardando'); clearTimeout(V.saveT); V.saveT = setTimeout(persist, 1200); }
+    async function persist() {
+      if (!V.dirty.size && !V.favDirty) return;
+      const p = V.pend || { paginas: {}, base_revs: {}, favoritos: null };
+      V.dirty.forEach((n) => { if (!(n in p.paginas)) p.base_revs[n] = V.revs[n] || 0; p.paginas[n] = clone(itens(n)); });
+      if (V.favDirty) p.favoritos = { base_rev: p.favoritos ? p.favoritos.base_rev : V.favs.rev, lista: clone(V.favs.lista) };
+      p.op_id = P.uuid(); p.at = Date.now(); p.material_id = m.id; p.arquivo_id = m.arquivo_id;
+      V.dirty.clear(); V.favDirty = false; V.pend = p;
+      await idb.put('pend', key, p); setState('local');
+      send();
+    }
+    async function send() {
+      if (V.sending || !V.pend) return; V.sending = true;
+      const p = V.pend; setState('salvando');
+      try {
+        const r = await P.api.call('est.annSave', { material_id: m.id, arquivo_id: m.arquivo_id, paginas: p.paginas, base_revs: p.base_revs, favoritos: p.favoritos, op_id: p.op_id }, { mutation: true, timeout: 90000 });
+        Object.assign(V.revs, r.revs || {}); V.rev = r.revisao; if (r.favoritos_rev != null) V.favs.rev = r.favoritos_rev;
+        if (V.pend === p) { V.pend = null; await idb.del('pend', key); }
+        V.retry = 0; setState(V.dirty.size ? 'aguardando' : 'salvo');
+        const row = S.where('est_pdf_anot', (a) => a.material_id === m.id && a.arquivo_id === m.arquivo_id)[0];
+        const total = Object.values(V.ann).reduce((s, x) => s + x.itens.length, 0);
+        S.put('est_pdf_anot', { ...(row || { id: 'tmp-' + m.id, material_id: m.id, arquivo_id: m.arquivo_id }), revisao: r.revisao, total, favoritos: V.favs.lista.length, atualizado: r.salvo_em });
+      } catch (e) {
+        if (e.code === 'CONFLICT') { V.sending = false; await conflict(e.data || {}); return; }
+        V.retry = (V.retry || 0) + 1; setState(navigator.onLine === false ? 'offline' : 'falha');
+        if (V.alive && V.retry < 8) setTimeout(send, Math.min(60000, 2000 * 2 ** V.retry));
+      } finally { V.sending = false; }
+      if (V.pend && V.pend !== p) send();
+    }
+    /** Conflito: a mesma página mudou em outro aparelho. Iguais são resolvidas sozinhas; o resto, você escolhe. */
+    async function conflict(d) {
+      const p = V.pend, cf = d.conflitos || {}, sig = (its) => (its || []).map((a) => a.id + '@' + (a.alterado || '')).sort().join('|');
+      Object.keys(cf).forEach((pg) => { if (pg !== '_favoritos' && p.paginas[pg] && sig(cf[pg].itens) === sig(p.paginas[pg])) { V.revs[pg] = cf[pg].rev; delete p.paginas[pg]; delete p.base_revs[pg]; delete cf[pg]; } });
+      if (!Object.keys(cf).length) { if (Object.keys(p.paginas).length || p.favoritos) { p.op_id = P.uuid(); return send(); } V.pend = null; await idb.del('pend', key); setState('salvo'); return; }
+      setState('conflito');
+      const pgs = Object.keys(cf).filter((k) => k !== '_favoritos');
+      const escolha = await new Promise((res) => ui.sheet({ title: 'Anotações mudaram em outro aparelho', body: h`<p class="muted" style="font-size:13.5px">${pgs.length ? `Página(s) ${pgs.join(', ')}` : ''}${pgs.length && cf._favoritos ? ' e ' : ''}${cf._favoritos ? 'os favoritos' : ''} foram alterados em outro lugar desde que você abriu este PDF. Nada foi perdido: escolha o que fica.</p>
+          <div class="stack mt-3"><button class="btn btn-primary" data-c="juntar">Juntar as duas versões</button><button class="btn btn-ghost" data-c="minha">Manter as minhas</button><button class="btn btn-ghost" data-c="servidor">Usar as do outro aparelho</button></div><p class="faint mt-3" style="font-size:12px">Juntar mantém todas as marcações; quando a mesma marcação foi editada nos dois, fica a edição mais recente.</p>`,
+        onClose: () => res(null), onMount(s2) { s2.el.addEventListener('click', (e) => { const b = e.target.closest('[data-c]'); if (b) { const v = b.dataset.c; res(v); s2.close(); } }); } }));
+      if (!escolha) { setState('conflito', 'abra o menu para resolver'); V.conflito = d; return; }
+      V.conflito = null;
+      pgs.forEach((pg) => {
+        const srv = cf[pg].itens || [], mine = p.paginas[pg] || [];
+        if (escolha === 'servidor') { V.ann[pg] = { itens: clone(srv) }; delete p.paginas[pg]; delete p.base_revs[pg]; }
+        else { let out = mine; if (escolha === 'juntar') { const map = new Map(srv.map((a) => [a.id, a])); mine.forEach((a) => { const o2 = map.get(a.id); if (!o2 || String(a.alterado || '') >= String(o2.alterado || '')) map.set(a.id, a); }); out = [...map.values()]; } p.paginas[pg] = out; V.ann[pg] = { itens: clone(out) }; p.base_revs[pg] = cf[pg].rev; }
+        V.revs[pg] = cf[pg].rev; redraw(+pg);
+      });
+      if (cf._favoritos) {
+        const srv = cf._favoritos.lista || [];
+        if (escolha === 'servidor') { V.favs.lista = srv; p.favoritos = null; }
+        else { const lst = escolha === 'juntar' ? [...new Map(srv.concat((p.favoritos || {}).lista || []).map((f) => [+f.pagina, f])).values()] : (p.favoritos || {}).lista || []; V.favs.lista = lst; p.favoritos = { base_rev: cf._favoritos.rev, lista: lst }; }
+        V.favs.rev = cf._favoritos.rev;
+      }
+      if (!Object.keys(p.paginas).length && !p.favoritos) { V.pend = null; await idb.del('pend', key); setState('salvo'); return; }
+      p.op_id = P.uuid(); await idb.put('pend', key, p); send();
+    }
+
+    // ---------- criação de marcações ----------
+    const newAnn = (tipo, extra) => { const now = new Date().toISOString(); return { id: 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), tipo, cor: V.cor, opacidade: tipo === 'marca' || tipo === 'marca_texto' ? Math.min(V.opa, 0.4) : tipo === 'pincel' ? Math.min(V.opa, 0.5) : V.opa, espessura: tipo === 'pincel' ? Math.max(8, V.esp * 4) : tipo === 'sublinhado' || tipo === 'riscado' ? Math.max(0.8, V.esp / 2) : V.esp, ordem: Date.now() % 1e9, criado: now, alterado: now, ...extra }; };
+    const pageOf = (target) => { const el = target && target.closest && target.closest('.pv-page'); return el ? V.pages[+el.dataset.pg - 1] : null; };
+    const local = (pg, e) => { const b = pg.el.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; };
+
+    /** Retângulos da seleção de texto, por página, em pontos do PDF (linhas próximas são unidas). */
+    function selRects() {
+      const sel = window.getSelection(); if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+      const rng = sel.getRangeAt(0); if (!root.contains(rng.commonAncestorContainer)) return null;
+      const cr = Array.from(rng.getClientRects()).filter((r) => r.width > 1 && r.height > 2), out = {};
+      V.pages.forEach((pg) => {
+        if (!pg.rendered) return; const b = pg.el.getBoundingClientRect();
+        const mine = cr.filter((r) => r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top).map((r) => [r.left - b.left, r.top - b.top, r.width, r.height]);
+        if (!mine.length) return;
+        mine.sort((a, c) => a[1] - c[1] || a[0] - c[0]);
+        const merged = [];
+        mine.forEach((r) => { const l = merged[merged.length - 1]; if (l && Math.abs(l[1] - r[1]) < r[3] * 0.5 && r[0] <= l[0] + l[2] + 6) { const x2 = Math.max(l[0] + l[2], r[0] + r[2]); l[1] = Math.min(l[1], r[1]); l[3] = Math.max(l[3], r[3]); l[2] = x2 - l[0]; } else merged.push(r.slice()); });
+        out[pg.i] = merged.map((r) => normRect(pp(pg, r[0], r[1]), pp(pg, r[0] + r[2], r[1] + r[3])));
+      });
+      return Object.keys(out).length ? { porPg: out, texto: sel.toString().replace(/\s+/g, ' ').trim().slice(0, 2000) } : null;
+    }
+    function applySel(tipo) {
+      const s = selRects(); if (!s) return null; let first = null;
+      Object.entries(s.porPg).forEach(([n, rects]) => { const a = newAnn(tipo, { rects, trecho: s.texto }); mutate(+n, (L) => L.push(a)); if (!first) first = { pg: +n, id: a.id }; });
+      window.getSelection().removeAllRanges(); hidePops(); return first;
+    }
+    function selMenu() {
+      const s = window.getSelection(), box = $('[data-selmenu]');
+      if (!s || s.isCollapsed || !s.rangeCount || !root.contains(s.anchorNode)) { box.hidden = true; return; }
+      if (TEXTUAL.has(V.tool)) { applySel(V.tool); return; }
+      const r = s.getRangeAt(0).getBoundingClientRect(), rb = root.getBoundingClientRect();
+      box.innerHTML = P.toHtml(h`<button data-sm="marca_texto">${icon('highlighter', 'xs')}Marcar</button><button data-sm="sublinhado">${icon('underline', 'xs')}Sublinhar</button><button data-sm="riscado">${icon('strike', 'xs')}Riscar</button><button data-sm="copiar">${icon('copy', 'xs')}Copiar</button><button data-sm="resumo">Resumo</button><button data-sm="flashcard">Flashcard</button><button data-sm="duvida">Dúvida</button><button data-sm="questao">Questão</button>`);
+      box.hidden = false; box.style.left = Math.max(8, Math.min(rb.width - box.offsetWidth - 8, r.left - rb.left + r.width / 2 - box.offsetWidth / 2)) + 'px'; box.style.top = Math.max(56, r.top - rb.top - box.offsetHeight - 8) + 'px';
+    }
+    document.addEventListener('selectionchange', V.onSel = () => { clearTimeout(V.selT); if (TEXTUAL.has(V.tool) && V.ptr !== 'touch') return; V.selT = setTimeout(selMenu, TEXTUAL.has(V.tool) ? 1200 : 250); });
+    root.addEventListener('pointerdown', (e) => { V.ptr = e.pointerType; }, true);
+    root.addEventListener('pointerup', (e) => { if (TEXTUAL.has(V.tool) && e.pointerType !== 'touch') setTimeout(() => applySel(V.tool), 30); });
+
+    /** Leva o trecho para resumo, flashcard, dúvida ou questão, ligando ao material e à página. */
+    function sendTo(dest, texto, n) {
+      const base = { material_id: m.id, pagina: n, disciplina_id: m.disciplina_id || null, assunto_id: String(m.assunto_ids || '').split(',').filter(Boolean)[0] || null };
+      const ref = `${m.codigo}, p. ${n}`;
+      if (dest === 'resumo') E.noteEdit(null, { ...base, tipo: 'trecho', titulo: `Trecho de ${ref}`, trecho: texto, conteudo: `> ${texto}\n\n`, fonte: ref });
+      if (dest === 'duvida') E.noteEdit(null, { ...base, tipo: 'duvida', titulo: `Dúvida em ${ref}`, trecho: texto, conteudo: `> ${texto}\n\nMinha dúvida: `, fonte: ref });
+      if (dest === 'flashcard') E.cardEdit(null, { frente: texto.slice(0, 900), verso: '', disciplina_id: base.disciplina_id, assunto_id: base.assunto_id, origem_ref: ref });
+      if (dest === 'questao') P.estQ.edit(null, { enunciado: texto, material_id: m.id, pagina: n, disciplina_id: base.disciplina_id, assunto_id: base.assunto_id, fonte: ref });
+    }
+
+    // ---------- ponteiro: desenhar, selecionar, mover, apagar ----------
+    let drag = null;
+    function hit(pg, x, y) {
+      const its = (V.ann[pg.i] || { itens: [] }).itens.slice().sort((a, b) => (b.ordem || 0) - (a.ordem || 0));
+      for (const a of its) {
+        const v = vrect(pg, bboxOf(a)), tol = 6;
+        if (x < v[0] - tol || x > v[0] + v[2] + tol || y < v[1] - tol || y > v[1] + v[3] + tol) continue;
+        if (a.pts && (a.tipo === 'caneta' || a.tipo === 'pincel' || a.tipo === 'linha' || a.tipo === 'seta')) {
+          const lim = Math.max(8, (a.espessura || 2) * V.scale / 2 + 5);
+          for (let i = 0; i + 3 < a.pts.length || i === 0; i += 2) { const p1 = pv(pg, a.pts[i], a.pts[i + 1]), p2 = a.pts.length > i + 3 ? pv(pg, a.pts[i + 2], a.pts[i + 3]) : p1; if (segDist(x, y, p1, p2) <= lim) return a; if (a.pts.length <= i + 3) break; }
+          continue;
+        }
+        if (a.tipo === 'retangulo' || a.tipo === 'elipse') { const inner = x > v[0] + 8 && x < v[0] + v[2] - 8 && y > v[1] + 8 && y < v[1] + v[3] - 8; if (inner && V.tool === 'borracha') continue; }
+        return a;
+      }
+      return null;
+    }
+    const segDist = (x, y, a, b) => { const dx = b[0] - a[0], dy = b[1] - a[1], L = dx * dx + dy * dy; let t = L ? ((x - a[0]) * dx + (y - a[1]) * dy) / L : 0; t = Math.max(0, Math.min(1, t)); return Math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy)); };
+    pagesEl.addEventListener('pointerdown', (e) => {
+      if (!DRAW.has(V.tool) || e.button > 0) return;
+      const pg = pageOf(e.target); if (!pg || !pg.vp) return;
+      const [x, y] = local(pg, e); hidePops();
+      if (V.tool === 'borracha') { const a = hit(pg, x, y); if (a) mutate(pg.i, (L) => L.splice(L.findIndex((z) => z.id === a.id), 1)); return; }
+      if (V.tool === 'selecionar') {
+        const a = hit(pg, x, y); const prev = V.sel; V.sel = a ? { pg: pg.i, id: a.id } : null;
+        if (prev && prev.pg !== pg.i) redraw(prev.pg); redraw(pg.i);
+        if (a) { drag = { mode: 'move', pg, x0: x, y0: y, orig: clone(a), before: clone(itens(pg.i)), moved: false }; e.preventDefault(); pagesEl.setPointerCapture(e.pointerId); }
+        if (a) objMenu(pg, a); return;
+      }
+      if (V.tool === 'texto' || V.tool === 'comentario') {
+        const p0 = pp(pg, x, y), sz = V.tool === 'texto' ? [180, 40] : [16, 16];
+        const p1 = pp(pg, x + sz[0] * V.scale, y + sz[1] * V.scale);
+        editText(pg.i, newAnn(V.tool, { rect: normRect(p0, p1), texto: '', fonte: 12, alinhamento: 'left', opacidade: 1, espessura: 1 }), true); return;
+      }
+      e.preventDefault(); pagesEl.setPointerCapture(e.pointerId);
+      drag = { mode: 'draw', pg, x0: x, y0: y, pts: [x, y], last: [x, y] };
+    });
+    pagesEl.addEventListener('pointermove', (e) => {
+      if (!drag) return; const pg = drag.pg; const [x, y] = local(pg, e);
+      if (drag.mode === 'move') { const a0 = pp(pg, drag.x0, drag.y0), a1 = pp(pg, x, y); const it = itens(pg.i).find((z) => z.id === drag.orig.id); if (!it) return; const c = clone(drag.orig); translate(c, a1[0] - a0[0], a1[1] - a0[1]); Object.assign(it, c); drag.moved = Math.hypot(x - drag.x0, y - drag.y0) > 3; drawAnn(pg); return; }
+      if (V.tool === 'caneta' || V.tool === 'pincel') { if (Math.hypot(x - drag.last[0], y - drag.last[1]) < 1.6) return; drag.pts.push(x, y); drag.last = [x, y]; }
+      else drag.pts = [drag.x0, drag.y0, x, y];
+      preview(pg);
+    });
+    const endDrag = () => {
+      if (!drag) return; const d = drag; drag = null; const pg = d.pg;
+      if (d.mode === 'move') { if (d.moved) { const it = itens(pg.i).find((z) => z.id === d.orig.id); if (it) it.alterado = new Date().toISOString(); V.hist.push({ n: pg.i, before: d.before, after: clone(itens(pg.i)) }); V.fut = []; dirty(pg.i); } redraw(pg.i); return; }
+      pg.el.querySelector('.pv-prev') && pg.el.querySelector('.pv-prev').remove();
+      const t = V.tool, pts = d.pts;
+      if (pts.length < 4 || (t !== 'caneta' && t !== 'pincel' && Math.hypot(pts[2] - pts[0], pts[3] - pts[1]) < 4)) return;
+      let a;
+      if (t === 'caneta' || t === 'pincel') { const q = []; for (let i = 0; i < pts.length; i += 2) { const z = pp(pg, pts[i], pts[i + 1]); q.push(z[0], z[1]); } a = newAnn(t, { pts: q }); }
+      else if (t === 'linha' || t === 'seta') { const p1 = pp(pg, pts[0], pts[1]), p2 = pp(pg, pts[2], pts[3]); a = newAnn(t, { pts: [p1[0], p1[1], p2[0], p2[1]] }); }
+      else a = newAnn(t, { rect: normRect(pp(pg, pts[0], pts[1]), pp(pg, pts[2], pts[3])) });
+      mutate(pg.i, (L) => L.push(a));
+    };
+    pagesEl.addEventListener('pointerup', endDrag); pagesEl.addEventListener('pointercancel', endDrag);
+    function preview(pg) {
+      let el = pg.el.querySelector('.pv-prev'); if (!el) { el = document.createElementNS('http://www.w3.org/2000/svg', 'g'); el.setAttribute('class', 'pv-prev'); pg.el.querySelector('svg').appendChild(el); }
+      const p = drag.pts, c = P.esc(V.cor), w = Math.max(1, (V.tool === 'pincel' ? Math.max(8, V.esp * 4) : V.esp) * V.scale), t = V.tool;
+      if (t === 'caneta' || t === 'pincel') { let dd = ''; for (let i = 0; i < p.length; i += 2) dd += (i ? 'L' : 'M') + p[i] + ' ' + p[i + 1]; el.innerHTML = `<path d="${dd}" fill="none" stroke="${c}" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round" opacity="${t === 'pincel' ? 0.45 : V.opa}"/>`; }
+      else if (t === 'linha' || t === 'seta') el.innerHTML = `<line x1="${p[0]}" y1="${p[1]}" x2="${p[2]}" y2="${p[3]}" stroke="${c}" stroke-width="${w}" stroke-linecap="round"/>`;
+      else { const x = Math.min(p[0], p[2]), y = Math.min(p[1], p[3]), ww = Math.abs(p[2] - p[0]), hh = Math.abs(p[3] - p[1]); el.innerHTML = t === 'elipse' ? `<ellipse cx="${x + ww / 2}" cy="${y + hh / 2}" rx="${ww / 2}" ry="${hh / 2}" fill="none" stroke="${c}" stroke-width="${w}"/>` : `<rect x="${x}" y="${y}" width="${ww}" height="${hh}" ${t === 'marca' ? `fill="${c}" opacity="0.35"` : `fill="none" stroke="${c}" stroke-width="${w}"`}/>`; }
+    }
+
+    /** Caixa de texto e comentário: edição num painel curto. */
+    function editText(n, a, isNew) {
+      ui.sheet({ title: a.tipo === 'texto' ? (isNew ? 'Caixa de texto' : 'Editar texto') : (isNew ? 'Comentário' : 'Editar comentário'), body: h`<div class="stack"><textarea class="input" rows="5" data-t maxlength="5000" placeholder="${a.tipo === 'texto' ? 'Texto que aparece na página' : 'Seu comentário'}">${a.texto || ''}</textarea>
+          ${a.tipo === 'texto' ? h`<div class="row-sm wrap"><label class="pv-mini">Tamanho<select data-f>${[8, 10, 12, 14, 18, 24, 32].map((v) => h`<option ${raw(+a.fonte === v ? 'selected' : '')}>${v}</option>`)}</select></label><label class="pv-mini">Alinhamento<select data-al>${[['left', 'Esquerda'], ['center', 'Centro'], ['right', 'Direita']].map(([v, l]) => h`<option value="${v}" ${raw(a.alinhamento === v ? 'selected' : '')}>${l}</option>`)}</select></label></div>` : ''}</div>`,
+        foot: h`<button class="btn btn-primary" data-ok>${isNew ? 'Adicionar' : 'Salvar'}</button>`,
+        onMount(s2) { setTimeout(() => s2.$('[data-t]').focus(), 250); s2.$('[data-ok]').onclick = () => {
+          const t = s2.$('[data-t]').value; if (!t.trim()) { ui.toast('Escreva o texto.', { error: true }); return; }
+          const patch = { texto: t, alterado: new Date().toISOString() };
+          if (a.tipo === 'texto') { patch.fonte = +s2.$('[data-f]').value; patch.alinhamento = s2.$('[data-al]').value; const lines = t.split('\n').length; const r = a.rect; const need = lines * patch.fonte * 1.3 + 6; const rot = (V.pages[n - 1] && V.pages[n - 1].prot) || 0; if (rot % 180 === 0) { if (r[3] - r[1] < need) patch.rect = [r[0], r2(r[3] - need), r[2], r[3]]; } }
+          s2.close();
+          if (isNew) mutate(n, (L) => L.push({ ...a, ...patch })); else mutate(n, (L) => Object.assign(L.find((z) => z.id === a.id) || {}, patch));
+        }; } });
+    }
+
+    function objMenu(pg, a) {
+      const box = $('[data-objmenu]'), rb = root.getBoundingClientRect(), v = vrect(pg, bboxOf(a)), b = pg.el.getBoundingClientRect();
+      const txt = a.trecho || a.texto || '';
+      box.innerHTML = P.toHtml(h`<span class="faint" style="font-size:11.5px;padding:0 6px">${TIPOS[a.tipo]}</span>${a.tipo === 'texto' || a.tipo === 'comentario' ? h`<button data-om="editar">${icon('edit', 'xs')}Editar</button>` : ''}
+        <button data-om="cor">${icon('droplet', 'xs')}Cor</button><button data-om="dup">${icon('copy', 'xs')}Duplicar</button><button data-om="frente">Trazer à frente</button>${txt ? h`<button data-om="resumo">Resumo</button><button data-om="flashcard">Flashcard</button><button data-om="duvida">Dúvida</button><button data-om="questao">Questão</button>` : ''}<button data-om="del" class="danger">${icon('trash', 'xs')}Excluir</button>`);
+      box.hidden = false; box.dataset.pg = pg.i; box.dataset.id = a.id;
+      box.style.left = Math.max(8, Math.min(rb.width - box.offsetWidth - 8, b.left - rb.left + v[0])) + 'px';
+      box.style.top = Math.max(56, Math.min(rb.height - box.offsetHeight - 60, b.top - rb.top + v[1] - box.offsetHeight - 10)) + 'px';
+    }
+    const hidePops = () => { $('[data-objmenu]').hidden = true; if (!window.getSelection() || window.getSelection().isCollapsed) $('[data-selmenu]').hidden = true; };
+
+    root.addEventListener('click', (e) => {
+      const sm = e.target.closest('[data-sm]');
+      if (sm) {
+        const k = sm.dataset.sm;
+        if (TEXTUAL.has(k)) { applySel(k); return; }
+        const s = window.getSelection(), t = s ? s.toString().replace(/\s+/g, ' ').trim() : '';
+        if (k === 'copiar') { navigator.clipboard && navigator.clipboard.writeText(t).then(() => ui.toast('Copiado')).catch(() => ui.toast('Não foi possível copiar.', { error: true })); hidePops(); return; }
+        const r = s.rangeCount ? pageOf(s.getRangeAt(0).startContainer.parentElement) : null;
+        if (['resumo', 'duvida'].includes(k) && r) { const f = applySel('marca_texto'); if (f) { /* a marcação acompanha o trecho */ } }
+        sendTo(k, t, r ? r.i : V.cur); hidePops(); return;
+      }
+      const om = e.target.closest('[data-om]');
+      if (om) {
+        const box = $('[data-objmenu]'), n = +box.dataset.pg, id = box.dataset.id, a = itens(n).find((z) => z.id === id); if (!a) return;
+        const k = om.dataset.om; box.hidden = true;
+        if (k === 'del') { mutate(n, (L) => L.splice(L.findIndex((z) => z.id === id), 1)); V.sel = null; redraw(n); }
+        if (k === 'dup') { const c = clone(a); c.id = newAnn(a.tipo).id; c.criado = c.alterado = new Date().toISOString(); c.ordem = Date.now() % 1e9; translate(c, 12, -12); mutate(n, (L) => L.push(c)); V.sel = { pg: n, id: c.id }; redraw(n); }
+        if (k === 'frente') mutate(n, (L) => { const z = L.find((q) => q.id === id); z.ordem = Date.now() % 1e9; z.alterado = new Date().toISOString(); });
+        if (k === 'cor') mutate(n, (L) => { const z = L.find((q) => q.id === id); z.cor = V.cor; z.alterado = new Date().toISOString(); });
+        if (k === 'editar') editText(n, a, false);
+        if (['resumo', 'flashcard', 'duvida', 'questao'].includes(k)) sendTo(k, a.trecho || a.texto, n);
+        return;
+      }
+      const cm = e.target.closest('.pv-cm, .pv-tx');
+      if (cm && (V.tool === 'ler' || V.tool === 'selecionar')) { const pg = pageOf(cm), a = itens(pg.i).find((z) => z.id === cm.dataset.aid); if (!a) return; if (V.tool === 'ler' && a.tipo === 'comentario') { ui.sheet({ title: `Comentário · p. ${pg.i}`, body: h`<p style="white-space:pre-wrap">${a.texto}</p>`, foot: h`<button class="btn btn-ghost" data-close>Fechar</button><button class="btn btn-primary" data-ed>Editar</button>`, onMount(s2) { s2.$('[data-ed]').onclick = () => { s2.close(); editText(pg.i, a, false); }; } }); return; } V.sel = { pg: pg.i, id: a.id }; redraw(pg.i); objMenu(pg, a); return; }
+      const tb = e.target.closest('.pv-tool[data-tool]');
+      if (tb) { setTool(tb.dataset.tool); return; }
+      const sw = e.target.closest('[data-cor]');
+      if (sw) { V.cor = sw.dataset.cor; P.ls.set('est.pdf_cor', V.cor); root.querySelectorAll('[data-cor]').forEach((b) => b.classList.toggle('on', b === sw)); if (V.sel) { const n = V.sel.pg, id = V.sel.id; mutate(n, (L) => { const z = L.find((q) => q.id === id); if (z) { z.cor = V.cor; z.alterado = new Date().toISOString(); } }); } return; }
+      const a = e.target.closest('[data-a]');
+      if (a) action(a.dataset.a, a);
+      const sideItem = e.target.closest('[data-go-pg]');
+      if (sideItem) { const n = +sideItem.dataset.goPg; goto(n); if (sideItem.dataset.aid) { V.sel = { pg: n, id: sideItem.dataset.aid }; setTimeout(() => redraw(n), 350); } if (innerWidth < 900) toggleSide(null); }
+    });
+    root.addEventListener('dblclick', (e) => { const tx = e.target.closest('.pv-tx'); if (!tx) return; const pg = pageOf(tx), a = itens(pg.i).find((z) => z.id === tx.dataset.aid); if (a) editText(pg.i, a, false); });
+    $('[data-esp]').onchange = (e) => { V.esp = +e.target.value; };
+    $('[data-opa]').oninput = (e) => { V.opa = +e.target.value / 100; };
+    $('[data-pg]').addEventListener('change', (e) => goto(+e.target.value));
+    function setTool(t) { V.tool = t; root.querySelectorAll('[data-tool]').forEach((b) => b.classList.toggle('on', b.dataset.tool === t)); root.classList.toggle('drawing', DRAW.has(t)); root.dataset.modo = t; if (t !== 'selecionar' && V.sel) { const n = V.sel.pg; V.sel = null; redraw(n); } hidePops(); if (TEXTUAL.has(t)) ui.toast('Selecione o trecho no texto do PDF. Em PDF digitalizado (imagem), use "Destacar área".', { duration: 4500 }); }
+
+    function action(k, el) {
+      if (k === 'undo') undo(); if (k === 'redo') redo();
+      if (k === 'zin' || k === 'zout') { V.scale = Math.max(0.4, Math.min(4, r2(V.scale * (k === 'zin' ? 1.2 : 1 / 1.2)))); relayout(); }
+      if (k === 'fitw' || k === 'fitp') { const vb = V.base, w = V.rot % 180 ? vb.height : vb.width, hh = V.rot % 180 ? vb.width : vb.height; V.scale = k === 'fitw' ? (scroller.clientWidth - 24) / w : Math.min((scroller.clientWidth - 24) / w, (scroller.clientHeight - 16) / hh); relayout(); }
+      if (k === 'rot') { V.rot = (V.rot + 90) % 360; relayout(); }
+      if (k === 'eye') { V.show = !V.show; el.innerHTML = P.toHtml(icon(V.show ? 'eye' : 'eye-off', 'sm')); V.pages.forEach((p) => p.rendered && drawAnn(p)); ui.toast(V.show ? 'Marcações visíveis' : 'Marcações ocultas (continuam salvas)'); }
+      if (k === 'read') { root.classList.toggle('reading'); if (root.classList.contains('reading')) ui.toast('Modo leitura: toque no centro da tela para mostrar os controles.'); }
+      if (k === 'fav') toggleFav();
+      if (k === 'side') toggleSide(el.dataset.p === V.side ? null : el.dataset.p);
+      if (k === 'menu') menu();
+    }
+    scroller.addEventListener('click', (e) => { if (!root.classList.contains('reading') || e.target.closest('.pv-cm, .pv-tx')) return; const r = scroller.getBoundingClientRect(); if (Math.abs(e.clientX - (r.left + r.width / 2)) < r.width / 4 && window.getSelection().isCollapsed) root.classList.toggle('show-ctl'); });
+    scroller.addEventListener('wheel', (e) => { if (!e.ctrlKey) return; e.preventDefault(); clearTimeout(V.wz); V.scale = Math.max(0.4, Math.min(4, V.scale * (e.deltaY < 0 ? 1.1 : 1 / 1.1))); $('[data-z]').textContent = Math.round(V.scale * 100) + '%'; V.wz = setTimeout(() => relayout(), 180); }, { passive: false });
+    sh.el.addEventListener('keydown', V.onKey = (e) => {
+      if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); }
+      else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
+      else if (mod && e.key.toLowerCase() === 'f') { e.preventDefault(); toggleSide('busca'); }
+      else if ((e.key === 'Delete' || e.key === 'Backspace') && V.sel) { const { pg, id } = V.sel; mutate(pg, (L) => L.splice(L.findIndex((z) => z.id === id), 1)); V.sel = null; redraw(pg); hidePops(); }
+      else if (e.key === 'Escape' && V.sel) { e.stopPropagation(); const n = V.sel.pg; V.sel = null; redraw(n); hidePops(); }
+      else if (e.key === '+' || e.key === '=') action('zin'); else if (e.key === '-') action('zout');
+    });
+
+    function toggleFav() {
+      const n = V.cur, i = V.favs.lista.findIndex((f) => +f.pagina === n);
+      if (i >= 0) { V.favs.lista.splice(i, 1); ui.toast(`Página ${n} saiu dos favoritos`); }
+      else { const t = (V.txt[n] && V.txt[n].s.trim().slice(0, 60)) || ''; V.favs.lista.push({ pagina: n, titulo: t || 'Página ' + n, criado: new Date().toISOString() }); ui.toast(`Página ${n} favoritada`); }
+      V.favs.lista.sort((a, b) => a.pagina - b.pagina); V.favDirty = true; V.changed = true; setCur(n); setState('aguardando'); clearTimeout(V.saveT); V.saveT = setTimeout(persist, 800);
+      if (V.side === 'favoritos') side();
+    }
+
+    // ---------- painel lateral: páginas, marcações, favoritos, busca ----------
+    function toggleSide(p) { V.side = p; const el = $('[data-side]'); el.hidden = !p; root.classList.toggle('side-open', !!p); if (p) side(); }
+    function side() {
+      const el = $('[data-side]'); if (!V.side) return;
+      const tabs = h`<div class="pv-tabs">${[['paginas', 'Páginas'], ['marcas', 'Marcações'], ['favoritos', 'Favoritos'], ['busca', 'Buscar']].map(([k, l]) => h`<button class="${V.side === k ? 'on' : ''}" data-a="side" data-p="${k}">${l}</button>`)}<button class="btn-icon sm" data-a="side" data-p="${V.side}" aria-label="Fechar painel">${icon('x', 'sm')}</button></div>`;
+      if (V.side === 'paginas') { el.innerHTML = P.toHtml(h`${tabs}<div class="pv-thumbs">${Array.from({ length: V.n }, (_, i) => h`<button class="pv-th ${i + 1 === V.cur ? 'on' : ''}" data-go-pg="${i + 1}"><canvas data-th="${i + 1}"></canvas><span>${i + 1}${V.favs.lista.some((f) => +f.pagina === i + 1) ? ' ★' : ''}${(V.ann[i + 1] || { itens: [] }).itens.length ? ' · ' + V.ann[i + 1].itens.length : ''}</span></button>`)}</div>`); thumbs(el); return; }
+      if (V.side === 'favoritos') { el.innerHTML = P.toHtml(h`${tabs}${V.favs.lista.length ? h`<div class="list">${V.favs.lista.map((f) => h`<button class="li tap" data-go-pg="${f.pagina}" style="width:100%;text-align:left"><span class="tile sm">${icon('bookmark', 'sm')}</span><span class="main"><span class="t">Página ${f.pagina}</span><span class="s">${f.titulo}</span></span></button>`)}</div>` : h`<p class="muted p-3" style="font-size:13px">Nenhum favorito. Use o botão ${icon('bookmark', 'xs')} na barra de baixo.</p>`}`); return; }
+      if (V.side === 'busca') {
+        el.innerHTML = P.toHtml(h`${tabs}<div class="p-2"><input class="input sm" data-sq placeholder="Buscar no texto do PDF" value="${V.search.q}"></div><div data-sres>${searchRes()}</div>`);
+        const i = el.querySelector('[data-sq]'); i.focus(); i.onkeydown = (e) => { if (e.key === 'Enter') doSearch(i.value); }; return;
+      }
+      const all = []; Object.entries(V.ann).forEach(([n, x]) => x.itens.forEach((a) => all.push({ n: +n, a })));
+      const f = V.filt, cores = [...new Set(all.map((x) => x.a.cor))];
+      const rows = all.filter(({ a }) => (!f.tipo || a.tipo === f.tipo) && (!f.cor || a.cor === f.cor) && (!f.q || P.norm((a.trecho || '') + ' ' + (a.texto || '')).includes(P.norm(f.q)))).sort((x, y) => x.n - y.n || (x.a.ordem || 0) - (y.a.ordem || 0));
+      el.innerHTML = P.toHtml(h`${tabs}<div class="p-2 stack"><input class="input sm" data-fq placeholder="Buscar nas marcações" value="${f.q}"><select class="input sm" data-ft><option value="">Todos os tipos</option>${Object.entries(TIPOS).map(([k, l]) => h`<option value="${k}" ${raw(f.tipo === k ? 'selected' : '')}>${l}</option>`)}</select>
+        <div class="row-sm wrap">${cores.map((c) => h`<button class="pv-sw ${f.cor === c ? 'on' : ''}" data-fc="${c}" style="background:${c}" aria-label="Filtrar cor ${c}"></button>`)}${f.cor ? h`<button class="fchip" data-fc="">todas as cores</button>` : ''}</div><span class="faint" style="font-size:12px">${rows.length} de ${all.length} marcação(ões)</span></div>
+        <div class="list">${rows.slice(0, 400).map(({ n, a }) => h`<button class="li tap" data-go-pg="${n}" data-aid="${a.id}" style="width:100%;text-align:left"><span class="pv-dot" style="background:${a.cor}"></span><span class="main"><span class="t">${(a.trecho || a.texto || TIPOS[a.tipo]).slice(0, 90)}</span><span class="s">p. ${n} · ${TIPOS[a.tipo]}</span></span></button>`)}</div>`);
+      el.querySelector('[data-fq]').oninput = P.debounce ? P.debounce((e) => { f.q = e.target.value; side(); el.querySelector('[data-fq]').focus(); }, 300) : (e) => { f.q = e.target.value; };
+      el.querySelector('[data-ft]').onchange = (e) => { f.tipo = e.target.value; side(); };
+      el.querySelectorAll('[data-fc]').forEach((b) => { b.onclick = () => { f.cor = b.dataset.fc; side(); }; });
+    }
+    async function thumbs(el) {
+      const ob = new IntersectionObserver((ents) => ents.forEach(async (en) => {
+        if (!en.isIntersecting) return; ob.unobserve(en.target); const n = +en.target.dataset.th;
+        try { const page = await V.doc.getPage(n), vp = page.getViewport({ scale: 110 / page.getViewport({ scale: 1 }).width, rotation: ((page.rotate || 0) + V.rot) % 360 }); en.target.width = vp.width; en.target.height = vp.height; await page.render({ canvasContext: en.target.getContext('2d'), viewport: vp }).promise; } catch (e) { /* miniatura opcional */ }
+      }), { root: el });
+      el.querySelectorAll('[data-th]').forEach((c) => ob.observe(c));
+    }
+    async function pageText(n) { if (V.ocr[n]) return V.ocr[n].texto; if (!V.txt[n]) { const pg = await V.doc.getPage(n), tc = await pg.getTextContent(); V.txt[n] = { tc, s: tc.items.map((x) => x.str).join(' ') }; } return V.txt[n].s; }
+    async function doSearch(q) {
+      V.search = { q, hits: [], busy: true }; const box = $('[data-sres]'); if (box) box.innerHTML = '<div class="skel m-2" style="height:60px"></div>';
+      const nq = P.norm(q).trim(); if (nq.length < 2) { V.search.busy = false; if (box) box.innerHTML = P.toHtml(searchRes()); return; }
+      for (let n = 1; n <= V.n && V.alive && V.search.q === q; n++) { const s = await pageText(n), ns = P.norm(s); let i = ns.indexOf(nq), k = 0; while (i >= 0 && k < 20) { V.search.hits.push({ n, snip: s.slice(Math.max(0, i - 40), i + nq.length + 50) }); i = ns.indexOf(nq, i + nq.length); k++; } }
+      V.search.busy = false; const b2 = $('[data-sres]'); if (b2) b2.innerHTML = P.toHtml(searchRes()); V.pages.forEach((p) => p.rendered && markHits(p));
+    }
+    function searchRes() { const S2 = V.search; if (!S2.q) return h`<p class="muted p-3" style="font-size:13px">Digite e tecle Enter. Em PDF digitalizado (só imagem) não há texto para buscar.</p>`; return h`<p class="faint p-2" style="font-size:12px">${S2.hits.length} resultado(s)${S2.hits.length >= 400 ? ' (mostrando 400)' : ''}</p><div class="list">${S2.hits.slice(0, 400).map((x) => h`<button class="li tap" data-go-pg="${x.n}" style="width:100%;text-align:left"><span class="main"><span class="t">…${x.snip}…</span><span class="s">p. ${x.n}</span></span></button>`)}</div>`; }
+    function markHits(pg) { const q = P.norm(V.search.q || '').trim(); pg.el.querySelectorAll('.textLayer span').forEach((s) => s.classList.toggle('hit', q.length >= 2 && P.norm(s.textContent).includes(q))); }
+
+    // ---------- menu ----------
+    // ---------- OCR de páginas digitalizadas ----------
+    const O = P.estOcr;
+    const ocrPref = () => ({ auto: P.settings.get('est.ocr_auto', true) !== false, motor: P.settings.get('est.ocr_motor', 'aparelho') });
+    async function ocrInit() {
+      try {
+        const r = await P.api.call('est.textGet', { material_id: m.id, ocr: true }, { timeout: 60000 });
+        Object.entries(r.ocr || {}).forEach(([n, x]) => { V.ocr[n] = { texto: (r.paginas || {})[n] || '', palavras: O.unpack(x.palavras), motor: x.motor, conf: x.conf, cache: true }; });
+        V.pages.forEach((pg) => { if (V.ocr[pg.i] && pg.rendered) { pg.rendered = false; render(pg); } });
+      } catch (e) { /* sem cache: o OCR roda quando precisar */ }
+      V.ocrReady = true; if (V.ocrQ.length) ocrPump();
+    }
+    /** Página sem camada de texto: entra na fila (a aberta primeiro, depois as demais em segundo plano). */
+    function ocrWant(n, force) {
+      if (V.ocr[n] || V.ocrStop && !force) return;
+      if (!force && !ocrPref().auto) { ocrStatus('sem texto · OCR desligado nas Preferências'); return; }
+      V.ocrQ = [n, ...V.ocrQ.filter((x) => x !== n)];
+      if (!V.ocrBg) { V.ocrBg = true; for (let i = 1; i <= V.n; i++) if (i !== n && !V.ocr[i] && !V.ocrQ.includes(i)) V.ocrQ.push(i); }
+      if (V.ocrReady) ocrPump();
+    }
+    function ocrStatus(t, cancel) {
+      const el = $('[data-ocrst]'); if (!el) return; el.hidden = !t;
+      el.innerHTML = t ? P.toHtml(h`${t}${cancel ? h` · <button type="button" data-ocr-stop>Cancelar</button>` : ''}`) : '';
+      const b = el.querySelector('[data-ocr-stop]'); if (b) b.onclick = () => { V.ocrStop = true; V.ocrQ = []; ocrStatus('OCR cancelado · ' + Object.keys(V.ocr).length + ' página(s) lidas'); };
+    }
+    async function ocrPump() {
+      if (V.ocrRun) return; V.ocrRun = true; V.ocrStop = false;
+      const total = () => Object.keys(V.ocr).length + V.ocrQ.length;
+      try {
+        while (V.alive && !V.ocrStop && V.ocrQ.length) {
+          const n = V.ocrQ.shift(); if (V.ocr[n]) continue;
+          const pg = V.pages[n - 1]; await ensurePage(pg);
+          if (!V.txt[n]) { const tc = await pg.page.getTextContent(); V.txt[n] = { tc, s: tc.items.map((x) => x.str).join(' ') }; }
+          if (!O.needsOcr(V.txt[n].s.replace(/\s/g, '').length)) continue;
+          ocrStatus(`lendo texto (OCR) ${Object.keys(V.ocr).length + 1}/${total()}`, true);
+          let r;
+          try { r = await O.page(pg.page, { motor: ocrPref().motor, material_id: m.id, pagina: n }); }
+          catch (e) { ocrStatus('OCR falhou: ' + (e.message || e)); V.ocrStop = true; break; }
+          if (!V.alive) break;
+          V.ocr[n] = { texto: r.texto, palavras: O.unpack(r.palavras), motor: r.motor, conf: r.conf };
+          V.ocrSave[n] = { texto: r.texto, ocr: { motor: r.motor, conf: r.conf, angulo: r.angulo, palavras: r.palavras } };
+          if (pg.rendered) { pg.rendered = false; render(pg); }
+          if (Object.keys(V.ocrSave).length >= 3 || !V.ocrQ.length) await ocrFlush();
+        }
+      } finally {
+        V.ocrRun = false; await ocrFlush();
+        if (!V.ocrStop && V.alive) { const k = Object.keys(V.ocr).length; ocrStatus(k ? `texto por OCR em ${k} página(s)` : ''); }
+      }
+    }
+    async function ocrFlush() {
+      const ks = Object.keys(V.ocrSave); if (!ks.length) return;
+      const paginas = {}, ocr = {}; ks.forEach((n) => { paginas[n] = V.ocrSave[n].texto; ocr[n] = V.ocrSave[n].ocr; }); V.ocrSave = {};
+      try { await P.api.call('est.textSave', { material_id: m.id, arquivo_id: m.arquivo_id, paginas, ocr, total: V.n }, { mutation: true, timeout: 90000 }); }
+      catch (e) { ks.forEach((n) => { V.ocrSave[n] = { texto: paginas[n], ocr: ocr[n] }; }); }
+    }
+    /** Camada de texto invisível com as palavras do OCR (seleção, busca e marcações de texto). */
+    function ocrLayer(pg) {
+      const tl = pg.el.querySelector('.textLayer'), o = V.ocr[pg.i], vp = pg.vp, vp0 = pg.page.getViewport({ scale: 1 });
+      tl.innerHTML = ''; const cx = (ocrLayer.cx = ocrLayer.cx || document.createElement('canvas').getContext('2d')), frag = document.createDocumentFragment();
+      (o.palavras || []).forEach((w) => {
+        const a = vp.convertToViewportPoint(...vp0.convertToPdfPoint(w.x, w.y)), b = vp.convertToViewportPoint(...vp0.convertToPdfPoint(w.x + w.w, w.y + w.h));
+        const x = Math.min(a[0], b[0]), y = Math.min(a[1], b[1]), ww = Math.abs(b[0] - a[0]), hh = Math.abs(b[1] - a[1]), fs = Math.max(4, hh * 0.9);
+        cx.font = `${fs}px sans-serif`; const mw = cx.measureText(w.t + ' ').width || 1;
+        const sp = document.createElement('span'); sp.textContent = w.t + ' '; sp.dataset.ocr = '1';
+        sp.style.cssText = `left:${x}px;top:${y}px;font-size:${fs}px;font-family:sans-serif;transform:scaleX(${(ww * 1.06 / mw).toFixed(3)})`;
+        frag.appendChild(sp);
+      });
+      tl.appendChild(frag);
+    }
+    /** Compara os dois motores na página aberta (tempo e texto), para escolher pelos números. */
+    async function ocrCompare() {
+      const n = V.cur, pg = V.pages[n - 1]; await ensurePage(pg);
+      const s2 = ui.sheet({ title: `Comparar OCR na página ${n}`, wide: true, body: h`<div data-cmp><div class="skel" style="height:120px"></div><p class="faint mt-2" style="font-size:12px">Rodando o OCR do aparelho e o do Google Drive…</p></div>` });
+      const out = {}; for (const mt of ['aparelho', 'drive']) { try { out[mt] = await O.page(pg.page, { motor: mt, material_id: m.id, pagina: n }); } catch (e) { out[mt] = { erro: e.message || String(e) }; } }
+      const nat = (V.txt[n] && V.txt[n].s.replace(/\s/g, '').length >= 40) ? V.txt[n].s : null;
+      const col = (k, l) => { const r = out[k]; return h`<div class="card pad"><b>${l}</b>${r.erro ? h`<p class="t-danger mt-2" style="font-size:13px">${r.erro}</p>` : h`<p class="faint mt-1" style="font-size:12px">${(r.ms / 1000).toFixed(1).replace('.', ',')} s · ${r.texto.split(/\s+/).filter(Boolean).length} palavras${r.conf != null ? ' · confiança ' + r.conf + '%' : ''}${nat ? ' · erro de palavras contra o texto do PDF ' + Math.round(O.wer(nat, r.texto) * 100) + '%' : ''}</p><pre class="ocr-pre mt-2">${r.texto.slice(0, 4000)}</pre>`}</div>`; };
+      const el = s2.$('[data-cmp]'); if (!el) return;
+      el.innerHTML = P.toHtml(h`<div class="grid g2">${col('aparelho', 'No aparelho (Tesseract.js, por)')}${col('drive', 'Google Drive (servidor)')}</div>${!out.aparelho.erro && !out.drive.erro ? h`<p class="faint mt-2" style="font-size:12px">Diferença entre os dois: ${Math.round(O.wer(out.drive.texto, out.aparelho.texto) * 100)}% das palavras. Sem texto original para comparar, confira um trecho à mão antes de escolher o motor em Preferências de Estudos.</p>` : ''}`);
+    }
+
+    function menu() {
+      const tot = Object.values(V.ann).reduce((s, x) => s + x.itens.length, 0), vis = toRanges(V.visit);
+      ui.menu(`${m.codigo} · ${tot} marcação(ões) · revisão ${V.rev}`, [
+        V.conflito ? { label: 'Resolver conflito de anotações', icon: 'alert', act: () => conflict(V.conflito) } : null,
+        V.pend ? { label: 'Tentar enviar as anotações agora', icon: 'refresh', act: () => { V.retry = 0; send(); } } : null,
+        { label: 'Imprimir ou baixar', sub: 'Original ou com as marcações; todas as páginas ou um intervalo', icon: 'file', act: async () => { await flushSave(); printSheet(m, { paginas: '', variante: Object.values(V.ann).some((x) => (x.itens || []).length) ? 'anotado' : 'original' }); } },
+        { label: 'Gerar PDF com as marcações', sub: 'Guarda no seu Drive e registra a revisão exata', icon: 'download', act: () => exportNow(true) },
+        E.tg() ? { label: 'Enviar cópia anotada para meu Telegram', icon: 'message', act: () => sendAnnotated(m) } : null,
+        { label: 'Marcar páginas como lidas', sub: vis ? 'Visitadas agora: ' + vis : 'Informe as páginas que você estudou', icon: 'check', act: markRead },
+        E.open() ? null : { label: 'Iniciar sessão de estudo com este material', icon: 'play', act: () => P.act['est.start']({ dataset: { mat: m.id, disc: m.disciplina_id || '' } }) },
+        { label: 'Resumo desta página', icon: 'edit', act: () => sendTo('resumo', '', V.cur) },
+        E.ia && E.ia.configurado ? { label: 'Resumir com IA', sub: 'Objetivo, direcionado ou detalhado; rascunho para conferir', icon: 'zap', act: () => E.resumoIA(m, { paginas: String(V.cur) }) } : null,
+        { label: V.ocr[V.cur] ? 'Refazer o OCR desta página' : 'Ler o texto desta página (OCR)', sub: V.ocr[V.cur] ? 'Lida por ' + V.ocr[V.cur].motor : 'Para página digitalizada (imagem)', icon: 'search', act: () => { delete V.ocr[V.cur]; V.ocrStop = false; ocrWant(V.cur, true); } },
+        { label: 'Comparar OCR: aparelho × Google Drive', sub: 'Tempo e texto lado a lado na página ' + V.cur, icon: 'layers', act: ocrCompare },
+        { label: 'Abrir no Google Drive', icon: 'external', act: () => E.openDrive(m.arquivo_id) }]);
+    }
+    function markRead() {
+      const vis = toRanges(V.visit);
+      ui.sheet({ title: 'Marcar páginas como lidas', body: h`<div class="field"><label>Páginas estudadas</label><input class="input" data-r placeholder="Ex.: 12-30, 35" value="${V.cur}"></div><p class="faint mt-2" style="font-size:12px">${vis ? `Você passou pelas páginas ${vis}. ` : ''}Só marque o que de fato estudou: passar pela página não conta como leitura.</p>`,
+        foot: h`<button class="btn btn-primary" data-ok>Marcar</button>`, onMount(s2) { s2.$('[data-ok]').onclick = async () => { const v = s2.$('[data-r]').value.trim(); if (!/^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/.test(v)) { ui.toast('Use páginas como 12-30, 35.', { error: true }); return; } try { const r = await P.api.call('est.readingSave', { material_id: m.id, marcar_lidas: v, total_paginas: V.n }, { mutation: true }); S.put('est_leitura', r.leitura); s2.close(); ui.toast('Páginas marcadas como lidas'); } catch (e) { ui.toast(e.message, { error: true }); } }; } });
+    }
+    async function syncText(range) { const set = new Set(); String(range).split(',').forEach((p) => { const [a, b] = p.split('-').map((z) => +z.trim()); for (let i = a; i <= (b || a); i++) if (i >= 1 && i <= V.n) set.add(i); }); const paginas = {}; for (const n of set) paginas[n] = await pageText(n); await P.api.call('est.textSave', { material_id: m.id, arquivo_id: m.arquivo_id, paginas, total: V.n }, { mutation: true }); }
+
+    /** Texto das páginas para a busca no Telegram e para a IA (em lotes, em segundo plano). */
+    async function extractText() {
+      const k = 'prumo.esttxt.' + m.arquivo_id; let from = +(localStorage.getItem(k) || 0);
+      if (from >= V.n || (m.texto_paginas && +m.texto_paginas >= V.n)) return;
+      while (V.alive && from < V.n) {
+        const paginas = {}, to = Math.min(V.n, from + 15);
+        for (let n = from + 1; n <= to; n++) { try { paginas[n] = await pageText(n); } catch (e) { paginas[n] = ''; } }
+        try { await P.api.call('est.textSave', { material_id: m.id, arquivo_id: m.arquivo_id, paginas, total: V.n }, { mutation: true, timeout: 90000 }); } catch (e) { return; }
+        from = to; try { localStorage.setItem(k, from); } catch (e) { /* ok */ }
+        await P.sleep(400);
+      }
+    }
+
+    async function exportNow(openAfter) {
+      await flushSave();
+      if (V.pend) { ui.toast('Ainda há anotações não enviadas ao servidor. Aguarde "salvo" para gerar a cópia.', { error: true }); return null; }
+      const ex = await exportIfNeeded(m, { force: true, bytes: V.bytesP, openAfter });
+      return ex;
+    }
+    async function flushSave() { clearTimeout(V.saveT); if (V.dirty.size || V.favDirty) await persist(); for (let i = 0; i < 40 && (V.sending || (V.pend && !V.conflito && V.state !== 'falha' && V.state !== 'offline')); i++) { if (!V.sending && V.pend) send(); await P.sleep(300); } }
+
+    async function close() {
+      V.ocrStop = true; V.ocrQ = []; ocrFlush(); P.estOcr && P.estOcr.stop();
+      V.alive = false; if (/^#\/est/.test(location.hash)) P.router.pendingRefresh = true; document.removeEventListener('selectionchange', V.onSel); if (io) io.disconnect(); clearTimeout(V.readT);
+      if (V.doc) saveReading();
+      try { await flushSave(); } catch (e) { /* fica na fila */ }
+      if (V.pend) ui.toast('Anotações guardadas neste aparelho. Serão enviadas quando houver conexão (ou ao reabrir o material).', { duration: 7000 });
+      else if (V.changed && P.settings.get('est.exportar_ao_sair', true) !== false) exportIfNeeded(m, { silent: true, background: true });
+      try { if (V.doc) V.doc.destroy(); } catch (e) { /* ok */ }
+    }
+  }
+
+  // ================= exportação com as marcações =================
+  const busy = {};
+  async function syncPendingFor(m) {
+    const key = m.id + '|' + m.arquivo_id, p = await idb.get('pend', key); if (!p || !p.paginas) return true;
+    try { await P.api.call('est.annSave', { material_id: m.id, arquivo_id: m.arquivo_id, paginas: p.paginas, base_revs: p.base_revs, favoritos: p.favoritos, op_id: p.op_id }, { mutation: true, timeout: 90000 }); await idb.del('pend', key); return true; }
+    catch (e) { return false; }
+  }
+  /** Gera e registra a cópia anotada da revisão atual, se ainda não existir. */
+  function exportIfNeeded(m, o = {}) {
+    if (!m || m.tipo !== 'pdf' || !m.arquivo_id) return Promise.resolve(null);
+    if (!o.force && P.settings.get('est.exportar_ao_sair', true) === false) return Promise.resolve(null);
+    if (busy[m.id]) return busy[m.id];
+    const t = o.silent ? null : ui.toast('Preparando a cópia anotada…', { duration: 600000 });
+    busy[m.id] = (async () => {
+      try {
+        if (!(await syncPendingFor(m))) throw new Error('Há anotações deste material guardadas só neste aparelho. Abra o material para sincronizar antes de exportar.');
+        const g = await P.api.call('est.annGet', { material_id: m.id, arquivo_id: m.arquivo_id }, { timeout: 90000 });
+        const tot = Object.values(g.doc.paginas || {}).reduce((s, x) => s + (x.itens || []).length, 0);
+        if (!tot && !(g.doc.favoritos || []).length) { if (o.force && !o.silent) ui.toast('Este material ainda não tem marcações.'); return null; }
+        const pronta = (g.exportacoes || []).find((e) => +e.revisao === +g.doc.revisao);
+        if (pronta) { S.put('est_exportacoes', pronta); if (o.openAfter) E.openDrive(pronta.arquivo_id); return pronta; }
+        if (t) t.set('Baixando o original…');
+        const bytes = await fetchBytes(m.arquivo_id);
+        if (t) t.set('Desenhando as marcações…');
+        const out = await build(m, g.doc, bytes);
+        if (t) t.set('Guardando no seu Drive…');
+        // um arquivo só por material: a revisão nova substitui o conteúdo da cópia anterior no Drive
+        const file = new File([out], `${m.codigo}_${String(m.titulo).replace(/[^\w\-]+/g, '_').slice(0, 50)}_anotado.pdf`, { type: 'application/pdf' });
+        const up = await E.upload(file, { destino: 'exportacoes', substituir: { material_id: m.id, tipo: 'anotado' }, onProgress: (p) => t && t.set(`Guardando no seu Drive… ${Math.round(p * 100)}%`) });
+        const arq = up.arquivo; if (!arq) throw new Error('O envio da cópia não terminou.');
+        S.put('arquivos', arq);
+        const r = await P.api.call('est.exportRegister', { material_id: m.id, arquivo_id: arq.id, revisao: g.doc.revisao, tipo: 'anotado' }, { mutation: true });
+        S.put('est_exportacoes', r.exportacao);
+        if (!r.atual && !o.silent) ui.toast('As anotações mudaram durante a exportação: esta cópia é da revisão ' + g.doc.revisao + '.', { duration: 7000 });
+        else if (!o.silent) ui.toast(`Cópia anotada pronta (revisão ${g.doc.revisao})`, o.openAfter ? { action: { label: 'Abrir', fn: () => E.openDrive(arq.id) } } : {});
+        return r.exportacao;
+      } catch (e) {
+        if (!o.silent) ui.toast(e.message || String(e), { error: true });
+        else if (o.background) P.reportError && P.reportError(e, 'est.export');
+        if (o.force) throw e; return null;
+      } finally { if (t) t.close(); delete busy[m.id]; }
+    })();
+    return busy[m.id];
+  }
+
+  /** Desenha as marcações sobre o PDF original (pontos do PDF; respeita /Rotate da página). */
+  async function build(m, doc, bytes) {
+    const L = await E.lib('pdflib');
+    const { PDFDocument, StandardFonts, rgb, degrees, BlendMode, LineCapStyle } = L;
+    let pdf;
+    try { pdf = await PDFDocument.load(bytes, { updateMetadata: false }); }
+    catch (e) { if (/encrypt/i.test(e.message || '')) throw new Error('Este PDF é protegido por senha/permissões: não é possível gerar a cópia anotada. As marcações continuam salvas no Prumo.'); throw new Error('Não consegui preparar a cópia: ' + e.message); }
+    const font = await pdf.embedFont(StandardFonts.Helvetica), bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+    const pages = pdf.getPages(), comments = [];
+    const col = (hx) => { const c = hexRgb(hx); return rgb(c[0], c[1], c[2]); };
+    Object.keys(doc.paginas || {}).map(Number).sort((a, b) => a - b).forEach((n) => {
+      const page = pages[n - 1]; if (!page) return;
+      const rot = ((page.getRotation().angle % 360) + 360) % 360, { R, D } = ROT[rot] || ROT[0];
+      const its = (doc.paginas[n].itens || []).slice().sort((a, b) => (a.ordem || 0) - (b.ordem || 0));
+      its.forEach((a) => {
+        const c = col(a.cor), op = a.opacidade || 1, w = a.espessura || 2;
+        try {
+          if (a.tipo === 'marca' || a.tipo === 'marca_texto') (a.rects || [a.rect]).forEach((r) => page.drawRectangle({ x: r[0], y: r[1], width: r[2] - r[0], height: r[3] - r[1], color: c, opacity: Math.min(op, 0.4), blendMode: BlendMode.Multiply }));
+          else if (a.tipo === 'sublinhado' || a.tipo === 'riscado') (a.rects || []).forEach((r) => { const e = edges(r, rot), s = a.tipo === 'sublinhado' ? e.bottom : e.mid; page.drawLine({ start: { x: s[0][0], y: s[0][1] }, end: { x: s[1][0], y: s[1][1] }, thickness: Math.max(0.8, w), color: c, opacity: op }); });
+          else if (a.tipo === 'caneta' || a.tipo === 'pincel') { let d = ''; for (let i = 0; i < a.pts.length; i += 2) d += (i ? 'L' : 'M') + a.pts[i] + ' ' + (-a.pts[i + 1]) + ' '; page.drawSvgPath(d, { x: 0, y: 0, borderColor: c, borderWidth: w, borderOpacity: a.tipo === 'pincel' ? Math.min(op, 0.5) : op, borderLineCap: LineCapStyle ? LineCapStyle.Round : undefined, blendMode: a.tipo === 'pincel' ? BlendMode.Multiply : undefined }); }
+          else if (a.tipo === 'linha' || a.tipo === 'seta') {
+            const p1 = { x: a.pts[0], y: a.pts[1] }, p2 = { x: a.pts[2], y: a.pts[3] };
+            page.drawLine({ start: p1, end: p2, thickness: w, color: c, opacity: op, lineCap: LineCapStyle ? LineCapStyle.Round : undefined });
+            if (a.tipo === 'seta') { const ang = Math.atan2(p2.y - p1.y, p2.x - p1.x), Lh = Math.max(6, w * 4); [0.45, -0.45].forEach((k) => page.drawLine({ start: p2, end: { x: p2.x - Lh * Math.cos(ang + k), y: p2.y - Lh * Math.sin(ang + k) }, thickness: w, color: c, opacity: op })); }
+          }
+          else if (a.tipo === 'retangulo') page.drawRectangle({ x: a.rect[0], y: a.rect[1], width: a.rect[2] - a.rect[0], height: a.rect[3] - a.rect[1], borderColor: c, borderWidth: w, borderOpacity: op });
+          else if (a.tipo === 'elipse') page.drawEllipse({ x: (a.rect[0] + a.rect[2]) / 2, y: (a.rect[1] + a.rect[3]) / 2, xScale: (a.rect[2] - a.rect[0]) / 2, yScale: (a.rect[3] - a.rect[1]) / 2, borderColor: c, borderWidth: w, borderOpacity: op });
+          else if (a.tipo === 'texto') {
+            const r = a.rect, fs = a.fonte || 12, tl = { 0: [r[0], r[3]], 90: [r[0], r[1]], 180: [r[2], r[1]], 270: [r[2], r[3]] }[rot] || [r[0], r[3]];
+            const boxW = rot % 180 ? r[3] - r[1] : r[2] - r[0], lines = [];
+            winAnsi(a.texto).split('\n').forEach((par) => { let cur = ''; par.split(' ').forEach((wd) => { const t2 = cur ? cur + ' ' + wd : wd; if (font.widthOfTextAtSize(t2, fs) > boxW - 4 && cur) { lines.push(cur); cur = wd; } else cur = t2; }); lines.push(cur); });
+            lines.forEach((ln, i) => { const lw = font.widthOfTextAtSize(ln, fs), off = a.alinhamento === 'center' ? (boxW - lw) / 2 : a.alinhamento === 'right' ? boxW - lw - 2 : 2, down = fs * (i + 1) * 1.2; page.drawText(ln, { x: tl[0] + R[0] * off + D[0] * down, y: tl[1] + R[1] * off + D[1] * down, size: fs, font, color: c, opacity: op, rotate: degrees(rot) }); });
+          }
+          else if (a.tipo === 'comentario') {
+            comments.push({ n, texto: a.texto || '', num: comments.length + 1 });
+            const r = a.rect, sz = Math.max(12, r[2] - r[0]);
+            page.drawRectangle({ x: r[0], y: r[3] - sz, width: sz, height: sz, color: c, opacity: 0.9 });
+            page.drawText(String(comments.length), { x: r[0] + 3, y: r[3] - sz + 3, size: 8, font: bold, color: rgb(0.1, 0.1, 0.1), rotate: degrees(rot) });
+          }
+        } catch (e) { console.warn('export item', n, a.tipo, e); }
+      });
+    });
+    // Apêndice: comentários e favoritos (o PDF original não tem onde mostrar texto longo)
+    const favs = doc.favoritos || [];
+    if (comments.length || favs.length) {
+      const A4 = [595.28, 841.89], M = 48; let pg = pdf.addPage(A4), y = A4[1] - M;
+      const line = (t, o2 = {}) => { const fs = o2.size || 10, f = o2.bold ? bold : font, maxW = A4[0] - 2 * M - (o2.indent || 0); const words = winAnsi(t).split(/\s+/); let cur = ''; const out = []; words.forEach((wd) => { const t2 = cur ? cur + ' ' + wd : wd; if (f.widthOfTextAtSize(t2, fs) > maxW && cur) { out.push(cur); cur = wd; } else cur = t2; }); out.push(cur); out.forEach((ln) => { if (y < M + fs) { pg = pdf.addPage(A4); y = A4[1] - M; } pg.drawText(ln, { x: M + (o2.indent || 0), y, size: fs, font: f, color: rgb(0.1, 0.1, 0.1) }); y -= fs * 1.35; }); };
+      line(`${m.codigo} · ${m.titulo}`, { size: 14, bold: true }); line(`Cópia anotada · revisão ${doc.revisao} das anotações · gerada em ${fmt.date(P.d.today())}`, { size: 9 }); y -= 8;
+      if (comments.length) { line('Comentários', { size: 12, bold: true }); comments.forEach((c) => { line(`${c.num}. Página ${c.n}`, { bold: true }); String(c.texto).split('\n').forEach((t) => line(t, { indent: 14 })); y -= 4; }); y -= 8; }
+      if (favs.length) { line('Páginas favoritas', { size: 12, bold: true }); favs.forEach((f) => line(`Página ${f.pagina}: ${f.titulo || ''}`)); }
+    }
+    pdf.setProducer('Prumo'); pdf.setModificationDate(new Date());
+    return pdf.save();
+  }
+
+  async function sendAnnotated(m) {
+    if (!E.tg()) { ui.toast('Conecte o seu Telegram em Configurações › Telegram.', { error: true }); return; }
+    try { const ex = await exportIfNeeded(m, { force: true }); if (!ex) return; await E.sendTg({ tipo: 'exportacao', id: ex.id }); }
+    catch (e) { /* a mensagem já foi exibida */ }
+  }
+
+  /** Envia anotações que ficaram só no aparelho (sem abrir o leitor). Conflitos ficam para quando o material for aberto. */
+  async function syncPending() {
+    if (!P.auth || !P.auth.token || !P.auth.token() || navigator.onLine === false) return;
+    const keys = await idb.keys('pend'); let ok = 0, falta = 0;
+    for (const k of keys) { const p = await idb.get('pend', k); if (!p || !p.material_id) continue; const m = { id: p.material_id, arquivo_id: p.arquivo_id }; if (await syncPendingFor(m)) ok++; else falta++; }
+    if (falta) ui.toast(`${falta} material(is) com anotações guardadas só neste aparelho. Abra-os para resolver.`, { duration: 8000 });
+    return { ok, falta };
+  }
+  window.addEventListener('online', () => setTimeout(syncPending, 3000));
+  setTimeout(() => { try { if (Object.keys(localStorage).some((k) => k.startsWith('prumo.estpend.'))) syncPending(); } catch (e) { /* ok */ } }, 12000);
+
+
+  // ================= imprimir e baixar (original ou anotado, todas as páginas ou um intervalo) =================
+  /** Bytes do PDF: original, ou com as marcações atuais desenhadas na hora (nunca uma cópia antiga). */
+  async function bytesFor(m, variante, onStep) {
+    const st = onStep || (() => {});
+    st('Baixando o original…');
+    const orig = await fetchBytes(m.arquivo_id);
+    if (variante !== 'anotado') return { bytes: orig, rev: null };
+    if (!(await syncPendingFor(m))) throw new Error('Há anotações deste material guardadas só neste aparelho. Abra o material para sincronizar antes de imprimir a versão anotada.');
+    const g = await P.api.call('est.annGet', { material_id: m.id, arquivo_id: m.arquivo_id }, { timeout: 90000 });
+    const tot = Object.values(g.doc.paginas || {}).reduce((a, x) => a + (x.itens || []).length, 0);
+    if (!tot) throw new Error('Este material ainda não tem marcações: escolha o original.');
+    st('Desenhando as marcações…');
+    return { bytes: await build(m, g.doc, orig), rev: g.doc.revisao };
+  }
+  /** Só as páginas pedidas (ex.: "3-7, 10"), na ordem. */
+  async function subset(bytes, range) {
+    if (!range) return bytes;
+    const { PDFDocument } = await E.lib('pdflib');
+    const src = await PDFDocument.load(bytes, { updateMetadata: false, ignoreEncryption: true }), n = src.getPageCount(), idx = [];
+    String(range).split(',').forEach((p) => { const [a, b] = p.split('-').map((z) => +String(z).trim()); if (!a) return; for (let i = a; i <= (b || a); i++) if (i >= 1 && i <= n && !idx.includes(i - 1)) idx.push(i - 1); });
+    if (!idx.length) throw new Error('Nenhuma página válida nesse intervalo (o PDF tem ' + n + ' páginas).');
+    const out = await PDFDocument.create(), pages = await out.copyPages(src, idx); pages.forEach((pg) => out.addPage(pg));
+    return out.save();
+  }
+  function printSheet(m, o = {}) {
+    if (!m || m.tipo !== 'pdf' || !m.arquivo_id) { ui.toast('Este material não tem PDF.', { error: true }); return null; }
+    const st = { v: o.variante || 'original', modo: o.paginas ? 'intervalo' : 'todas', r: o.paginas || '' };
+    const s = ui.sheet({ title: 'Imprimir ou baixar · ' + m.codigo, body: h`<div data-pb></div>`, foot: h`<button type="button" class="btn btn-ghost" data-dl>${icon('download', 'sm')}Baixar</button><button type="button" class="btn btn-primary" data-pr>${icon('file', 'sm')}Imprimir</button>` });
+    const draw = () => {
+      s.$('[data-pb]').innerHTML = P.toHtml(h`<div class="form">
+        <div class="field full"><label>Versão</label><div class="seg" role="radiogroup"><button type="button" role="radio" aria-checked="${st.v === 'original'}" class="${st.v === 'original' ? 'on' : ''}" data-v="original">Original</button><button type="button" role="radio" aria-checked="${st.v === 'anotado'}" class="${st.v === 'anotado' ? 'on' : ''}" data-v="anotado">Com as marcações</button></div>
+          <span class="hint">${st.v === 'anotado' ? 'Desenhada agora com as marcações atuais (não usa cópia antiga).' : 'O arquivo como foi enviado.'}</span></div>
+        <div class="field full"><label>Páginas</label><div class="seg" role="radiogroup"><button type="button" role="radio" aria-checked="${st.modo === 'todas'}" class="${st.modo === 'todas' ? 'on' : ''}" data-m="todas">Todas${m.paginas ? ' (' + m.paginas + ')' : ''}</button><button type="button" role="radio" aria-checked="${st.modo === 'intervalo'}" class="${st.modo === 'intervalo' ? 'on' : ''}" data-m="intervalo">Intervalo</button></div>
+          ${st.modo === 'intervalo' ? h`<input class="input mt-2" data-r value="${st.r}" placeholder="Ex.: 3-7, 10" inputmode="numeric" aria-label="Intervalo de páginas">` : ''}</div>
+        <p class="faint full" data-stp style="font-size:12px"></p></div>`);
+      s.$$('[data-v]').forEach((b) => { b.onclick = () => { st.v = b.dataset.v; draw(); }; });
+      s.$$('[data-m]').forEach((b) => { b.onclick = () => { st.r = (s.$('[data-r]') || {}).value || st.r; st.modo = b.dataset.m; draw(); }; });
+    };
+    const go = async (acao, btn) => {
+      const r = st.modo === 'intervalo' ? ((s.$('[data-r]') || {}).value || '').trim() : '';
+      if (st.modo === 'intervalo' && !/^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/.test(r)) { ui.toast('Use páginas como 3-7, 10.', { error: true }); return; }
+      btn.classList.add('loading'); const stp = (t) => { const el = s.$('[data-stp]'); if (el) el.textContent = t; };
+      try {
+        const b0 = await bytesFor(m, st.v, stp); stp(r ? 'Separando as páginas ' + r + '…' : '');
+        const out = await subset(b0.bytes, r);
+        const nome = `${m.codigo}_${String(m.titulo).replace(/[^\w\-]+/g, '_').slice(0, 50)}${st.v === 'anotado' ? '_anotado_rev' + b0.rev : ''}${r ? '_p' + r.replace(/\s/g, '').replace(/,/g, '_') : ''}.pdf`;
+        if (acao === 'imprimir') P.rep.print(out, nome); else { P.rep.save(out, nome, 'application/pdf'); ui.toast('PDF baixado: ' + nome, { icon: 'download' }); }
+        s.close();
+      } catch (e) { stp(''); ui.toast(e.message || String(e), { error: true }); } finally { btn.classList.remove('loading'); }
+    };
+    s.$('[data-pr]').onclick = (ev) => go('imprimir', ev.currentTarget);
+    s.$('[data-dl]').onclick = (ev) => go('baixar', ev.currentTarget);
+    draw();
+    return s;
+  }
+
+  P.estPdf = { _V: () => window.__estV, open: (m, o) => E.ensure().then(() => open(m, o)), loadLib, fetchBytes, visited: (mid) => toRanges(visitMap[mid] || new Set()), exportIfNeeded, sendAnnotated, syncPending, printSheet, bytesFor, subset, _build: build, _edges: edges };
+})();
+</script>

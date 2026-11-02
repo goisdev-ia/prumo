@@ -1,0 +1,316 @@
+<script>
+/* Prumo · Configurações: perfil (foto), aparência, preferências, notificações, segurança (PIN), dados e backup,
+   integrações, arquivos, logs e diagnóstico. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const st = { logs: { nivel: '', modulo: '', q: '', de: '', ate: '', offset: 0 }, logRes: null, fileTipo: '' };
+  const TIPOS = [['', 'Todos'], ['comprovante', 'Comprovantes'], ['foto_progresso', 'Progresso'], ['rotulo', 'Rótulos'], ['foto_perfil', 'Perfil'], ['outro', 'Outros']];
+
+  const section = (to, ic, title, sub) => h`<a class="li tap" href="#/${to}"><span class="tile">${icon(ic)}</span><span class="main"><span class="t">${title}</span><span class="s">${sub}</span></span>${icon('chev-r', 'sm faint')}</a>`;
+  const back = h`<a href="#/cfg" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Configurações</a>`;
+  const toggleRow = (key, label, hint, def) => h`<div class="li"><span class="main"><span class="t">${label}</span>${hint ? h`<span class="s" style="white-space:normal">${hint}</span>` : ''}</span><label class="toggle"><input type="checkbox" data-on-change="cfg.toggle" data-key="${key}" ${P.settings.get(key, def) ? raw('checked') : ''}><span></span></label></div>`;
+  const numRow = (key, label, def, unit, min, max) => h`<div class="li"><span class="main"><span class="t">${label}</span></span><span class="input-wrap" style="width:140px"><input class="input num" inputmode="numeric" value="${P.settings.get(key, def)}" data-on-change="cfg.num" data-key="${key}" data-min="${min}" data-max="${max}" aria-label="${label}">${unit ? h`<span class="suffix">${unit}</span>` : ''}</span></div>`;
+
+  P.screen('cfg', {
+    mod: 'cfg', tab: 'geral', title: 'Configurações',
+    render() {
+      return h`<div class="page-head"><div><h1>Configurações</h1><p>Conectado como ${P.bootInfo ? P.bootInfo.email : ''}</p></div><div class="row-sm"><button class="btn btn-ghost" data-act="auth.logout">${icon('logout', 'sm')}Sair</button></div></div>
+        <div class="dash"><div class="span-6"><div class="list cardlist">
+          ${section('cfg/perfil', 'user', 'Perfil', 'Foto, nome, nascimento, altura')}${section('cfg/aparencia', 'sun', 'Aparência', 'Tema escuro, claro ou automático')}
+          ${section('cfg/preferencias', 'sliders', 'Preferências', 'Semana, metas diárias, timers')}${section('cfg/notificacoes', 'bell', 'Notificações', 'Push no celular, resumo diário e e-mail')}${section('tar/alarmes', 'alarm', 'Alarmes', 'Água, refeições, remédios e tarefas')}${section('cfg/telegram', 'message', 'Telegram', 'Avisos e resumo do dia no Telegram (grátis)')}${section('cfg/telegram/comandos', 'list', 'Comandos do Telegram', 'Tudo que o bot entende hoje, com exemplos')}${section('est/prefs', 'book', 'Estudos', 'Revisões, leitor de PDF, avisos de estudo, IA opcional')}
+          ${section('cfg/seguranca', 'lock', 'Segurança', P.me.tem_pin ? 'PIN ativo' : 'PIN e bloqueio por inatividade')}</div></div>
+        <div class="span-6"><div class="list cardlist">
+          ${section('cfg/dados', 'database', 'Dados e backup', 'Exportar, restaurar, modo demonstração')}${section('cfg/integracoes', 'link', 'Integrações', 'Google Agenda, Open Food Facts, gatilhos')}
+          ${section('cfg/arquivos', 'folder', 'Arquivos', 'Comprovantes, fotos e rótulos no Drive')}${section('cfg/logs', 'history', 'Logs', 'Auditoria e erros')}
+          ${section('cfg/sobre', 'info', 'Sobre e diagnóstico', 'Versão ' + ((P.bootInfo && P.bootInfo.version) || ''))}</div></div></div>`;
+    }
+  });
+
+  P.screen('cfg/perfil', {
+    mod: 'cfg', tab: 'perfil', title: 'Perfil',
+    render() {
+      const me = P.me;
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Perfil</h1></div></div>
+        <div class="dash"><div class="card pad-lg span-4" style="text-align:center"><div style="display:inline-block;position:relative">${ui.avatar(me, 'lg')}<button class="btn-icon filled sm" data-act="cfg.photo" aria-label="Trocar foto" style="position:absolute;right:-4px;bottom:-4px;border:2px solid var(--surface-1)">${icon('camera', 'sm')}</button></div>
+          <h2 class="mt-3">${me.nome || ''}</h2><p class="muted">${me.email}</p>
+          <button class="btn btn-ghost btn-sm mt-3" data-act="auth.logout">${icon('logout', 'sm')}Sair desta conta</button>
+          ${me.altura_cm && P.fit && P.fit.latestWeight() ? h`<div class="row-sm" style="justify-content:center;margin-top:12px"><span class="chip">${fmt.num(P.fit.latestWeight(), 1)} kg</span><span class="chip">${fmt.num(me.altura_cm / 100, 2)} m</span>${me.nascimento ? h`<span class="chip">${D.age(me.nascimento)} anos</span>` : ''}</div>` : ''}</div>
+        <div class="card span-8"><form class="form" id="prof" novalidate>${P.form.html(PROF_FIELDS, me)}<button class="btn btn-primary" data-act="cfg.saveProfile">${icon('check', 'sm')}Salvar perfil</button></form></div></div>`;
+    },
+    mount(root) { P.form.bind(root.querySelector('#prof'), PROF_FIELDS); }
+  });
+  const PROF_FIELDS = [{ k: 'nome', l: 'Nome', t: 'text', req: true, max: 80 }, { k: 'email', l: 'E-mail de acesso', t: 'text', ro: true },
+    { k: 'nascimento', l: 'Nascimento', t: 'date', half: true }, { k: 'sexo', l: 'Sexo (para as fórmulas)', t: 'select', half: true, opts: [['masculino', 'Masculino'], ['feminino', 'Feminino'], ['outro', 'Outro']] },
+    { k: 'altura_cm', l: 'Altura', t: 'num', unit: 'cm', half: true, min: 80, max: 250 }, { k: 'unidade_peso', l: 'Unidade de peso', t: 'select', half: true, req: true, opts: [['kg', 'Quilos (kg)'], ['lb', 'Libras (lb)']] }];
+
+  P.screen('cfg/aparencia', {
+    mod: 'cfg', tab: 'aparencia', title: 'Aparência',
+    render() {
+      const mode = P.theme.mode;
+      const opt = (v, l, ic, bg, fg, acc) => h`<button class="card link theme-opt ${mode === v ? 'on' : ''}" data-act="cfg.theme" data-v="${v}"><div class="theme-prev" style="background:${bg};color:${fg}"><span style="background:${acc}"></span><i style="background:${fg}"></i><i style="background:${fg};width:60%"></i></div><div class="row-sm mt-3">${icon(ic, 'sm')}<b>${l}</b>${mode === v ? icon('check-circle', 'sm accent') : ''}</div></button>`;
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Aparência</h1><p>Aplicado na hora, salvo no seu perfil.</p></div></div>
+        <div class="grid g3">${opt('dark', 'Escuro', 'moon', '#1A1A1A', '#FFF3D6', '#F2B705')}${opt('light', 'Claro', 'sun', '#FFFFFF', '#1A1A1A', '#F2B705')}${opt('auto', 'Automático', 'monitor', 'linear-gradient(90deg,#1A1A1A 50%,#FFF9EA 50%)', '#9A9A9A', '#F2B705')}</div>`;
+    }
+  });
+
+  P.screen('cfg/preferencias', {
+    mod: 'cfg', tab: 'preferencias', title: 'Preferências',
+    render() {
+      const ws = +P.settings.get('geral.inicio_semana', P.me.inicio_semana || 0);
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Preferências</h1></div></div>
+        <div class="dash"><div class="span-6"><div class="group-h">Geral</div><div class="list cardlist">
+          <div class="li"><span class="main"><span class="t">A semana começa no</span></span>${ui.seg([[0, 'Domingo'], [1, 'Segunda']], ws, 'cfg.weekStart', { cls: 'sm' })}</div>
+          <div class="li"><span class="main"><span class="t">Moeda</span><span class="s">Real brasileiro (R$)</span></span></div></div>
+          <div class="group-h">Fitness</div><div class="list cardlist">${numRow('fit.meta_passos', 'Meta de passos por dia', 8000, 'passos', 1000, 50000)}${numRow('fit.meta_treinos_semana', 'Treinos por semana', 4, '', 1, 14)}${toggleRow('fit.som', 'Som nos timers', 'Bip ao fim do descanso e nas trocas do intervalado', true)}</div></div>
+        <div class="span-6"><div class="group-h">Alimentação</div><div class="list cardlist">${toggleRow('nut.somar_exercicio', 'Somar calorias do treino', 'As calorias gastas aumentam as restantes do dia', true)}<div class="li tap" data-act="nut.waterGoal"><span class="main"><span class="t">Meta de água por dia</span><span class="s">${P.nut ? fmt.num(P.nut.waterGoal() / 1000, 1) + ' L' + (+P.settings.get('nut.meta_agua_ml', 0) >= 500 ? ' (escolhida por você)' : ' (automática, 35 ml/kg)') : ''}</span></span>${icon('chev-r', 'sm')}</div></div>
+          <div class="group-h">Tarefas</div><div class="list cardlist">${numRow('tar.pomodoro_min', 'Duração do Pomodoro', 25, 'min', 5, 120)}${numRow('tar.pausa_min', 'Pausa curta', 5, 'min', 1, 60)}</div></div></div>`;
+    }
+  });
+
+  P.screen('cfg/notificacoes', {
+    mod: 'cfg', tab: 'notificacoes', title: 'Notificações',
+    render() {
+      const ps = P.pwa.state, pu = ps.push, url = P.pwa.url();
+      let push;
+      if (!ps.inShell) {
+        push = h`<div class="card pad-lg"><div class="row"><span class="tile" style="background:var(--primary-tint);color:var(--primary-ink)">${icon('bell')}</span><div class="grow"><b>Notificações no celular</b><p class="muted mt-1" style="font-size:13.5px">Para receber lembretes com o app fechado, abra o Prumo pelo <b>app instalado</b> e ative aqui. Pelo link do Google o navegador não deixa.</p></div></div>
+          ${url ? h`<div class="row-sm mt-4"><a class="btn btn-primary" href="${url}" target="_blank" rel="noopener">${icon('external', 'sm')}Abrir o app instalável</a><button class="btn btn-ghost" data-act="cfg.copyPwa">${icon('copy', 'sm')}Copiar link</button></div>` : h`<p class="faint mt-3" style="font-size:12.5px">O link do app instalável ainda não foi configurado (CONFIG.PWA_URL).</p>`}</div>`;
+      } else if (!pu.supported) {
+        push = h`<div class="card pad-lg"><b>Este aparelho não aceita push</b><p class="muted mt-1" style="font-size:13.5px">No iPhone, o push só funciona com o Prumo adicionado à Tela de Início (iOS 16.4 ou mais novo). No Android, use o Chrome.</p></div>`;
+      } else {
+        const on = pu.subscribed && pu.permission === 'granted';
+        push = h`<div class="card pad-lg"><div class="row"><span class="tile" style="background:${on ? 'var(--success-tint)' : 'var(--primary-tint)'};color:${on ? 'var(--success)' : 'var(--primary-ink)'}">${icon(on ? 'check' : 'bell')}</span><div class="grow"><b>${on ? 'Push ativo neste aparelho' : pu.permission === 'denied' ? 'Notificações bloqueadas' : 'Ativar notificações neste aparelho'}</b>
+          <p class="muted mt-1" style="font-size:13.5px">${on ? 'Lembretes de tarefas, rotinas, eventos, contas e metas aparecem mesmo com o app fechado.' : pu.permission === 'denied' ? 'Libere as notificações do Prumo nas configurações do celular e volte aqui.' : 'Avisos de tarefas, rotinas, contas a vencer e metas, mesmo com o app fechado.'}</p></div></div>
+          <div class="row-sm mt-4">${on ? h`<button class="btn btn-ghost" data-act="cfg.pushTest">${icon('bell', 'sm')}Enviar teste</button><button class="btn btn-ghost" data-act="cfg.pushOff">Desativar</button>` : pu.permission === 'denied' ? '' : h`<button class="btn btn-primary" data-act="cfg.pushOn">${icon('bell', 'sm')}Ativar notificações</button>`}</div></div>`;
+      }
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Notificações</h1><p>No celular (push), na central do app e por e-mail.</p></div></div>
+        <div class="dash"><div class="span-6">${push}
+          <div class="group-h mt-4">O que avisar</div><div class="list cardlist">${toggleRow('notif.push', 'Push no celular', 'Liga ou desliga o envio para todos os seus aparelhos', true)}${toggleRow('notif.rotinas', 'Início das rotinas', 'Aviso quando uma rotina com horário está para começar', true)}${toggleRow('nut.lembrete_agua', 'Lembrete de água no app', 'Aviso à tarde quando estiver abaixo da metade da meta', true)}</div></div>
+        <div class="span-6"><div class="group-h">E-mail</div><div class="list cardlist">${toggleRow('notif.email', 'Lembretes por e-mail', 'Tarefas com horário de lembrete', true)}${toggleRow('notif.resumo', 'Resumo do dia às 7h', 'Tarefas, contas a vencer, treino e rotinas do dia', true)}</div>
+          <p class="faint mt-3" style="font-size:12.5px">Os avisos são conferidos a cada 15 minutos, e o resumo sai às 7h.</p></div></div>`;
+    }
+  });
+
+  P.screen('cfg/seguranca', {
+    mod: 'cfg', tab: 'seguranca', title: 'Segurança',
+    render() {
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Segurança</h1></div></div>
+        <div class="list cardlist"><div class="li"><span class="tile">${icon('lock')}</span><span class="main"><span class="t">PIN de acesso</span><span class="s">${P.me.tem_pin ? 'Ativo' : 'Desativado'} · pedido ao abrir e após inatividade</span></span><button class="btn btn-ghost btn-sm" data-act="cfg.pin">${P.me.tem_pin ? 'Alterar' : 'Criar PIN'}</button></div>
+          ${P.me.tem_pin ? h`${numRow('seg.bloqueio_min', 'Bloquear após inatividade', 10, 'min', 1, 240)}<div class="li"><span class="main"><span class="t">Remover PIN</span></span><button class="btn btn-danger btn-sm" data-act="cfg.pinOff">Remover</button></div>` : ''}</div>
+        <p class="faint mt-4" style="font-size:12.5px">O Web App roda com a sua conta Google e só você tem acesso (implantação "Somente eu"). O PIN protege o app aberto num aparelho compartilhado; ele é guardado como hash.</p>`;
+    }
+  });
+
+  P.screen('cfg/dados', {
+    mod: 'cfg', tab: 'dados', title: 'Dados e backup',
+    render() {
+      const demo = P.bootInfo && P.bootInfo.hasDemo;
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Dados e backup</h1></div></div>
+        <div class="dash"><div class="span-6"><div class="group-h">Backup</div><div class="list cardlist">
+          <div class="li"><span class="tile">${icon('database')}</span><span class="main"><span class="t">Backup da planilha agora</span><span class="s">Cópia completa na pasta "backups" (mantém as últimas ${P.settings.get('sys.backups_manter', 8)}). Também roda todo domingo.</span></span><button class="btn btn-ghost btn-sm" data-act="cfg.backup">Fazer</button></div>
+          <div class="li"><span class="tile">${icon('download')}</span><span class="main"><span class="t">Exportar tudo (JSON)</span><span class="s">Seus dados de todos os módulos, na pasta "exportacoes"</span></span><button class="btn btn-ghost btn-sm" data-act="cfg.export">Exportar</button></div>
+          <div class="li"><span class="tile">${icon('upload')}</span><span class="main"><span class="t">Restaurar de um JSON</span><span class="s">Adiciona o que não existe; não apaga nada</span></span><button class="btn btn-ghost btn-sm" data-act="cfg.import">Escolher</button></div></div></div>
+        <div class="span-6"><div class="group-h">Modo demonstração</div><div class="list cardlist"><div class="li"><span class="tile">${icon('layers')}</span><span class="main"><span class="t">${demo ? 'Dados de exemplo carregados' : 'Carregar dados de exemplo'}</span><span class="s">3 meses de finanças, 12 semanas de treino e peso, diário, tarefas, metas e rotinas. Removível a qualquer momento.</span></span>${demo ? h`<button class="btn btn-danger btn-sm" data-act="cfg.demoOff">Remover</button>` : h`<button class="btn btn-primary btn-sm" data-act="cfg.demo">Carregar</button>`}</div></div>
+          <div class="group-h">Manutenção</div><div class="list cardlist">${numRow('sys.log_retencao_dias', 'Guardar logs por', 90, 'dias', 7, 3650)}${numRow('sys.upload_max_mb', 'Tamanho máximo de upload', 10, 'MB', 1, 25)}
+          <div class="li"><span class="main"><span class="t">Limpar cache</span><span class="s">Força recarregar tudo da planilha</span></span><button class="btn btn-ghost btn-sm" data-act="cfg.clearCache">Limpar</button></div></div></div></div>`;
+    }
+  });
+
+  P.screen('cfg/integracoes', {
+    mod: 'cfg', tab: 'integracoes', title: 'Integrações',
+    render() {
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Integrações</h1></div></div>
+        <div class="list cardlist">${toggleRow('int.calendar', 'Google Agenda', 'Permite enviar eventos da Agenda do Prumo para o seu Google Agenda', false)}${toggleRow('int.off', 'Open Food Facts', 'Consulta produtos pelo código de barras numa base aberta', true)}
+          <div class="li"><span class="main"><span class="t">Gatilhos automáticos</span><span class="s">Resumo diário, recorrências, lembretes e backup semanal</span></span><button class="btn btn-ghost btn-sm" data-act="cfg.triggers">Reinstalar</button></div></div>`;
+    }
+  });
+
+  P.screen('cfg/sobre', {
+    mod: 'cfg', tab: 'sobre', title: 'Sobre e diagnóstico',
+    render() {
+      const tests = [['TMB homem 80kg/180cm/30a', P.calc.bmr({ peso: 80, altura: 180, idade: 30, sexo: 'masculino' }) === 1780], ['1RM Epley 100×5', P.calc.oneRm(100, 5).epley === 116.7], ['Fatura após fechamento', P.calc.invoiceFor('2026-10-05', 3, 10).competencia === '2026-11'], ['Meta de reduzir', P.calc.goalProgress({ valor_inicial: 90, valor_alvo: 80 }, 85) === 50]];
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Sobre e diagnóstico</h1></div><button class="btn btn-primary btn-sm" data-act="cfg.diag">${icon('refresh', 'sm')}Testar ambiente</button></div>
+        <div class="dash"><div class="card span-5"><div class="row"><span class="logo-tile" style="width:52px;height:52px">${P.logo({ tile: true })}</span><div><h2>Prumo</h2><p class="muted">Versão ${(P.bootInfo && P.bootInfo.version) || ''} · Apps Script + Sheets + Drive</p></div></div>
+          <div class="kv mt-4"><span>Conta</span><b>${(P.bootInfo && P.bootInfo.email) || ''}</b></div><div class="kv"><span>Fuso</span><b>America/Sao_Paulo</b></div><div class="kv"><span>Registros carregados</span><b>${fmt.num(P.sum(Object.keys(P.bootInfo ? P.bootInfo.tables : {}), (k) => S.all(k).length))}</b></div>
+          <div class="group-h">Cálculos (autoteste)</div>${tests.map(([l, ok]) => h`<div class="kv"><span>${l}</span><b class="${ok ? 'pos' : 'neg'}">${icon(ok ? 'check' : 'x', 'xs')}</b></div>`)}</div>
+        <div class="card span-7" id="diag">${ui.empty({ ill: 'search', title: 'Clique em "Testar ambiente"', text: 'Verifica planilha, pasta do Drive, OCR, gatilhos e cota de e-mail.', small: true })}</div></div>`;
+    }
+  });
+
+  // ---------- Logs ----------
+  const logList = () => {
+    const r = st.logRes;
+    if (!r) return ui.skeleton();
+    if (!r.items.length) return ui.empty({ ill: 'search', title: 'Nenhum log com esses filtros', small: true });
+    const cls = { error: 'down', warn: 'acc', audit: 'info', info: '' };
+    return h`<div class="list cardlist">${r.items.map((l, i) => h`<div class="li tap" data-act="cfg.logOpen" data-i="${i}"><span class="chip ${cls[l.nivel]}" style="width:56px;justify-content:center">${l.nivel}</span><span class="main"><span class="t">${l.acao || '—'}${l.entidade ? h` <span class="faint">· ${l.entidade}</span>` : ''}</span><span class="s">${l.mensagem ? String(l.mensagem).split('\n')[0] : l.modulo} · ${fmt.rel(l.ts)}</span></span></div>`)}</div>
+      <div class="row between mt-3"><span class="muted" style="font-size:13px">${st.logs.offset + 1}–${st.logs.offset + r.items.length} de ${r.total}</span><div class="row-sm"><button class="btn btn-ghost btn-sm" data-act="cfg.logPage" data-v="-1" ${st.logs.offset ? '' : raw('disabled')}>Anterior</button><button class="btn btn-ghost btn-sm" data-act="cfg.logPage" data-v="1" ${st.logs.offset + r.items.length < r.total ? '' : raw('disabled')}>Próxima</button></div></div>`;
+  };
+  P.cfgLogs = () => ({ ...st.logs });
+  const loadLogs = async () => {
+    try { st.logRes = await P.api.call('logs.list', { ...st.logs, limit: 50 }); }
+    catch (e) { st.logRes = { items: [], total: 0 }; ui.toast(e.message, { error: true }); }
+    const el = document.getElementById('log-list'); if (el) el.innerHTML = P.toHtml(logList());
+  };
+  P.screen('cfg/logs', {
+    mod: 'cfg', tab: 'logs', title: 'Logs',
+    render() {
+      const f = st.logs;
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Logs</h1><p>Auditoria de alterações e erros do servidor e do app</p></div><div class="row-sm">${P.rep.button('logs')}<button class="btn btn-ghost btn-sm" data-act="cfg.logPurge">${icon('trash', 'sm')}Limpar antigos</button></div></div>
+        <div class="stack-sm">${ui.chips([['', 'Todos'], ['audit', 'Auditoria'], ['error', 'Erros'], ['warn', 'Avisos'], ['info', 'Info']], f.nivel, 'cfg.logNivel')}
+          <div class="form-row"><div class="search field full">${icon('search')}<input class="input" placeholder="Buscar ação, entidade ou mensagem" value="${f.q}" data-on-input="cfg.logQ"></div>
+          <div class="field"><label>Módulo</label><select class="input" data-on-change="cfg.logMod"><option value="">Todos</option>${['financas', 'fitness', 'alimentacao', 'tarefas', 'metas', 'rotinas', 'arquivos', 'ocr', 'sistema', 'cliente', 'auth'].map((m) => h`<option value="${m}" ${f.modulo === m ? raw('selected') : ''}>${m}</option>`)}</select></div>
+          <div class="field"><label>De</label><input class="input" type="date" value="${f.de}" data-on-change="cfg.logDe"></div></div></div>
+        <div id="log-list" class="mt-3">${logList()}</div>`;
+    },
+    mount() { if (!st.logRes) loadLogs(); }
+  });
+
+  // ---------- Arquivos ----------
+  P.screen('cfg/arquivos', {
+    mod: 'cfg', tab: 'arquivos', title: 'Arquivos', deps: ['arquivos'],
+    render() {
+      const fk = 'cfg.arq', fo = { def: 'tudo', modes: ['mes', 'ano', 'intervalo', 'tudo'] };
+      const rows = P.pf.filter(fk, S.all('arquivos').filter((a) => (!st.fileTipo || a.tipo === st.fileTipo) && P.flt.match(fk, a.nome, a.descricao, a.entidade)), 'created_at', fo).sort((a, b) => ((a.created_at || '') < (b.created_at || '') ? 1 : -1));
+      const total = P.sum(S.all('arquivos'), (a) => +a.tamanho_bytes || 0);
+      return h`<div class="page-head"><div>${back}<h1 class="mt-2">Arquivos</h1><p>${S.all('arquivos').length} arquivos · ${fmt.num(total / 1048576, 1)} MB no Drive</p></div><button class="btn btn-primary btn-sm" data-act="cfg.upload">${icon('upload', 'sm')}Enviar</button></div>
+        <div class="filters mb-3">${P.flt.search(fk, 'Buscar pelo nome')}${P.pf.bar(fk, fo)}</div>
+        ${ui.chips(TIPOS, st.fileTipo, 'cfg.fileTipo')}
+        ${rows.length ? h`<div class="file-grid mt-3">${rows.slice(0, 120).map((a) => h`<button class="file-tile" data-act="cfg.fileOpen" data-id="${a.id}"><span class="file-thumb" data-thumb="${/^image\//.test(a.mime) ? a.id : ''}">${icon(/pdf/.test(a.mime) ? 'file' : /json|csv|text/.test(a.mime) ? 'file' : 'image', 'lg')}</span><span class="ellipsis" style="font-size:12.5px;font-weight:600">${a.nome}</span><span class="faint" style="font-size:11.5px">${fmt.date(String(a.created_at).slice(0, 10))} · ${fmt.num((a.tamanho_bytes || 0) / 1024)} KB</span></button>`)}</div>`
+          : ui.empty({ ill: 'file', title: 'Nenhum arquivo', text: 'Comprovantes, fotos de progresso e rótulos enviados aparecem aqui.', action: { label: 'Enviar arquivo', act: 'cfg.upload' } })}`;
+    },
+    mount(root) {
+      P.$$('[data-thumb]', root).forEach(async (el) => {
+        const id = el.dataset.thumb; if (!id) return;
+        try { const u = P.files.cached(id) || await P.files.url(id, true); if (u) el.innerHTML = `<img alt="" loading="lazy" src="${P.esc(u)}">`; } catch (e) { /* mantém ícone */ }
+      });
+    }
+  });
+
+  // ================= Ações =================
+  const reRender = () => P.router.render(true);
+  const afterData = (msg) => { ui.toast(msg); setTimeout(() => location.reload(), 900); };
+  Object.assign(P.act, {
+    'cfg.pushOn': async (el) => {
+      el.classList.add('loading');
+      try { await P.pwa.enablePush(); ui.toast('Notificações ativadas neste aparelho', { icon: 'bell' }); await P.api.call('push.test', {}, { mutation: true }).catch(() => {}); }
+      catch (e) { ui.toast(e.message, { error: true }); }
+      reRender();
+    },
+    'cfg.pushOff': async () => { try { await P.pwa.disablePush(); ui.toast('Push desativado neste aparelho'); } catch (e) { ui.toast(e.message, { error: true }); } reRender(); },
+    'cfg.pushTest': async (el) => { el.classList.add('loading'); try { await P.api.call('push.test', {}, { mutation: true }); ui.toast('Teste enviado. Deve chegar em alguns segundos.'); } catch (e) { ui.toast(e.message, { error: true }); } el.classList.remove('loading'); },
+    'cfg.copyPwa': () => { const u = P.pwa.url(); try { navigator.clipboard.writeText(u).then(() => ui.toast('Link copiado'), () => ui.toast(u)); } catch (e) { ui.toast(u); } },
+    'cfg.toggle': (el) => P.settings.set({ [el.dataset.key]: el.checked }).then(() => ui.toast('Preferência salva')).catch(() => { el.checked = !el.checked; }),
+    'cfg.num': (el) => { const v = Math.round(P.parseNum(el.value)); const min = +el.dataset.min, max = +el.dataset.max; if (!Number.isFinite(v) || v < min || v > max) { ui.toast(`Use um valor entre ${min} e ${max}.`, { error: true }); el.value = P.settings.get(el.dataset.key, ''); return; } P.settings.set({ [el.dataset.key]: v }).then(() => ui.toast('Preferência salva')); },
+    'cfg.weekStart': async (el) => { await P.settings.set({ 'geral.inicio_semana': +el.dataset.v }); P.api.call('profile.save', { profile: { inicio_semana: +el.dataset.v } }, { mutation: true }).then((r) => { P.me = r.profile; }).catch(() => {}); reRender(); },
+    'cfg.theme': (el) => { P.theme.apply(el.dataset.v); P.me.tema = el.dataset.v; P.api.call('profile.save', { profile: { tema: el.dataset.v } }, { mutation: true }).catch((e) => ui.toast(e.message, { error: true })); reRender(); },
+    'cfg.saveProfile': async (el) => {
+      const form = document.getElementById('prof');
+      const r = P.form.read(form, PROF_FIELDS); if (!r.ok) return;
+      delete r.values.email;
+      el.classList.add('loading');
+      try { const res = await P.api.call('profile.save', { profile: r.values }, { mutation: true }); P.me = res.profile; ui.toast('Perfil salvo'); reRender(); }
+      catch (e) { el.classList.remove('loading'); if (!P.form.serverError(form, e)) ui.toast(e.message, { error: true }); }
+    },
+    'cfg.photo': async () => {
+      const file = await P.files.pick({ accept: 'image/\u002A' }); if (!file) return;
+      ui.toast('Enviando foto…', { icon: 'upload' });
+      try {
+        const prepared = await P.files.compress(file, { square: true, max: 512, quality: 0.86 });
+        const a = await P.files.upload(file, { tipo: 'foto_perfil', modulo: 'perfil' }, { prepared });
+        const res = await P.api.call('profile.save', { profile: { foto_arquivo_id: a.id } }, { mutation: true });
+        P.me = res.profile; ui.toast('Foto atualizada'); reRender(); P.shell.renderTop(P.router.current());
+      } catch (e) { ui.toast(e.message, { error: true }); }
+    },
+    'cfg.pin': () => {
+      const fields = (P.me.tem_pin ? [{ k: 'atual', l: 'PIN atual', t: 'text', req: true }] : []).concat([{ k: 'pin', l: 'Novo PIN (4 a 6 números)', t: 'text', req: true, validate: (v) => (/^\d{4,6}$/.test(v || '') ? '' : 'Use de 4 a 6 números.') }, { k: 'pin2', l: 'Repita o PIN', t: 'text', req: true, validate: (v, all) => (v === all.pin ? '' : 'Os PINs não conferem.') }]);
+      ui.editSheet({ title: P.me.tem_pin ? 'Alterar PIN' : 'Criar PIN', deletable: false, fields, mount(sh) { P.$$('input', sh.el).forEach((i) => { i.type = 'password'; i.inputMode = 'numeric'; i.autocomplete = 'off'; }); },
+        save: async (v) => { const r = await P.api.call('auth.setPin', { pin: v.pin, atual: v.atual }, { mutation: true }); P.me.tem_pin = r.tem_pin; reRender(); }, savedMsg: 'PIN salvo' });
+    },
+    'cfg.pinOff': () => ui.editSheet({ title: 'Remover PIN', deletable: false, createLabel: 'Remover', fields: [{ k: 'atual', l: 'PIN atual', t: 'text', req: true }], mount(sh) { P.$('input', sh.el).type = 'password'; },
+      save: async (v) => { const r = await P.api.call('auth.setPin', { pin: null, atual: v.atual }, { mutation: true }); P.me.tem_pin = r.tem_pin; reRender(); }, savedMsg: 'PIN removido' }),
+    'cfg.backup': async (el) => { el.classList.add('loading'); try { const r = await P.api.call('sys.backup', {}, { mutation: true, timeout: 200000 }); ui.toast('Backup criado: ' + r.nome, { action: { label: 'Abrir', fn: () => window.open(r.url, '_blank', 'noopener') }, duration: 9000 }); } catch (e) { ui.toast(e.message, { error: true }); } el.classList.remove('loading'); },
+    'cfg.export': async (el) => { el.classList.add('loading'); try { const r = await P.api.call('sys.exportAll', {}, { mutation: true, timeout: 200000 }); ui.toast(r.nome + ' salvo', { action: { label: 'Abrir', fn: () => window.open(r.url, '_blank', 'noopener') }, duration: 9000 }); } catch (e) { ui.toast(e.message, { error: true }); } el.classList.remove('loading'); },
+    'cfg.import': async () => {
+      const file = await P.files.pick({ accept: 'application/json,.json' }); if (!file) return;
+      const text = await P.files.readText(file);
+      let data; try { data = JSON.parse(text); } catch (e) { return ui.toast('Arquivo inválido.', { error: true }); }
+      const n = P.sum(Object.values(data.tabelas || {}), (r) => (r || []).length);
+      if (!await ui.confirm({ title: 'Restaurar backup?', text: `${fmt.num(n)} registros de ${data.exportado_em ? fmt.date(String(data.exportado_em).slice(0, 10)) : 'data desconhecida'}. Só entra o que ainda não existe.`, ok: 'Restaurar' })) return;
+      ui.toast('Restaurando…', { icon: 'upload' });
+      try { const r = await P.api.call('sys.importAll', { json: text }, { mutation: true, timeout: 330000 }); afterData(`Restaurado: ${fmt.num(P.sum(Object.values(r.inseridos)))} registros${r.pendentes.length ? ' (rode de novo para concluir)' : ''}`); }
+      catch (e) { ui.toast(e.message, { error: true }); }
+    },
+    'cfg.demo': async (el) => {
+      if (!await ui.confirm({ title: 'Carregar dados de exemplo?', text: 'Leva cerca de um minuto. Tudo fica marcado e pode ser removido depois em Configurações › Dados.', ok: 'Carregar' })) return;
+      if (el) el.classList.add('loading');
+      ui.toast('Gerando dados de exemplo…', { icon: 'layers', duration: 60000 });
+      try { await P.api.call('sys.seedDemo', {}, { mutation: true, timeout: 330000 }); afterData('Dados de exemplo carregados'); }
+      catch (e) { if (el) el.classList.remove('loading'); ui.toast(e.message, { error: true }); }
+    },
+    'cfg.demoOff': async (el) => {
+      if (!await ui.confirm({ title: 'Remover dados de exemplo?', text: 'Remove só o que foi criado pelo modo demonstração.', ok: 'Remover', danger: true })) return;
+      el.classList.add('loading');
+      try { const r = await P.api.call('sys.clearDemo', {}, { mutation: true, timeout: 330000 }); afterData(r.resultado[0]); }
+      catch (e) { el.classList.remove('loading'); ui.toast(e.message, { error: true }); }
+    },
+    'cfg.clearCache': async () => { await P.api.call('sys.clearCache', {}, { mutation: true }); P.api.clearCache(); afterData('Cache limpo'); },
+    'cfg.triggers': async (el) => { el.classList.add('loading'); try { const r = await P.api.call('sys.setupTriggers', {}, { mutation: true }); ui.toast(r.resultado[0]); } catch (e) { ui.toast(e.message, { error: true }); } el.classList.remove('loading'); },
+    'cfg.diag': async (el) => {
+      el.classList.add('loading');
+      const box = document.getElementById('diag'); box.innerHTML = P.toHtml(ui.skeleton());
+      try {
+        const r = await P.api.call('sys.diagnostics', {}, { timeout: 120000 });
+        box.innerHTML = P.toHtml(h`<div class="card-head">${icon('shield')}<h3>Ambiente</h3></div><div class="list">${r.checks.map((c) => h`<div class="li"><span class="tile sm" style="color:${c.ok ? 'var(--success)' : 'var(--danger)'}">${icon(c.ok ? 'check-circle' : 'alert', 'sm')}</span><span class="main"><span class="t">${c.label}</span><span class="s" style="white-space:normal">${c.detail}</span></span></div>`)}</div>`);
+      } catch (e) { box.innerHTML = P.toHtml(ui.errorState(e.message, 'cfg.diag')); }
+      el.classList.remove('loading');
+    },
+    'cfg.logNivel': (el) => { st.logs.nivel = el.dataset.v; st.logs.offset = 0; st.logRes = null; reRender(); loadLogs(); },
+    'cfg.logMod': (el) => { st.logs.modulo = el.value; st.logs.offset = 0; loadLogs(); },
+    'cfg.logDe': (el) => { st.logs.de = el.value; st.logs.offset = 0; loadLogs(); },
+    'cfg.logQ': P.debounce((el) => { st.logs.q = el.value; st.logs.offset = 0; loadLogs(); }, 400),
+    'cfg.logPage': (el) => { st.logs.offset = Math.max(0, st.logs.offset + 50 * +el.dataset.v); loadLogs(); },
+    'cfg.logOpen': (el) => {
+      const l = st.logRes.items[+el.dataset.i];
+      const diff = () => { const a = l.antes_json || {}, d = l.depois_json || {}; const keys = [...new Set(Object.keys(a).concat(Object.keys(d)))].filter((k) => !/^(id|user_id|created_at|updated_at)$/.test(k)); return keys.length ? h`<table class="table mt-3"><thead><tr><th>Campo</th><th>Antes</th><th>Depois</th></tr></thead><tbody>${keys.map((k) => h`<tr><td><b>${k}</b></td><td class="neg">${a[k] === undefined || a[k] === null ? '—' : typeof a[k] === 'object' ? JSON.stringify(a[k]).slice(0, 120) : String(a[k])}</td><td class="pos">${d[k] === undefined || d[k] === null ? '—' : typeof d[k] === 'object' ? JSON.stringify(d[k]).slice(0, 120) : String(d[k])}</td></tr>`)}</tbody></table>` : ''; };
+      ui.sheet({ title: `${l.acao || 'Log'} · ${l.nivel}`, wide: true, body: h`<div class="kv"><span>Quando</span><b>${new Date(l.ts).toLocaleString('pt-BR')}</b></div><div class="kv"><span>Módulo</span><b>${l.modulo || '—'}</b></div><div class="kv"><span>Entidade</span><b>${l.entidade || '—'} ${l.entidade_id ? '· ' + String(l.entidade_id).slice(0, 13) : ''}</b></div><div class="kv"><span>Dispositivo</span><b>${l.dispositivo || '—'}</b></div>${l.duracao_ms ? h`<div class="kv"><span>Duração</span><b>${l.duracao_ms} ms</b></div>` : ''}
+        ${l.mensagem ? h`<pre style="white-space:pre-wrap;font-size:12px;background:var(--surface-2);padding:12px;border-radius:12px;margin-top:12px">${l.mensagem}</pre>` : ''}${diff()}` });
+    },
+    'cfg.logPurge': async () => { const days = +P.settings.get('sys.log_retencao_dias', 90); if (!await ui.confirm({ title: `Apagar logs com mais de ${days} dias?`, ok: 'Apagar', danger: true })) return; const r = await P.api.call('logs.purge', { dias: days }, { mutation: true, timeout: 200000 }); ui.toast(`${r.removidos} registro(s) removido(s)`); st.logRes = null; loadLogs(); },
+    'cfg.fileTipo': (el) => { st.fileTipo = el.dataset.v; reRender(); },
+    'cfg.upload': async () => {
+      const files = await P.files.pick({ accept: 'image/\u002A,application/pdf', multiple: true }); if (!files || !files.length) return;
+      for (const f of files) { try { await P.files.upload(f, { tipo: 'outro', modulo: 'arquivos' }); } catch (e) { ui.toast(`${f.name}: ${e.message}`, { error: true }); } }
+      ui.toast(`${files.length} arquivo(s) enviado(s)`);
+    },
+    'cfg.fileOpen': async (el) => {
+      const a = S.get('arquivos', el.dataset.id);
+      const used = S.where('fin_lancamentos', (l) => String(l.arquivo_ids || '').includes(a.id)).map((l) => ({ label: 'Lançamento: ' + l.descricao, run: () => P.fin.openTx(l) }))
+        .concat(S.where('fit_medidas', (m) => String(m.foto_arquivo_ids || '').includes(a.id)).map((m) => ({ label: 'Medida de ' + fmt.date(m.data), run: () => P.router.go('fit/evolucao') })));
+      const sh = ui.sheet({ title: a.nome, wide: true,
+        body: h`<div class="file-preview" data-prev>${/^image\//.test(a.mime) ? h`<div class="skel" style="height:260px"></div>` : h`<div class="empty sm">${icon('file', 'lg')}<p>${a.mime}</p></div>`}</div>
+          <div class="kv mt-3"><span>Tipo</span><b>${(TIPOS.find((t) => t[0] === a.tipo) || [])[1] || a.tipo}</b></div><div class="kv"><span>Tamanho</span><b>${fmt.num((a.tamanho_bytes || 0) / 1024)} KB</b></div><div class="kv"><span>Enviado</span><b>${fmt.date(String(a.created_at).slice(0, 10))}</b></div>
+          ${a.ocr_json ? h`<div class="kv"><span>OCR</span><b>${a.ocr_json.tipo}</b></div>` : ''}
+          <div class="group-h">Vínculos</div>${used.length ? h`<div class="list">${used.map((u, i) => h`<button class="li tap" data-u="${i}" style="width:100%;text-align:left">${icon('link', 'sm')}<span class="main"><span class="t">${u.label}</span></span></button>`)}</div>` : h`<p class="faint" style="font-size:13px">Não vinculado a nenhum registro.</p>`}`,
+        foot: h`<button class="btn btn-danger" data-trash style="flex:0 0 auto" aria-label="Excluir">${icon('trash', 'sm')}</button><button class="btn btn-ghost" data-rename>${icon('edit', 'sm')}Renomear</button><button class="btn btn-primary" data-drive>${icon('external', 'sm')}Abrir no Drive</button>`,
+        onMount(s) {
+          if (/^image\//.test(a.mime)) P.files.url(a.id).then((u) => { s.$('[data-prev]').innerHTML = `<img alt="" src="${P.esc(u)}" style="width:100%;border-radius:14px">`; }).catch(() => {});
+          s.body.addEventListener('click', (e) => { const b = e.target.closest('[data-u]'); if (b) { s.close(); setTimeout(() => used[+b.dataset.u].run(), 260); } });
+          s.$('[data-drive]').onclick = async () => { const r = await P.api.call('files.link', { id: a.id }); window.open(r.url, '_blank', 'noopener'); };
+          s.$('[data-rename]').onclick = () => { s.close(); setTimeout(() => ui.editSheet({ title: 'Renomear arquivo', deletable: false, fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true }], defaults: { nome: a.nome }, save: (v) => S.route('files.rename', { id: a.id, nome: v.nome }).then((r) => S.put('arquivos', r.arquivo)), savedMsg: 'Arquivo renomeado' }), 260); };
+          s.$('[data-trash]').onclick = async () => { if (!await ui.confirm({ title: 'Mover para a lixeira do Drive?', text: 'O arquivo some do Prumo e vai para a lixeira do seu Drive.', ok: 'Excluir', danger: true })) return; s.close(); try { const r = await P.api.call('files.trash', { id: a.id }, { mutation: true }); S.put('arquivos', r.arquivo); ui.toast('Arquivo na lixeira'); } catch (e) { ui.toast(e.message, { error: true }); } };
+        } });
+      return sh;
+    }
+  });
+
+  P.module({
+    id: 'cfg', name: 'Configurações', icon: 'settings', home: 'cfg', hidden: true, plusLabel: 'Enviar arquivo', plus: () => P.act['cfg.upload'](),
+    tabs: [{ id: 'geral', label: 'Geral', icon: 'settings', route: 'cfg' }, { id: 'perfil', label: 'Perfil', icon: 'user', route: 'cfg/perfil' }, { id: 'arquivos', label: 'Arquivos', icon: 'folder', route: 'cfg/arquivos' }, { id: 'mais', label: 'Mais', icon: 'grid', more: true }],
+    more: [{ id: 'aparencia', label: 'Aparência', icon: 'sun', route: 'cfg/aparencia' }, { id: 'preferencias', label: 'Preferências', icon: 'sliders', route: 'cfg/preferencias' }, { id: 'notificacoes', label: 'Notificações', icon: 'bell', route: 'cfg/notificacoes' }, { id: 'seguranca', label: 'Segurança', icon: 'lock', route: 'cfg/seguranca' },
+      { id: 'dados', label: 'Dados e backup', icon: 'database', route: 'cfg/dados' }, { id: 'integracoes', label: 'Integrações', icon: 'link', route: 'cfg/integracoes' }, { id: 'logs', label: 'Logs', icon: 'history', route: 'cfg/logs' }, { id: 'sobre', label: 'Sobre e diagnóstico', icon: 'info', route: 'cfg/sobre' }]
+  });
+})();
+</script>
