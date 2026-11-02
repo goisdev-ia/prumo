@@ -1,0 +1,124 @@
+<script>
+/* Prumo · marca (logo) e tela de login: e-mail + senha de acesso, e saída. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon } = P;
+
+  // ================= Marca =================
+  // "P" cuja haste termina na ponta de um prumo, pendurado no fio e apontando para a marca no chão.
+  let gid = 0;
+  /** SVG da marca. o.tile = fundo arredondado; o.mono = cor única (currentColor). */
+  P.logo = (o = {}) => {
+    const id = 'pg' + (++gid);
+    const fill = o.mono ? 'currentColor' : `url(#${id})`;
+    const ink = o.ink || 'currentColor';
+    const body = `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F6D365"/><stop offset="1" stop-color="#F2B705"/></linearGradient></defs>
+      <g transform="translate(-16 7)"><path d="M200 40 V118" stroke="${ink}" stroke-width="9" stroke-linecap="round" fill="none"/>
+      <path fill="${fill}" fill-rule="evenodd" d="M168 118 H276 A100 100 0 0 1 276 318 H232 V366 L200 424 L168 366 Z M276 176 A42 42 0 1 1 275.99 176 Z"/>
+      <rect x="174" y="448" width="52" height="10" rx="5" fill="${ink}"/></g>`;
+    if (o.tile) return raw(`<svg class="logo-svg" viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="112" fill="#1A1A1A"/>${body.replace(/currentColor/g, '#FFF3D6')}</svg>`);
+    return raw(`<svg class="logo-svg" viewBox="140 40 232 432" aria-hidden="true">${body}</svg>`);
+  };
+  /** Marca + nome, para cabeçalhos. */
+  P.brand = (cls = '') => h`<span class="brand-lockup ${cls}"><span class="brand-logo">${P.logo()}</span><span class="brand-word">prumo</span></span>`;
+
+  // ================= Login =================
+  const st = { email: '', busy: false, error: '', field: '' };
+  let root = null;
+
+  const fieldErr = (f) => (st.error && st.field === f ? h`<p class="login-err" role="alert">${icon('alert', 'sm')}${st.error}</p>` : '');
+
+  function formHtml() {
+    return h`<form class="login-form" data-login="senha" novalidate>
+      ${st.expired ? h`<p class="login-note">${icon('clock', 'sm')}Sua sessão terminou. Entre de novo para continuar.</p>` : ''}
+      <h1>Entrar</h1>
+      <p class="login-sub">Use seu e-mail e a senha de acesso do Prumo.</p>
+      <div class="field"><label for="lg-email">E-mail</label>
+        <input id="lg-email" class="input" name="email" type="email" inputmode="email" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="voce@email.com" value="${st.email}" required>
+        ${fieldErr('email')}</div>
+      <div class="field"><label for="lg-senha">Senha</label>
+        <div class="login-pass"><input id="lg-senha" class="input" name="senha" type="password" autocomplete="current-password" placeholder="Senha de acesso" required>
+        <button type="button" class="btn-icon" data-login-act="ver" aria-label="Mostrar senha">${icon('eye', 'sm')}</button></div>
+        ${fieldErr('senha')}</div>
+      ${st.error && !st.field ? h`<p class="login-err" role="alert">${icon('alert', 'sm')}${st.error}</p>` : ''}
+      <button class="btn btn-primary btn-lg login-btn" type="submit" ${st.busy ? raw('disabled') : ''}>${st.busy ? h`<span class="spinner"></span>Entrando` : h`Entrar${icon('arrow-r', 'sm')}`}</button>
+      <p class="login-foot">${icon('shield', 'sm')}Cada e-mail tem os próprios dados. O que você cadastrar fica registrado no seu nome.</p>
+    </form>`;
+  }
+
+  function render() {
+    if (!root) return;
+    const slot = root.querySelector('.login-panel');
+    slot.innerHTML = P.toHtml(formHtml());
+    const first = slot.querySelector(st.email ? '#lg-senha' : '#lg-email');
+    if (first && !matchMedia('(pointer: coarse)').matches) setTimeout(() => first.focus(), 30);
+  }
+
+  async function submit(form) {
+    if (st.busy) return;
+    st.error = ''; st.field = '';
+    const senha = form.senha.value;
+    try {
+      st.busy = true;
+      st.email = form.email.value.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(st.email)) throw Object.assign(new Error('Informe um e-mail válido.'), { field: 'email' });
+      if (!senha) throw Object.assign(new Error('Informe a senha.'), { field: 'senha' });
+      render();
+      const r = await P.api.call('auth.login', { email: st.email, senha }, { retries: 1, mutation: true });
+      return finish(r);
+    } catch (e) {
+      st.error = e.message || 'Não foi possível entrar.'; st.field = e.field || '';
+    } finally { st.busy = false; }
+    render();
+  }
+
+  function finish(r) {
+    P.auth.set(r.token, r.email);
+    P.auth._expiring = false;
+    root.classList.add('leaving');
+    setTimeout(() => location.reload(), 220);
+  }
+
+  P.login = {
+    show(o = {}) {
+      st.expired = !!o.expired; st.error = ''; st.email = st.email || P.auth.email() || '';
+      document.querySelectorAll('.sheet-wrap, .dialog-wrap, .lock').forEach((el) => el.remove());
+      if (!root) {
+        root = document.createElement('div');
+        root.className = 'login';
+        root.innerHTML = P.toHtml(h`
+          <aside class="login-hero" aria-hidden="true">
+            <span class="login-ghost">${P.logo({ mono: true })}</span>
+            ${P.brand('lg')}
+            <div class="login-hero-copy">
+              <p class="login-kicker">Controle pessoal</p>
+              <h2>Sua vida<br><span>no prumo.</span></h2>
+              <p>Finanças, treinos, alimentação, tarefas, metas e rotinas no mesmo lugar, do seu jeito.</p>
+            </div>
+            <ul class="login-mods">${[['wallet', 'Finanças'], ['dumbbell', 'Fitness'], ['apple', 'Alimentação'], ['tasks', 'Tarefas'], ['target', 'Metas'], ['repeat', 'Rotinas']].map(([i, l]) => h`<li>${icon(i, 'sm')}${l}</li>`)}</ul>
+          </aside>
+          <main class="login-main"><div class="login-top">${P.brand()}</div><div class="login-panel"></div></main>`);
+        document.body.appendChild(root);
+        root.addEventListener('submit', (e) => { e.preventDefault(); submit(e.target); });
+        root.addEventListener('click', async (e) => {
+          const b = e.target.closest('[data-login-act]'); if (!b) return;
+          const a = b.dataset.loginAct;
+          if (a === 'ver') { const i = root.querySelector('#lg-senha'); const show = i.type === 'password'; i.type = show ? 'text' : 'password'; b.setAttribute('aria-label', show ? 'Ocultar senha' : 'Mostrar senha'); b.classList.toggle('on', show); }
+        });
+      }
+      document.body.classList.add('login-open');
+      render();
+    },
+    async logout() {
+      const ok = await P.ui.confirm({ title: 'Sair do Prumo?', text: 'Você vai precisar do e-mail e da senha para entrar de novo neste aparelho.', ok: 'Sair' });
+      if (!ok) return;
+      try { await P.api.call('auth.logout', {}, { retries: 0, mutation: true }); } catch (e) { /* sai mesmo assim */ }
+      P.auth.clear();
+      location.reload();
+    }
+  };
+  P.act = P.act || {};
+  P.act['auth.logout'] = () => P.login.logout();
+})();
+</script>

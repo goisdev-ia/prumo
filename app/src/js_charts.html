@@ -1,0 +1,111 @@
+<script>
+/* Prumo · gráficos (Chart.js 4) com cores do tema, tooltips legíveis e estado vazio. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const instances = new Map();
+  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+  function theme() {
+    return { text: css('--text'), text2: css('--text-2'), text3: css('--text-3'), grid: css('--grid'), surface: css('--surface-1'), border: css('--border'), primary: css('--primary'), soft: css('--primary-soft'), neutral: css('--c7'), track: css('--track') };
+  }
+
+  function base(t, o = {}) {
+    return {
+      responsive: true, maintainAspectRatio: false, animation: { duration: matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 420 },
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: !!o.legend, position: 'bottom', labels: { color: t.text2, boxWidth: 10, boxHeight: 10, usePointStyle: true, pointStyle: 'circle', padding: 14, font: { family: css('--font'), size: 12, weight: 600 } } },
+        tooltip: {
+          backgroundColor: '#2A2A2A', titleColor: '#FFF3D6', bodyColor: '#FFF3D6', borderColor: '#3A3A3A', borderWidth: 1, padding: 10, cornerRadius: 12,
+          titleFont: { family: css('--font'), weight: 700 }, bodyFont: { family: css('--font') }, displayColors: true, boxPadding: 4,
+          callbacks: { label: (c) => ` ${c.dataset.label ? c.dataset.label + ': ' : ''}${o.fmt ? o.fmt(c.parsed.y ?? c.parsed) : c.formattedValue}` }
+        }
+      },
+      scales: o.noScales ? {} : {
+        x: { grid: { display: false }, border: { display: false }, ticks: { color: t.text3, font: { family: css('--font'), size: 11, weight: 600 }, maxRotation: 0, autoSkipPadding: 10 }, stacked: !!o.stacked },
+        y: { grid: { color: t.grid, drawTicks: false }, border: { display: false }, ticks: { color: t.text3, font: { family: css('--font'), size: 11 }, padding: 8, maxTicksLimit: 5, callback: o.yfmt || ((v) => P.fmt.numSmart(v)) }, beginAtZero: o.zero !== false, stacked: !!o.stacked, suggestedMin: o.min, suggestedMax: o.max }
+      }
+    };
+  }
+
+  /**
+   * Monta um gráfico num container (div). Mostra estado vazio se não houver dados.
+   * @param {HTMLElement|string} host
+   * @param {{type:string, labels:string[], series:Object[], height?:number, empty?:string}} o
+   */
+  function mount(host, o) {
+    const el = typeof host === 'string' ? document.querySelector(host) : host;
+    if (!el) return null;
+    const hasData = o.series.some((s) => (s.data || []).some((v) => (v !== null && v !== undefined && +v !== 0)));
+    if (!hasData) { el.innerHTML = P.toHtml(P.ui.empty({ ill: 'chart', title: o.empty || 'Sem dados no período', small: true })); return null; }
+    if (typeof Chart === 'undefined') { el.innerHTML = P.toHtml(P.h`<p class="muted" style="padding:20px 0">Gráfico indisponível sem conexão com a CDN.</p>`); return null; }
+    el.innerHTML = '';
+    el.style.position = 'relative'; el.style.height = (o.height || 220) + 'px';
+    const canvas = document.createElement('canvas'); el.appendChild(canvas);
+    const key = el.id || Math.random().toString(36);
+    const build = () => {
+      const t = theme();
+      const cfg = { type: o.type, data: { labels: o.labels, datasets: o.series.map((s, i) => style(o.type, s, i, t, o)) }, options: base(t, o) };
+      if (o.type === 'doughnut') { cfg.options.cutout = '72%'; cfg.options.plugins.tooltip.callbacks.label = (c) => ` ${c.label}: ${o.fmt ? o.fmt(c.parsed) : c.formattedValue}`; }
+      if (o.type === 'radar') { cfg.options.scales = { r: { min: 0, max: o.max || 10, ticks: { display: false, stepSize: 2 }, grid: { color: t.grid }, angleLines: { color: t.grid }, pointLabels: { color: t.text2, font: { family: css('--font'), size: 11, weight: 600 } } } }; }
+      if (o.horizontal) {
+        cfg.options.indexAxis = 'y';
+        const sc = cfg.options.scales;
+        sc.x.grid = { color: t.grid, drawTicks: false }; sc.x.ticks.callback = o.yfmt || ((v) => P.fmt.numSmart(v)); sc.x.beginAtZero = true;
+        sc.y.grid = { display: false }; delete sc.y.ticks.callback; sc.y.ticks.color = t.text2; sc.y.ticks.autoSkip = false; sc.y.beginAtZero = false;
+        cfg.options.plugins.tooltip.callbacks.label = (c) => ` ${o.fmt ? o.fmt(c.parsed.x) : c.formattedValue}`;
+      }
+      if (o.goal !== undefined && o.goal !== null && cfg.options.scales.y) {
+        cfg.plugins = [goalLine(o.goal, t)];
+        const vals = o.series.flatMap((s) => s.data).filter((v) => v !== null && v !== undefined).map(Number);
+        cfg.options.scales.y.suggestedMin = Math.min(o.min ?? Infinity, o.goal, ...vals);
+        cfg.options.scales.y.suggestedMax = Math.max(o.max ?? -Infinity, o.goal, ...vals);
+      }
+      return new Chart(canvas, cfg);
+    };
+    const inst = { chart: build(), rebuild() { this.chart.destroy(); this.chart = build(); } };
+    instances.set(key, inst);
+    return inst.chart;
+  }
+
+  function style(type, s, i, t, o) {
+    const color = s.color || (i === 0 ? t.primary : s.neutral ? t.neutral : P.PALETTE[i % P.PALETTE.length]);
+    if (type === 'bar') {
+      const hi = o.highlight;
+      return { label: s.label, data: s.data, borderRadius: 8, borderSkipped: false, maxBarThickness: o.thick || 26, categoryPercentage: .72, barPercentage: .86,
+        backgroundColor: s.colors || (hi !== undefined && i === 0 ? s.data.map((_, j) => (j === hi ? t.primary : t.soft + '99')) : color), stack: s.stack };
+    }
+    if (type === 'line') {
+      return { label: s.label, data: s.data, borderColor: color, backgroundColor: s.fill ? hexA(color, .14) : 'transparent', fill: !!s.fill, tension: .35, borderWidth: s.dashed ? 1.5 : 2.5,
+        borderDash: s.dashed ? [5, 5] : [], pointRadius: s.points === false ? 0 : (o.labels.length > 20 ? 0 : 3.5), pointBackgroundColor: color, pointHoverRadius: 5, spanGaps: true };
+    }
+    if (type === 'doughnut') return { data: s.data, backgroundColor: s.colors || P.PALETTE, borderWidth: 0, spacing: 2, borderRadius: 6 };
+    if (type === 'radar') return { label: s.label, data: s.data, borderColor: color, backgroundColor: hexA(color, .2), pointBackgroundColor: color, borderWidth: 2 };
+    return { label: s.label, data: s.data, backgroundColor: color };
+  }
+
+  function hexA(hex, a) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim()); if (!m) return hex;
+    const n = parseInt(m[1], 16); return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+  }
+
+  function goalLine(value, t) {
+    return { id: 'goal', afterDatasetsDraw(chart) {
+      const y = chart.scales.y; if (!y) return;
+      const py = y.getPixelForValue(value), ctx = chart.ctx;
+      ctx.save(); ctx.setLineDash([5, 5]); ctx.strokeStyle = t.text3; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(chart.chartArea.left, py); ctx.lineTo(chart.chartArea.right, py); ctx.stroke(); ctx.restore();
+    } };
+  }
+
+  P.charts = {
+    mount,
+    destroyAll() { instances.forEach((i) => { try { i.chart.destroy(); } catch (e) { /* noop */ } }); instances.clear(); },
+    retheme() { instances.forEach((i) => { try { i.rebuild(); } catch (e) { /* noop */ } }); },
+    money: (v) => P.fmt.moneyShort(v),
+    /** Cores semânticas do tema (receita/despesa). */
+    income: () => (P.theme.resolved() === 'dark' ? '#7BC47F' : '#2E7D4F')
+  };
+})();
+</script>

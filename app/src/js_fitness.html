@@ -1,0 +1,710 @@
+<script>
+/* Prumo · Fitness: resumo, fichas, biblioteca, modo foco com descanso automático, timers, histórico, evolução, cardio e calculadoras. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const GRUPOS = [['peito', 'Peito'], ['costas', 'Costas'], ['ombros', 'Ombros'], ['biceps', 'Bíceps'], ['triceps', 'Tríceps'], ['antebraco', 'Antebraço'], ['quadriceps', 'Quadríceps'], ['posterior', 'Posterior'], ['gluteos', 'Glúteos'], ['panturrilha', 'Panturrilha'], ['abdomen', 'Abdômen'], ['corpo_todo', 'Corpo todo'], ['cardio', 'Cardio']];
+  const GL = Object.fromEntries(GRUPOS);
+  const EQUIP = [['barra', 'Barra'], ['halter', 'Halter'], ['maquina', 'Máquina'], ['polia', 'Polia'], ['peso_corporal', 'Peso corporal'], ['kettlebell', 'Kettlebell'], ['elastico', 'Elástico'], ['smith', 'Smith'], ['nenhum', 'Nenhum'], ['outro', 'Outro']];
+  const EVO_PF = { def: 'tudo', modes: ['30d', '90d', '6m', 'ano', 'intervalo', 'tudo'] };
+  const CARDIO = { corrida: ['Corrida', 9.8], caminhada: ['Caminhada', 4.3], bike: ['Bike', 7.5], natacao: ['Natação', 8], eliptico: ['Elíptico', 5], remo: ['Remo', 7], outro: ['Outro', 6] };
+  const st = { exQ: '', exGrupo: '', evo: 'peso', forcaEx: null, timerMode: 'intervalado', histLimit: 30 };
+
+  const TEMPLATES = [
+    { id: 'abc', nome: 'ABC clássico', blurb: '3 fichas · hipertrofia · 5x/semana', cor: '#F2B705', treinos: [
+      ['A · Peito e tríceps', '1,4', [['Supino reto com barra', 4, 8, 10], ['Supino inclinado com halteres', 3, 10, 12], ['Crossover na polia', 3, 12, 15], ['Tríceps na polia com corda', 3, 10, 12], ['Tríceps francês', 3, 10, 12]]],
+      ['B · Costas e bíceps', '2,5', [['Puxada frontal', 4, 8, 10], ['Remada curvada com barra', 4, 8, 10], ['Remada baixa na polia', 3, 10, 12], ['Rosca direta com barra', 3, 8, 10], ['Rosca martelo', 3, 10, 12]]],
+      ['C · Pernas e ombros', '3', [['Agachamento livre', 4, 6, 8], ['Leg press 45°', 4, 10, 12], ['Mesa flexora', 3, 10, 12], ['Desenvolvimento com halteres', 3, 8, 10], ['Elevação lateral', 3, 12, 15], ['Panturrilha em pé', 4, 12, 15]]]] },
+    { id: 'ppl', nome: 'Push Pull Legs', blurb: '3 fichas · empurrar, puxar, pernas', cor: '#C4684A', treinos: [
+      ['Push · Empurrar', '1,4', [['Supino reto com barra', 4, 6, 8], ['Desenvolvimento militar com barra', 3, 6, 8], ['Supino inclinado com halteres', 3, 8, 10], ['Elevação lateral', 3, 12, 15], ['Tríceps na polia com corda', 3, 10, 12]]],
+      ['Pull · Puxar', '2,5', [['Levantamento terra', 3, 5, 6], ['Barra fixa', 3, 6, 10], ['Remada curvada com barra', 3, 8, 10], ['Face pull', 3, 12, 15], ['Rosca alternada', 3, 10, 12]]],
+      ['Legs · Pernas', '3,6', [['Agachamento livre', 4, 6, 8], ['Levantamento terra romeno', 3, 8, 10], ['Leg press 45°', 3, 10, 12], ['Cadeira extensora', 3, 12, 15], ['Panturrilha sentada', 4, 12, 15]]]] },
+    { id: 'full', nome: 'Full body 3x', blurb: '1 ficha · corpo todo · iniciantes', cor: '#5F9E8F', treinos: [
+      ['Full body', '1,3,5', [['Agachamento goblet', 3, 10, 12], ['Supino reto na máquina', 3, 10, 12], ['Puxada frontal', 3, 10, 12], ['Desenvolvimento com halteres', 3, 10, 12], ['Prancha', 3, 1, 1]]]] },
+    { id: 'casa', nome: 'Treino em casa', blurb: 'Sem equipamento · 30 min', cor: '#8FA3B8', treinos: [
+      ['Casa · Corpo todo', '1,3,5', [['Flexão de braço', 4, 8, 15], ['Agachamento goblet', 4, 12, 20], ['Mergulho entre bancos', 3, 10, 15], ['Ponte de glúteo', 3, 15, 20], ['Mountain climber', 3, 20, 30], ['Prancha', 3, 1, 1]]]] },
+    { id: 'core', nome: 'Condicionamento + core', blurb: 'Circuito curto e intenso', cor: '#B98900', treinos: [
+      ['Circuito metabólico', '2,4', [['Burpee', 4, 10, 12], ['Kettlebell swing', 4, 15, 20], ['Polichinelo', 4, 30, 40], ['Abdominal infra', 3, 15, 20], ['Prancha lateral', 3, 1, 1]]]] }
+  ];
+
+  // ================= Seletores =================
+  const FT = P.fit = {
+    TEMPLATES,
+    exercises: () => S.all('fit_exercicios').sort((a, b) => a.nome.localeCompare(b.nome)),
+    ex: (id) => S.getAny('fit_exercicios', id),
+    plans: () => S.all('fit_treinos').filter((t) => t.ativo !== false).sort((a, b) => a.nome.localeCompare(b.nome)),
+    items: (tid) => S.where('fit_treino_itens', (i) => i.treino_id === tid).sort((a, b) => (a.ordem || 0) - (b.ordem || 0)),
+    sessions: () => S.where('fit_sessoes', (s) => s.status !== 'cancelada').sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : (a.inicio < b.inicio ? 1 : -1))),
+    goalWeek: () => +P.settings.get('fit.meta_treinos_semana', 4),
+    weekRange(date = D.today()) { const ws = +P.settings.get('geral.inicio_semana', P.me.inicio_semana || 0); const a = D.weekStart(date, ws); return [a, D.add(a, 6)]; },
+    weekSessions(date) { const [a, b] = FT.weekRange(date); return FT.sessions().filter((s) => s.data >= a && s.data <= b); },
+    plannedToday(date = D.today()) { const dow = String(D.dow(date)); return FT.plans().filter((t) => String(t.dias_semana || '').split(',').includes(dow)); },
+    weights: () => S.where('fit_medidas', (m) => m.peso_kg).sort((a, b) => (a.data < b.data ? -1 : 1)),
+    latestWeight() { const w = FT.weights(); return w.length ? +w[w.length - 1].peso_kg : null; },
+    steps: (date) => { const r = S.where('fit_passos', (p) => p.data === date)[0]; return r ? +r.passos : 0; },
+    goalWeight() { const m = S.where('met_metas', (x) => x.status === 'ativa' && (x.origem_metrica === 'fit_peso' || x.origem_metrica === 'nut_peso'))[0]; if (m) return +m.valor_alvo; const n = S.all('nut_metas').sort((a, b) => (a.vigencia_inicio < b.vigencia_inicio ? 1 : -1))[0]; return n && n.peso_alvo_kg ? +n.peso_alvo_kg : null; },
+    seriesOf: (sid) => S.where('fit_series', (x) => x.sessao_id === sid).sort((a, b) => (a.ordem || 0) - (b.ordem || 0)),
+    bestE1rm(exId, beforeSession) {
+      let best = 0;
+      S.where('fit_series', (x) => x.exercicio_id === exId && x.e1rm && x.sessao_id !== beforeSession).forEach((x) => { if (x.e1rm > best) best = x.e1rm; });
+      return best;
+    },
+    lastSets(exId) {
+      const sess = FT.sessions();
+      for (const s of sess) { const sets = S.where('fit_series', (x) => x.sessao_id === s.id && x.exercicio_id === exId).sort((a, b) => (a.ordem || 0) - (b.ordem || 0)); if (sets.length) return sets; }
+      return [];
+    },
+    recentPRs(n = 5) {
+      const sessById = Object.fromEntries(S.all('fit_sessoes').map((s) => [s.id, s]));
+      return S.where('fit_series', (x) => x.eh_pr).map((x) => ({ ...x, data: (sessById[x.sessao_id] || {}).data })).filter((x) => x.data).sort((a, b) => (a.data < b.data ? 1 : -1)).slice(0, n);
+    },
+    /** Dias seguidos com treino ou cardio (tolerando hoje vazio). */
+    activeStreak() {
+      const days = new Set(FT.sessions().map((s) => s.data).concat(S.all('fit_cardio').map((c) => c.data)));
+      let d = D.today(), n = 0; if (!days.has(d)) d = D.add(d, -1);
+      while (days.has(d)) { n++; d = D.add(d, -1); }
+      return n;
+    },
+    useTemplate: async (tid) => {
+      const t = TEMPLATES.find((x) => x.id === tid); if (!t) return;
+      const byName = Object.fromEntries(FT.exercises().map((e) => [P.norm(e.nome), e.id]));
+      const treinos = [], itens = [];
+      t.treinos.forEach(([nome, dias, list]) => {
+        const id = P.uuid();
+        treinos.push({ id, nome, dias_semana: dias, objetivo: 'hipertrofia', nivel: 'intermediario', duracao_estimada_min: 60, cor: t.cor, ativo: true });
+        list.forEach(([ex, series, rmin, rmax], i) => { const exId = byName[P.norm(ex)]; if (exId) itens.push({ treino_id: id, exercicio_id: exId, ordem: i, series, reps_min: rmin, reps_max: rmax, descanso_s: i === 0 ? 120 : 90, metodo: 'normal' }); });
+      });
+      await S.saveMany('fit_treinos', treinos);
+      await S.saveMany('fit_treino_itens', itens);
+      ui.toast(`${treinos.length} ficha(s) criada(s) a partir de "${t.nome}"`, { action: { label: 'Ver', fn: () => P.router.go('fit/treinos') } });
+    }
+  };
+
+  const weekLabels = () => { const [a] = FT.weekRange(); return Array.from({ length: 7 }, (_, i) => fmt.WD[D.dow(D.add(a, i))][0]); };
+  const pattern = (seed, color) => {
+    let s = seed.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
+    const r = () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+    const shapes = Array.from({ length: 7 }, (_, i) => { const x = Math.round(r() * 300), y = Math.round(r() * 160), sz = 18 + Math.round(r() * 70); return i % 3 === 0 ? `<circle cx="${x}" cy="${y}" r="${sz / 2}" fill="none" stroke="${color}" stroke-width="10" opacity=".55"/>` : i % 3 === 1 ? `<rect x="${x}" y="${y}" width="${sz}" height="${sz}" rx="${sz / 4}" fill="${color}" opacity=".35" transform="rotate(${Math.round(r() * 60)} ${x} ${y})"/>` : `<path d="M${x} ${y}l${sz} ${sz / 2}" stroke="${color}" stroke-width="12" stroke-linecap="round" opacity=".45"/>`; }).join('');
+    return raw(`<svg class="plan-art" viewBox="0 0 300 160" preserveAspectRatio="xMidYMid slice" aria-hidden="true">${shapes}</svg>`);
+  };
+  FT.pattern = pattern;
+  const planCard = (t) => h`<div class="plan-card" style="--pc:${t.cor}">${pattern(t.id, t.cor)}<div class="plan-body"><b>${t.nome}</b><span>${t.blurb}</span></div><button class="btn btn-primary btn-sm plan-cta" data-act="fit.useTpl" data-id="${t.id}">Usar</button></div>`;
+  FT.planCard = planCard;
+
+  // ================= Telas =================
+  const deps = ['fit_sessoes', 'fit_series', 'fit_treinos', 'fit_treino_itens', 'fit_exercicios', 'fit_medidas', 'fit_cardio', 'fit_passos', 'fit_timers_presets', 'met_metas', 'arquivos'];
+
+  P.screen('fit', {
+    mod: 'fit', tab: 'resumo', title: 'Fitness', deps,
+    render() {
+      const [a] = FT.weekRange(), days = Array.from({ length: 7 }, (_, i) => D.add(a, i)), today = D.today();
+      const week = FT.weekSessions(), goal = FT.goalWeek();
+      const dur = P.sum(week, (s) => +s.duracao_s || 0) + P.sum(S.where('fit_cardio', (c) => c.data >= a && c.data <= days[6]), (c) => +c.duracao_s || 0);
+      const kcal = P.sum(week, (s) => +s.kcal_estimadas || 0) + P.sum(S.where('fit_cardio', (c) => c.data >= a && c.data <= days[6]), (c) => +c.kcal || 0);
+      const steps = days.map(FT.steps), stepGoal = +P.settings.get('fit.meta_passos', 8000), todaySteps = FT.steps(today);
+      const w = FT.weights(), wNow = FT.latestWeight(), wGoal = FT.goalWeight();
+      const w30 = w.filter((x) => x.data <= D.add(today, -28)).pop();
+      const planned = FT.plannedToday(), prs = FT.recentPRs(4), streak = FT.activeStreak();
+      const doneToday = FT.sessions().some((s) => s.data === today);
+      return h`<div class="page-head"><div><h1>Fitness</h1><p>Semana de ${fmt.dm(a)} a ${fmt.dm(days[6])}</p></div><span class="streak">${icon('flame')}${streak} ${streak === 1 ? 'dia' : 'dias'}</span></div>
+      <div class="dash">
+        <div class="card pad-lg span-7 tap" data-act="fit.steps">
+          <div class="card-head">${icon('steps')}<h3>Passos</h3>${icon('chev-r', 'sm go')}</div>
+          <div class="row between" style="align-items:flex-end;gap:16px"><div>${ui.metric({ label: 'Hoje', value: fmt.num(todaySteps), count: todaySteps, unit: 'passos', sub: h`${fmt.num(todaySteps * 0.00075, 2)} km · ${fmt.num(todaySteps * 0.04, 0)} kcal` })}</div>
+          <div style="flex:1;max-width:300px">${ui.bars(steps, { hi: days.indexOf(today), labels: weekLabels(), goal: stepGoal, height: 92 })}</div></div></div>
+        <div class="span-5 grid g2">
+          <div class="card tap" data-act="ui.go" data-to="fit/historico"><div class="card-head">${icon('dumbbell')}<h3>Treinos</h3></div><div class="row between">${ui.metric({ label: 'na semana', value: `${week.length}/${goal}`, size: 'md' })}${ui.ring((week.length / goal) * 100, { size: 58, stroke: 7, icon: 'dumbbell' })}</div></div>
+          <div class="card"><div class="card-head">${icon('alarm')}<h3>Duração</h3></div><div class="row between">${ui.metric({ label: 'na semana', value: fmt.dur(dur), size: 'md' })}${ui.ring((dur / 60 / 240) * 100, { size: 58, stroke: 7, color: 'var(--c6)', icon: 'clock' })}</div></div>
+          <div class="card"><div class="card-head">${icon('flame')}<h3>Calorias</h3></div><div class="row between">${ui.metric({ label: 'gastas em treino', value: fmt.num(kcal), unit: 'kcal', size: 'md' })}${ui.ring((kcal / 2000) * 100, { size: 58, stroke: 7, color: 'var(--c4)', icon: 'flame' })}</div></div>
+          <a class="card link" href="#/fit/evolucao"><div class="card-head">${icon('scale')}<h3>Peso</h3></div>${wNow ? ui.metric({ label: wGoal ? `meta ${fmt.num(wGoal, 1)} kg` : 'atual', value: fmt.num(wNow, 1), unit: 'kg', size: 'md', sub: w30 ? ui.delta(wNow, +w30.peso_kg, { invert: wGoal ? wGoal < wNow : false }) : '' }) : h`<p class="muted">Sem registros</p>`}</a>
+        </div>
+        <div class="card span-7"><div class="card-head">${icon('play')}<h3>${doneToday ? 'Treino de hoje feito' : planned.length ? 'Treino de hoje' : 'Começar um treino'}</h3></div>
+          ${FT.plans().length ? h`<div class="list">${(planned.length ? planned : FT.plans().slice(0, 3)).map((t) => h`<div class="li"><span class="tile" style="background:${t.cor || 'var(--surface-2)'};color:var(--on-primary)">${icon('dumbbell')}</span><span class="main tap" data-act="ui.go" data-to="fit/treino/${t.id}"><span class="t">${t.nome}</span><span class="s">${FT.items(t.id).length} exercícios · ~${t.duracao_estimada_min || 60} min</span></span><button class="btn btn-primary btn-sm" data-act="fit.start" data-id="${t.id}">${icon('play', 'sm')}Iniciar</button></div>`)}</div>`
+            : ui.empty({ ill: 'dumbbell', title: 'Nenhuma ficha de treino', text: 'Crie a sua ou comece com um modelo abaixo.', small: true, action: { label: 'Nova ficha', act: 'fit.editPlan' } })}</div>
+        <div class="card span-5"><div class="card-head">${icon('trophy')}<h3>Recordes recentes</h3></div>
+          ${prs.length ? h`<div class="list">${prs.map((p) => { const e = FT.ex(p.exercicio_id) || {}; return h`<div class="li" style="min-height:52px"><span class="tile sm" style="color:var(--primary-ink)">${icon('trophy', 'sm')}</span><span class="main"><span class="t">${e.nome}</span><span class="s">${fmt.num(p.carga, 1)} kg × ${p.reps} · ${fmt.day(p.data)}</span></span><span class="v">${fmt.num(p.e1rm, 1)}<small>1RM est.</small></span></div>`; })}</div>` : ui.empty({ ill: 'chart', title: 'Os recordes aparecem aqui', text: 'Detectamos automaticamente quando sua carga estimada supera a melhor marca.', small: true })}</div>
+      </div>
+      <div class="section-title"><h2>Planos em destaque</h2></div>
+      <div class="carousel">${TEMPLATES.map(planCard)}</div>`;
+    },
+    mount(root) { ui.countUp(root); }
+  });
+
+  // ---------- Fichas ----------
+  P.screen('fit/treinos', {
+    mod: 'fit', tab: 'treinos', title: 'Treinos', deps,
+    render() {
+      const fk = 'fit.treinos', dia = P.flt.get(fk, 'dia', 'todos'), obj = P.flt.get(fk, 'obj', ''), base = S.all('fit_treinos');
+      const OBJ = { hipertrofia: 'Hipertrofia', forca: 'Força', emagrecimento: 'Emagrecimento', resistencia: 'Resistência', condicionamento: 'Condicionamento', mobilidade: 'Mobilidade' };
+      const all = base.filter((t) => (dia === 'todos' || String(t.dias_semana || '').split(',').includes(dia === 'hoje' ? String(D.dow(D.today())) : dia)) && (!obj || t.objetivo === obj))
+        .sort((a, b) => (b.ativo === false ? -1 : 0) - (a.ativo === false ? -1 : 0) || a.nome.localeCompare(b.nome));
+      return h`<div class="page-head"><div><h1>Treinos</h1><p>Suas fichas e modelos prontos</p></div><button class="btn btn-primary btn-sm" data-act="fit.editPlan">${icon('plus', 'sm')}Nova ficha</button></div>
+        ${base.length > 1 ? h`<div class="filters mb-3"><div class="row-f">${P.flt.chips(fk, 'dia', [['todos', 'Todos'], ['hoje', 'De hoje'], ...fmt.WD.map((w, i) => [String(i), w])])}${P.flt.select(fk, 'obj', Object.entries(OBJ), 'Qualquer objetivo')}</div></div>` : ''}
+        ${all.length ? h`<div class="grid acc-grid">${all.map((t) => { const it = FT.items(t.id); const dias = String(t.dias_semana || '').split(',').filter(Boolean).map((d) => fmt.WD[+d]).join(' · '); return h`<div class="card plan-row ${t.ativo === false ? 'archived' : ''}" style="--pc:${t.cor || 'var(--c1)'}">
+          <a href="#/fit/treino/${t.id}" class="grow" style="color:inherit"><b>${t.nome}</b><div class="muted" style="font-size:12.5px;margin-top:4px">${it.length} exercícios · ~${t.duracao_estimada_min || 60} min${dias ? ' · ' + dias : ''}</div>
+          <div class="row-sm wrap mt-3">${[...new Set(it.map((i) => (FT.ex(i.exercicio_id) || {}).grupo_muscular))].filter(Boolean).slice(0, 4).map((g) => h`<span class="chip">${GL[g]}</span>`)}</div></a>
+          <button class="btn btn-primary btn-sm" data-act="fit.start" data-id="${t.id}" ${it.length ? '' : raw('disabled')}>${icon('play', 'sm')}Iniciar</button></div>`; })}</div>` : base.length ? ui.empty({ ill: 'search', title: 'Nenhuma ficha neste filtro', small: true }) : ui.empty({ ill: 'dumbbell', title: 'Nenhuma ficha ainda', text: 'Monte sua ficha com séries, repetições, carga e descanso — ou use um modelo.', action: { label: 'Nova ficha', act: 'fit.editPlan' } })}
+        <div class="section-title"><h2>Modelos</h2></div><div class="carousel">${TEMPLATES.map(planCard)}</div>`;
+    }
+  });
+
+  P.screen('fit/treino/:id', {
+    mod: 'fit', tab: 'treinos', title: (c) => ((S.get('fit_treinos', c.params && c.params.id) || {}).nome || 'Treino'), deps,
+    render(ctx) {
+      const t = S.get('fit_treinos', ctx.params.id);
+      if (!t) return ui.empty({ ill: 'search', title: 'Ficha não encontrada', action: { label: 'Voltar', act: 'ui.go', data: { to: 'fit/treinos' } } });
+      const it = FT.items(t.id);
+      return h`<div class="page-head"><div><a href="#/fit/treinos" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Treinos</a><h1 class="mt-2">${t.nome}</h1><p>${{ hipertrofia: 'Hipertrofia', forca: 'Força', emagrecimento: 'Emagrecimento', resistencia: 'Resistência', condicionamento: 'Condicionamento', mobilidade: 'Mobilidade' }[t.objetivo] || ''} · ${t.nivel || ''}</p></div>
+        <div class="row-sm"><button class="btn btn-ghost btn-sm" data-act="fit.editPlan" data-id="${t.id}">${icon('edit', 'sm')}Editar</button><button class="btn btn-ghost btn-sm" data-act="fit.dupPlan" data-id="${t.id}">${icon('copy', 'sm')}Duplicar</button><button class="btn btn-primary btn-sm" data-act="fit.start" data-id="${t.id}" ${it.length ? '' : raw('disabled')}>${icon('play', 'sm')}Iniciar</button></div></div>
+        ${it.length ? h`<div class="list cardlist">${it.map((i, n) => { const e = FT.ex(i.exercicio_id) || {}; return h`<div class="li"><span class="num faint" style="width:20px;text-align:center;font-weight:700">${n + 1}</span>
+          <span class="main tap" data-act="fit.editItem" data-id="${i.id}"><span class="t">${e.nome || 'Exercício'}</span><span class="s">${i.series} × ${i.reps_min}${i.reps_max && i.reps_max !== i.reps_min ? '–' + i.reps_max : ''}${i.carga_sugerida ? ' · ' + fmt.num(i.carga_sugerida, 1) + ' kg' : ''} · descanso ${i.descanso_s || 90}s${i.metodo && i.metodo !== 'normal' ? ' · ' + i.metodo : ''}</span></span>
+          <div class="row-sm"><button class="btn-icon sm" data-act="fit.moveItem" data-id="${i.id}" data-v="-1" aria-label="Subir" ${n === 0 ? raw('disabled') : ''}>${icon('chev-u', 'sm')}</button><button class="btn-icon sm" data-act="fit.moveItem" data-id="${i.id}" data-v="1" aria-label="Descer" ${n === it.length - 1 ? raw('disabled') : ''}>${icon('chev-d', 'sm')}</button></div></div>`; })}</div>` : ''}
+        <button class="btn btn-ghost btn-block mt-4" data-act="fit.addItem" data-id="${t.id}">${icon('plus', 'sm')}Adicionar exercício</button>
+        ${t.observacoes ? h`<div class="card mt-4"><p class="muted">${t.observacoes}</p></div>` : ''}`;
+    }
+  });
+
+  // ---------- Biblioteca ----------
+  const exList = () => {
+    const q = P.norm(st.exQ);
+    return FT.exercises().filter((e) => (!st.exGrupo || e.grupo_muscular === st.exGrupo) && (!q || P.norm(e.nome + ' ' + (e.musculos_secundarios || '')).includes(q)));
+  };
+  const exRows = (rows, act = 'fit.openEx') => rows.length ? h`<div class="list cardlist">${rows.map((e) => h`<div class="li tap" data-act="${act}" data-id="${e.id}"><span class="tile sm">${icon(e.tipo === 'cardio' ? 'pulse' : e.tipo === 'mobilidade' ? 'leaf' : 'dumbbell', 'sm')}</span><span class="main"><span class="t">${e.nome}${e.personalizado ? h` <span class="chip acc" style="height:20px;font-size:10.5px">seu</span>` : ''}</span><span class="s">${GL[e.grupo_muscular] || ''} · ${(EQUIP.find((x) => x[0] === e.equipamento) || [])[1] || ''}</span></span>${icon('chev-r', 'sm faint')}</div>`)}</div>` : ui.empty({ ill: 'search', title: 'Nenhum exercício encontrado', small: true });
+  P.screen('fit/exercicios', {
+    mod: 'fit', tab: 'exercicios', title: 'Exercícios', deps,
+    render() {
+      return h`<div class="page-head"><div><h1>Exercícios</h1><p>${FT.exercises().length} na biblioteca</p></div><button class="btn btn-primary btn-sm" data-act="fit.editEx">${icon('plus', 'sm')}Personalizado</button></div>
+        <div class="stack-sm"><div class="search">${icon('search')}<input class="input" placeholder="Buscar exercício ou músculo" value="${st.exQ}" data-on-input="fit.exSearch"></div>
+        ${ui.chips([['', 'Todos']].concat(GRUPOS), st.exGrupo, 'fit.exGrupo')}</div>
+        <div id="ex-list" class="mt-3">${exRows(exList())}</div>`;
+    }
+  });
+
+  // ---------- Timers ----------
+  const T = { mode: 'intervalado', running: false, t0: 0, acc: 0, total: 60, work: 40, rest: 20, rounds: 8, raf: null, lastPhase: '' };
+  function timerState() {
+    const el = T.running ? (Date.now() - T.t0) / 1000 + T.acc : T.acc;
+    if (T.mode === 'cronometro') return { main: el, label: 'Cronômetro', pct: (el % 60) / 60 * 100 };
+    if (T.mode === 'regressivo') { const left = Math.max(0, T.total - el); return { main: left, label: 'Regressivo', pct: (left / T.total) * 100, done: left <= 0 }; }
+    const cycle = T.work + T.rest, totalT = cycle * T.rounds - T.rest;
+    if (el >= totalT) return { main: 0, label: 'Concluído', round: T.rounds, pct: 0, done: true, phase: 'fim' };
+    const round = Math.floor(el / cycle) + 1, inCycle = el % cycle, working = inCycle < T.work;
+    const left = working ? T.work - inCycle : cycle - inCycle;
+    return { main: left, label: working ? 'Trabalho' : 'Descanso', phase: working ? 'w' : 'r', round, pct: (left / (working ? T.work : T.rest)) * 100 };
+  }
+  function timerTick() {
+    const s = timerState(), box = document.getElementById('timer-face');
+    if (!box) { cancelAnimationFrame(T.raf); return; }
+    const key = (s.phase || '') + (s.round || '');
+    if (T.running && T.lastPhase && key !== T.lastPhase) FT.beep(s.phase === 'w' ? 2 : 1);
+    if (T.running && s.main <= 3.05 && s.main > 0 && Math.ceil(s.main) !== T.lastTick && T.mode !== 'cronometro') { T.lastTick = Math.ceil(s.main); FT.beep(0); }
+    T.lastPhase = key;
+    box.querySelector('[data-main]').textContent = fmt.clock(T.mode === 'cronometro' ? s.main : Math.ceil(s.main));
+    box.querySelector('[data-label]').textContent = s.label + (s.round ? ` · round ${s.round}/${T.rounds}` : '');
+    const ring = box.querySelector('.ring-val'); if (ring) { const c = +ring.getAttribute('stroke-dasharray'); ring.setAttribute('stroke-dashoffset', c * (1 - P.clamp(s.pct, 0, 100) / 100)); ring.setAttribute('stroke', s.phase === 'r' ? 'var(--c5)' : 'var(--primary)'); }
+    if (s.done && T.running) { T.running = false; T.acc = T.mode === 'regressivo' ? T.total : T.acc; FT.beep(3); if (navigator.vibrate) navigator.vibrate([300, 120, 300]); drawTimerControls(); }
+    if (T.running) T.raf = requestAnimationFrame(timerTick);
+  }
+  const drawTimerControls = () => { const c = document.getElementById('timer-ctrl'); if (c) c.innerHTML = P.toHtml(timerControls()); };
+  const timerControls = () => h`<button class="btn-icon filled" data-act="fit.timerReset" aria-label="Zerar" style="width:56px;height:56px">${icon('refresh')}</button>
+    <button class="fab" style="transform:none;box-shadow:none;width:76px;height:76px" data-act="fit.timerToggle" aria-label="${T.running ? 'Pausar' : 'Iniciar'}">${icon(T.running ? 'pause' : 'play')}</button>
+    <button class="btn-icon filled" data-act="fit.timerSave" aria-label="Salvar como preset" style="width:56px;height:56px" ${T.mode === 'cronometro' ? raw('disabled') : ''}>${icon('star')}</button>`;
+  /** Bip curto via Web Audio (tipo: 0 tique, 1 descanso, 2 trabalho, 3 fim). */
+  FT.beep = (kind = 1) => {
+    if (P.settings.get('fit.som', true) === false) return;
+    try {
+      const ctx = FT._ac || (FT._ac = new (window.AudioContext || window.webkitAudioContext)());
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.frequency.value = [660, 520, 880, 990][kind]; o.type = 'sine';
+      g.gain.setValueAtTime(0.0001, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + (kind === 3 ? 0.6 : 0.18));
+      o.connect(g).connect(ctx.destination); o.start(); o.stop(ctx.currentTime + (kind === 3 ? 0.62 : 0.2));
+    } catch (e) { /* áudio indisponível */ }
+  };
+  P.screen('fit/timers', {
+    mod: 'fit', tab: 'timers', title: 'Timers', deps: ['fit_timers_presets'],
+    render() {
+      const presets = S.all('fit_timers_presets');
+      const s = timerState();
+      return h`<div class="page-head"><div><h1>Timers</h1></div></div>
+        ${ui.seg([['intervalado', 'Intervalado'], ['regressivo', 'Regressivo'], ['cronometro', 'Cronômetro']], T.mode, 'fit.timerMode')}
+        <div class="card pad-lg mt-4 timer" id="timer-face">
+          <div class="timer-dial">${ui.ring(s.pct, { size: 236, stroke: 14 })}
+          <div class="timer-read"><b class="num" data-main>${fmt.clock(T.mode === 'cronometro' ? s.main : Math.ceil(s.main))}</b><span class="muted" data-label>${s.label}</span></div></div>
+          <div class="row" id="timer-ctrl" style="justify-content:center;gap:20px">${timerControls()}</div>
+          ${T.mode === 'intervalado' ? h`<div class="grid g3 mt-4">${[['work', 'Trabalho', 's'], ['rest', 'Descanso', 's'], ['rounds', 'Rounds', '']].map(([k, l, u]) => h`<div class="field"><label>${l}</label><div class="stepper"><button data-act="fit.timerStep" data-k="${k}" data-v="-1" aria-label="Menos">${icon('minus', 'sm')}</button><input class="num" value="${T[k]}" readonly aria-label="${l}"><button data-act="fit.timerStep" data-k="${k}" data-v="1" aria-label="Mais">${icon('plus', 'sm')}</button></div></div>`)}</div>` : ''}
+          ${T.mode === 'regressivo' ? h`<div class="row-sm wrap mt-4" style="justify-content:center">${[30, 45, 60, 90, 120, 180, 300].map((x) => h`<button class="fchip ${T.total === x ? 'on' : ''}" data-act="fit.timerQuick" data-v="${x}">${x < 60 ? x + ' s' : x / 60 + ' min'}</button>`)}</div>` : ''}
+        </div>
+        <div class="section-title"><h2>Presets</h2></div>
+        ${presets.length ? h`<div class="list cardlist">${presets.map((p) => h`<div class="li tap" data-act="fit.usePreset" data-id="${p.id}"><span class="tile sm">${icon('timer', 'sm')}</span><span class="main"><span class="t">${p.nome}</span><span class="s">${p.tipo === 'regressivo' ? fmt.clock(p.trabalho_s) : `${p.trabalho_s}s / ${p.descanso_s}s × ${p.rounds}`}</span></span><button class="btn-icon sm" data-act="fit.delPreset" data-id="${p.id}" aria-label="Excluir">${icon('trash', 'sm')}</button></div>`)}</div>` : ui.empty({ ill: 'calendar', title: 'Sem presets', small: true })}`;
+    },
+    mount() { if (T.running) timerTick(); },
+    unmount() { cancelAnimationFrame(T.raf); }
+  });
+
+  // ---------- Histórico ----------
+  P.screen('fit/historico', {
+    mod: 'fit', tab: 'historico', title: 'Histórico', deps,
+    render() {
+      const fk = 'fit.hist', fo = { def: 'tudo', modes: ['mes', 'ano', '90d', 'intervalo', 'tudo'] }, tipo = P.flt.get(fk, 'tipo', 'todos'), treino = P.flt.get(fk, 'treino', '');
+      const sess = P.pf.filter(fk, FT.sessions(), 'data', fo).filter((s) => tipo !== 'cardio' && (!treino || s.treino_id === treino));
+      const cardio = P.pf.filter(fk, S.all('fit_cardio'), 'data', fo).filter(() => tipo !== 'treinos' && !treino);
+      const items = sess.map((s) => ({ kind: 's', d: s.data, s })).concat(cardio.map((c) => ({ kind: 'c', d: c.data, c }))).sort((a, b) => (a.d < b.d ? 1 : -1)).slice(0, st.histLimit);
+      const filtros = h`<div class="filters mb-3">${P.pf.bar(fk, fo)}<div class="row-f">${P.flt.chips(fk, 'tipo', [['todos', 'Tudo'], ['treinos', 'Treinos'], ['cardio', 'Cardio']])}${S.all('fit_treinos').length ? P.flt.select(fk, 'treino', S.all('fit_treinos').map((t) => [t.id, t.nome]), 'Todos os treinos') : ''}</div></div>`;
+      const byWeek = P.groupBy(items, (x) => D.weekStart(x.d, +P.settings.get('geral.inicio_semana', 0)));
+      return h`<div class="page-head"><div><h1>Histórico</h1><p>${P.fmt.plural(sess.length, 'treino', 'treinos')} · ${P.fmt.plural(cardio.length, 'cardio', 'cardios')}</p></div></div>
+        ${filtros}
+        ${items.length ? Object.keys(byWeek).sort().reverse().map((wk) => h`<div class="group-h"><span>Semana de ${fmt.dm(wk)}</span><span>${byWeek[wk].length}</span></div>
+          <div class="list cardlist">${byWeek[wk].map((x) => x.kind === 's' ? (() => { const t = S.getAny('fit_treinos', x.s.treino_id); const prs = FT.seriesOf(x.s.id).filter((r) => r.eh_pr).length; return h`<div class="li tap" data-act="fit.openSession" data-id="${x.s.id}"><span class="tile" style="background:${(t && t.cor) || 'var(--surface-2)'};color:var(--on-primary)">${icon('dumbbell')}</span><span class="main"><span class="t">${t ? t.nome : 'Treino livre'}</span><span class="s">${fmt.day(x.s.data)} · ${fmt.dur(x.s.duracao_s)} · ${fmt.num(x.s.volume_total)} kg</span></span>${prs ? h`<span class="chip acc">${icon('trophy', 'xs')}${prs}</span>` : ''}</div>`; })()
+            : h`<div class="li tap" data-act="fit.editCardio" data-id="${x.c.id}"><span class="tile">${icon('pulse')}</span><span class="main"><span class="t">${CARDIO[x.c.atividade][0]}${x.c.distancia_km ? ' · ' + fmt.num(x.c.distancia_km, 1) + ' km' : ''}</span><span class="s">${fmt.day(x.c.data)} · ${fmt.dur(x.c.duracao_s)}${x.c.pace ? ' · ' + x.c.pace + '/km' : ''}</span></span></div>`)}</div>`)
+          : FT.sessions().length || S.all('fit_cardio').length ? ui.empty({ ill: 'search', title: 'Nada neste filtro', text: 'Mude o período ou o tipo.', small: true }) : ui.empty({ ill: 'dumbbell', title: 'Nenhum treino registrado', text: 'Inicie um treino ou registre um cardio.', action: { label: 'Começar treino', act: 'fit.pickStart' } })}
+        ${items.length >= st.histLimit ? h`<button class="btn btn-ghost btn-block mt-4" data-act="fit.histMore">Carregar mais</button>` : ''}`;
+    }
+  });
+
+  // ---------- Evolução ----------
+  P.screen('fit/evolucao', {
+    mod: 'fit', tab: 'evolucao', title: 'Evolução', deps,
+    render() {
+      const tabs = ui.seg([['peso', 'Peso'], ['medidas', 'Medidas'], ['fotos', 'Fotos'], ['forca', 'Força'], ['freq', 'Frequência']], st.evo, 'fit.evo', { cls: 'sm' });
+      const head = h`<div class="page-head"><div><h1>Evolução</h1></div><div class="row-sm">${P.rep.button('fit')}<button class="btn btn-primary btn-sm" data-act="fit.addMedida">${icon('plus', 'sm')}Registrar</button></div></div><div style="overflow-x:auto">${tabs}</div>
+        ${st.evo !== 'freq' ? h`<div class="filters mt-3">${P.pf.bar('fit.evo', EVO_PF)}</div>` : ''}`;
+      const wAll = FT.weights(), w = P.pf.filter('fit.evo', wAll, 'data', EVO_PF);
+      const semDados = ui.empty({ ill: 'search', title: 'Nada neste período', text: 'Escolha outro período ou "Tudo".', small: true });
+      if (st.evo === 'peso') {
+        if (!wAll.length) return h`${head}${ui.empty({ ill: 'chart', title: 'Registre seu peso', text: 'Com 3 registros já mostramos tendência e previsão para a meta.', action: { label: 'Registrar peso', act: 'fit.addMedida' } })}`;
+        if (!w.length) return h`${head}${semDados}`;
+        const goal = FT.goalWeight(), last = wAll[wAll.length - 1], first = w[0], lastP = w[w.length - 1];
+        const proj = goal ? P.calc.projectDate(wAll.slice(-10).map((x) => ({ date: x.data, v: +x.peso_kg })), goal) : null;
+        const alt = P.me.altura_cm ? P.calc.bmi(+last.peso_kg, +P.me.altura_cm) : null;
+        return h`${head}<div class="grid g3 mt-4"><div class="card">${ui.metric({ label: 'Atual', value: fmt.num(last.peso_kg, 1), unit: 'kg', size: 'md', sub: fmt.day(last.data) })}</div>
+          <div class="card">${ui.metric({ label: 'Variação no período', value: (lastP.peso_kg - first.peso_kg > 0 ? '+' : '') + fmt.num(lastP.peso_kg - first.peso_kg, 1), unit: 'kg', size: 'md', sub: `${fmt.date(first.data)} a ${fmt.date(lastP.data)}` })}</div>
+          <div class="card">${goal ? ui.metric({ label: `Meta ${fmt.num(goal, 1)} kg`, value: proj ? fmt.date(proj) : '—', size: 'md', sub: proj ? 'previsão pelo ritmo atual' : 'ritmo atual não alcança a meta' }) : ui.metric({ label: 'IMC', value: alt ? fmt.num(alt.imc, 1) : '—', size: 'md', sub: alt ? alt.classe : 'informe a altura no perfil' })}</div></div>
+          <div class="card mt-4"><div class="card-head">${icon('trending')}<h3>Peso e média móvel</h3></div><div id="evo-peso"></div></div>
+          <div class="list cardlist mt-4">${w.slice().reverse().slice(0, 12).map((x) => h`<div class="li tap" data-act="fit.addMedida" data-id="${x.id}"><span class="main"><span class="t">${fmt.num(x.peso_kg, 1)} kg${x.gordura_pct ? h` <span class="faint">· ${fmt.num(x.gordura_pct, 1)}% gordura</span>` : ''}</span><span class="s">${fmt.day(x.data)}</span></span>${icon('chev-r', 'sm faint')}</div>`)}</div>`;
+      }
+      if (st.evo === 'medidas') {
+        const msAll = S.all('fit_medidas').filter((m) => m.cintura || m.braco_d || m.quadril), ms = P.pf.filter('fit.evo', msAll, 'data', EVO_PF).sort((a, b) => (a.data < b.data ? -1 : 1));
+        if (msAll.length && !ms.length) return h`${head}${semDados}`;
+        if (!ms.length) return h`${head}${ui.empty({ ill: 'chart', title: 'Sem medidas', text: 'Registre cintura, quadril, braços… com fita métrica.', action: { label: 'Registrar medidas', act: 'fit.addMedida' } })}`;
+        const a = ms[0], b = ms[ms.length - 1];
+        const keys = [['cintura', 'Cintura'], ['quadril', 'Quadril'], ['peito', 'Peito'], ['braco_d', 'Braço dir.'], ['braco_e', 'Braço esq.'], ['coxa_d', 'Coxa dir.'], ['coxa_e', 'Coxa esq.'], ['panturrilha', 'Panturrilha'], ['pescoco', 'Pescoço'], ['gordura_pct', '% gordura']];
+        return h`${head}<div class="card mt-4" style="overflow-x:auto"><table class="table"><thead><tr><th>Medida</th><th class="r">${fmt.date(a.data)}</th><th class="r">${fmt.date(b.data)}</th><th class="r">Variação</th></tr></thead><tbody>
+          ${keys.filter(([k]) => a[k] || b[k]).map(([k, l]) => { const dv = (+b[k] || 0) - (+a[k] || 0); return h`<tr><td>${l}</td><td class="r">${a[k] ? fmt.num(a[k], 1) : '—'}</td><td class="r">${b[k] ? fmt.num(b[k], 1) : '—'}</td><td class="r ${dv < 0 ? 'pos' : dv > 0 ? '' : 'faint'}">${a[k] && b[k] ? (dv > 0 ? '+' : '') + fmt.num(dv, 1) : '—'}</td></tr>`; })}</tbody></table></div>`;
+      }
+      if (st.evo === 'fotos') {
+        const fotos = P.pf.filter('fit.evo', S.all('fit_medidas').filter((m) => m.foto_arquivo_ids), 'data', EVO_PF).sort((a, b) => (a.data < b.data ? -1 : 1)).flatMap((m) => String(m.foto_arquivo_ids).split(',').filter(Boolean).map((id) => ({ id, data: m.data })));
+        return h`${head}<div class="row-sm mt-4"><button class="btn btn-ghost btn-sm" data-act="fit.addFoto">${icon('camera', 'sm')}Adicionar foto</button>${fotos.length >= 2 ? h`<button class="btn btn-primary btn-sm" data-act="fit.compare">${icon('layers', 'sm')}Comparar antes e depois</button>` : ''}</div>
+          ${fotos.length ? h`<div class="photo-grid mt-4">${fotos.slice().reverse().map((f) => h`<figure class="photo" data-photo="${f.id}"><div class="skel" style="height:100%"></div><figcaption>${fmt.date(f.data)}</figcaption></figure>`)}</div>` : ui.empty({ ill: 'file', title: 'Nenhuma foto de progresso', text: 'As fotos ficam na pasta "progresso" do seu Drive, visíveis só para você.' })}`;
+      }
+      if (st.evo === 'forca') {
+        const used = [...new Set(S.all('fit_series').filter((x) => x.e1rm).map((x) => x.exercicio_id))].map(FT.ex).filter(Boolean).sort((a, b) => a.nome.localeCompare(b.nome));
+        if (!st.forcaEx && used[0]) st.forcaEx = used[0].id;
+        return h`${head}${used.length ? h`<div class="field mt-4"><label>Exercício</label><select class="input" data-on-change="fit.forcaEx">${used.map((e) => h`<option value="${e.id}" ${e.id === st.forcaEx ? raw('selected') : ''}>${e.nome}</option>`)}</select></div>
+          <div class="card mt-4"><div class="card-head">${icon('trending')}<h3>1RM estimado (Epley)</h3></div><div id="evo-forca"></div></div>
+          <div class="card mt-4"><div class="card-head">${icon('chart')}<h3>Volume semanal por grupo</h3></div><div id="evo-vol"></div></div>` : ui.empty({ ill: 'chart', title: 'Sem séries registradas', text: 'Faça um treino no modo foco para acompanhar a força.' })}`;
+      }
+      return h`${head}<div class="card mt-4"><div class="card-head">${icon('calendar')}<h3>Frequência de treinos</h3><span class="muted" style="font-size:12px">últimas 26 semanas</span></div><div id="evo-heat"></div></div>
+        <div class="card mt-4"><div class="card-head">${icon('chart')}<h3>Treinos por semana</h3></div><div id="evo-freq"></div></div>`;
+    },
+    mount(root) {
+      const w = P.pf.filter('fit.evo', FT.weights(), 'data', EVO_PF);
+      if (st.evo === 'peso' && w.length) {
+        const goal = FT.goalWeight();
+        P.charts.mount('#evo-peso', { type: 'line', labels: w.map((x) => fmt.dm(x.data)), series: [{ label: 'Peso', data: w.map((x) => +x.peso_kg), fill: true }, { label: 'Média móvel', data: P.calc.ema(w.map((x) => +x.peso_kg), 0.35), neutral: true, dashed: true, points: false }], goal, zero: false, legend: true, fmt: (v) => fmt.num(v, 1) + ' kg', height: 240 });
+      }
+      if (st.evo === 'fotos') P.$$('[data-photo]', root).forEach(async (fig) => { try { const u = await P.files.url(fig.dataset.photo); fig.querySelector('.skel').outerHTML = `<img alt="Foto de progresso" src="${P.esc(u)}">`; } catch (e) { fig.querySelector('.skel').outerHTML = '<div class="empty sm"><p>Indisponível</p></div>'; } });
+      if (st.evo === 'forca' && st.forcaEx) {
+        const sess = Object.fromEntries(S.all('fit_sessoes').map((s) => [s.id, s.data]));
+        const byDay = {};
+        S.where('fit_series', (x) => x.exercicio_id === st.forcaEx && x.e1rm).forEach((x) => { const d = sess[x.sessao_id]; if (d && P.pf.has('fit.evo', d, EVO_PF)) byDay[d] = Math.max(byDay[d] || 0, x.e1rm); });
+        const ds = Object.keys(byDay).sort();
+        P.charts.mount('#evo-forca', { type: 'line', labels: ds.map(fmt.dm), series: [{ label: '1RM est.', data: ds.map((d) => byDay[d]), fill: true }], zero: false, fmt: (v) => fmt.num(v, 1) + ' kg', height: 220 });
+        const weeks = Array.from({ length: 8 }, (_, i) => D.add(FT.weekRange()[0], (i - 7) * 7));
+        const groups = {};
+        S.all('fit_series').forEach((x) => { const d = sess[x.sessao_id]; if (!d || d < weeks[0]) return; const g = (FT.ex(x.exercicio_id) || {}).grupo_muscular || 'outro'; const wi = weeks.findIndex((wk, i) => d >= wk && (i === 7 || d < weeks[i + 1])); if (wi < 0) return; (groups[g] = groups[g] || Array(8).fill(0))[wi] += (+x.carga || 0) * (+x.reps || 0); });
+        const top = Object.entries(groups).sort((a, b) => P.sum(b[1]) - P.sum(a[1])).slice(0, 6);
+        P.charts.mount('#evo-vol', { type: 'bar', stacked: true, labels: weeks.map(fmt.dm), series: top.map(([g, data], i) => ({ label: GL[g] || g, data, color: P.PALETTE[i] })), legend: true, fmt: (v) => fmt.num(v) + ' kg', height: 240 });
+      }
+      if (st.evo === 'freq') {
+        const ws = +P.settings.get('geral.inicio_semana', 0), first = D.weekStart(D.add(D.today(), -26 * 7 + 7), ws);
+        const count = {}; FT.sessions().forEach((s) => { count[s.data] = (count[s.data] || 0) + 1; }); S.all('fit_cardio').forEach((c) => { count[c.data] = (count[c.data] || 0) + 1; });
+        document.getElementById('evo-heat').innerHTML = P.toHtml(ui.heat(D.range(first, D.add(first, 26 * 7 - 1)).map((d) => ({ date: d, v: d > D.today() ? 0 : Math.min(4, (count[d] || 0) * 2), title: `${fmt.date(d)}: ${count[d] || 0} atividade(s)` })))); ui.scrollHeat();
+        const weeks = Array.from({ length: 12 }, (_, i) => D.add(D.weekStart(D.today(), ws), (i - 11) * 7));
+        P.charts.mount('#evo-freq', { type: 'bar', labels: weeks.map(fmt.dm), series: [{ label: 'Treinos', data: weeks.map((wk) => FT.sessions().filter((s) => s.data >= wk && s.data <= D.add(wk, 6)).length) }], goal: FT.goalWeek(), highlight: 11, height: 200 });
+      }
+    }
+  });
+
+  // ---------- Cardio ----------
+  P.screen('fit/cardio', {
+    mod: 'fit', tab: 'cardio', title: 'Cardio', deps,
+    render() {
+      const fk = 'fit.cardio', fo = { def: 'mes', modes: ['mes', 'ano', '30d', 'intervalo', 'tudo'] }, atv = P.flt.get(fk, 'atv', '');
+      const all = P.pf.filter(fk, S.all('fit_cardio'), 'data', fo).filter((c) => !atv || c.atividade === atv).sort((a, b) => (a.data < b.data ? 1 : -1));
+      const month = all;
+      return h`<div class="page-head"><div><h1>Cardio</h1><p>${P.pf.range(fk, fo).label}</p></div><button class="btn btn-primary btn-sm" data-act="fit.editCardio">${icon('plus', 'sm')}Registrar</button></div>
+        <div class="filters mb-3">${P.pf.bar(fk, { ...fo, extra: P.flt.select(fk, 'atv', Object.entries(CARDIO).map(([k, x]) => [k, x[0]]), 'Todas as atividades') })}</div>
+        <div class="grid g3"><div class="card">${ui.metric({ label: 'Distância', value: fmt.num(P.sum(month, (c) => +c.distancia_km || 0), 1), unit: 'km', size: 'md' })}</div>
+          <div class="card">${ui.metric({ label: 'Tempo', value: fmt.dur(P.sum(month, (c) => +c.duracao_s || 0)), size: 'md' })}</div>
+          <div class="card">${ui.metric({ label: 'Calorias', value: fmt.num(P.sum(month, (c) => +c.kcal || 0)), unit: 'kcal', size: 'md' })}</div></div>
+        <div class="card mt-4"><div class="card-head">${icon('chart')}<h3>Km por semana</h3></div><div id="cardio-chart"></div></div>
+        ${all.length ? h`<div class="list cardlist mt-4">${all.slice(0, 120).map((c) => h`<div class="li tap" data-act="fit.editCardio" data-id="${c.id}"><span class="tile">${icon('pulse')}</span><span class="main"><span class="t">${CARDIO[c.atividade][0]}${c.distancia_km ? ' · ' + fmt.num(c.distancia_km, 1) + ' km' : ''}</span><span class="s">${fmt.day(c.data)} · ${fmt.dur(c.duracao_s)}${c.pace ? ' · ' + c.pace + '/km' : ''}${c.fc_media ? ' · ' + c.fc_media + ' bpm' : ''}</span></span><span class="v">${fmt.num(c.kcal || 0)}<small>kcal</small></span></div>`)}</div>` : ''}`;
+    },
+    mount() {
+      const ws = +P.settings.get('geral.inicio_semana', 0);
+      const weeks = Array.from({ length: 10 }, (_, i) => D.add(D.weekStart(D.today(), ws), (i - 9) * 7));
+      P.charts.mount('#cardio-chart', { type: 'bar', labels: weeks.map(fmt.dm), series: [{ label: 'Km', data: weeks.map((wk) => P.round(P.sum(S.where('fit_cardio', (c) => c.data >= wk && c.data <= D.add(wk, 6)), (c) => +c.distancia_km || 0), 1)) }], highlight: 9, fmt: (v) => fmt.num(v, 1) + ' km', height: 190, empty: 'Sem cardio nas últimas semanas' });
+    }
+  });
+
+  // ---------- Calculadoras ----------
+  const calcDefs = () => {
+    const age = D.age(P.me.nascimento) || 30, peso = FT.latestWeight() || 75, alt = +P.me.altura_cm || 175, sexo = P.me.sexo || 'masculino';
+    const last = S.all('fit_medidas').filter((m) => m.cintura).sort((a, b) => (a.data < b.data ? 1 : -1))[0] || {};
+    return { age, peso, alt, sexo, cintura: last.cintura || 88, pescoco: last.pescoco || 38, quadril: last.quadril || 98 };
+  };
+  P.screen('fit/calc', {
+    mod: 'fit', tab: 'calc', title: 'Calculadoras', deps: ['fit_medidas'],
+    render() {
+      const v = calcDefs();
+      const inp = (k, l, val, unit) => h`<div class="field"><label>${l}</label><div class="input-wrap"><input class="input num" inputmode="decimal" data-calc="${k}" value="${String(val).replace('.', ',')}">${unit ? h`<span class="suffix">${unit}</span>` : ''}</div></div>`;
+      return h`<div class="page-head"><div><h1>Calculadoras</h1><p>Preenchidas com seu perfil e últimas medidas.</p></div></div>
+        <div class="card"><div class="form-row">
+          <div class="field"><label>Sexo</label><select class="input" data-calc="sexo"><option value="masculino" ${v.sexo === 'masculino' ? raw('selected') : ''}>Masculino</option><option value="feminino" ${v.sexo === 'feminino' ? raw('selected') : ''}>Feminino</option></select></div>
+          ${inp('idade', 'Idade', v.age, 'anos')}${inp('peso', 'Peso', v.peso, 'kg')}${inp('altura', 'Altura', v.alt, 'cm')}
+          ${inp('cintura', 'Cintura', v.cintura, 'cm')}${inp('pescoco', 'Pescoço', v.pescoco, 'cm')}${inp('quadril', 'Quadril', v.quadril, 'cm')}
+          <div class="field"><label>Atividade</label><select class="input" data-calc="nivel">${Object.entries(P.calc.ACTIVITY_LABEL).map(([k, l]) => h`<option value="${k}" ${k === 'moderado' ? raw('selected') : ''}>${l}</option>`)}</select></div>
+          ${inp('carga', 'Carga (1RM)', 80, 'kg')}${inp('reps', 'Repetições', 6, '')}
+        </div></div>
+        <div class="grid calc-grid mt-4" id="calc-out"></div>
+        <p class="faint mt-4" style="font-size:12px">Estimativas por fórmulas populacionais. Não substituem avaliação de médico, nutricionista ou educador físico.</p>`;
+    },
+    mount(root) {
+      const out = root.querySelector('#calc-out');
+      const run = () => {
+        const g = (k) => { const el = root.querySelector(`[data-calc="${k}"]`); return el.tagName === 'SELECT' ? el.value : P.parseNum(el.value) || 0; };
+        const sexo = g('sexo'), idade = g('idade'), peso = g('peso'), altura = g('altura');
+        const imc = P.calc.bmi(peso, altura), faixa = P.calc.healthyRange(altura);
+        const tmb = P.calc.bmr({ peso, altura, idade, sexo }), tdee = P.calc.tdee(tmb, g('nivel'));
+        const gord = P.calc.navy({ sexo, cintura: g('cintura'), pescoco: g('pescoco'), quadril: g('quadril'), altura });
+        const rm = P.calc.oneRm(g('carga'), Math.round(g('reps'))), zones = P.calc.hrZones(idade);
+        const card = (ic, t, body) => h`<div class="card"><div class="card-head">${icon(ic)}<h3>${t}</h3></div>${body}</div>`;
+        out.innerHTML = P.toHtml(h`
+          ${card('scale', 'IMC', h`${ui.metric({ label: imc.classe, value: fmt.num(imc.imc, 1), size: 'md' })}<p class="muted mt-2" style="font-size:12.5px">Faixa saudável: ${fmt.num(faixa.min, 1)}–${fmt.num(faixa.max, 1)} kg</p>`)}
+          ${card('flame', 'Gasto diário', h`<div class="kv"><span>TMB (Mifflin)</span><b>${fmt.num(tmb)} kcal</b></div><div class="kv"><span>Total do dia (TDEE)</span><b>${fmt.num(tdee)} kcal</b></div>`)}
+          ${card('ruler', '% de gordura (Marinha)', ui.metric({ label: 'estimado', value: Number.isFinite(gord) && gord > 0 ? fmt.num(gord, 1) : '—', unit: '%', size: 'md', sub: Number.isFinite(gord) && gord > 0 ? `massa magra ≈ ${fmt.num(peso * (1 - gord / 100), 1)} kg` : 'confira as medidas' }))}
+          ${card('trophy', '1RM estimado', h`<div class="kv"><span>Epley</span><b>${fmt.num(rm.epley, 1)} kg</b></div><div class="kv"><span>Brzycki</span><b>${fmt.num(rm.brzycki, 1)} kg</b></div><div class="kv"><span>80% (5–8 reps)</span><b>${fmt.num(rm.epley * 0.8, 1)} kg</b></div>`)}
+          ${card('heart', 'Zonas de frequência', h`<p class="muted" style="font-size:12.5px;margin-bottom:6px">FC máx. (Tanaka): ${P.calc.hrMax(idade)} bpm</p>${zones.map((z) => h`<div class="kv"><span>Z${z.zona} · ${z.nome}</span><b>${z.de}–${z.ate}</b></div>`)}`)}
+          ${card('droplet', 'Hidratação', ui.metric({ label: 'meta diária', value: fmt.num(P.calc.water(peso) / 1000, 1), unit: 'litros', size: 'md', sub: '+ ~0,5 L por hora de treino' }))}`);
+      };
+      root.addEventListener('input', P.debounce(run, 150)); root.addEventListener('change', run); run();
+    }
+  });
+
+  // ================= Modo foco (executar treino) =================
+  const W = { s: null, el: null, timer: null, lock: null };
+  const saveRun = () => P.ls.set('fit.session', W.s);
+  /** Inicia (ou retoma) um treino em modo foco. */
+  FT.start = (treinoId, resume) => {
+    if (resume && P.ls.get('fit.session')) W.s = P.ls.get('fit.session');
+    else {
+      const t = S.get('fit_treinos', treinoId);
+      const items = treinoId ? FT.items(treinoId) : [];
+      W.s = {
+        id: P.uuid(), treino_id: treinoId || null, nome: t ? t.nome : 'Treino livre', t0: Date.now(), cur: 0, rest: null,
+        ex: items.map((i) => {
+          const prev = FT.lastSets(i.exercicio_id);
+          return { exercicio_id: i.exercicio_id, descanso_s: i.descanso_s || 90, alvo: `${i.reps_min}${i.reps_max && i.reps_max !== i.reps_min ? '–' + i.reps_max : ''}`,
+            sets: Array.from({ length: i.series || 3 }, (_, n) => { const p = prev[n] || prev[prev.length - 1]; return { carga: p ? p.carga : (i.carga_sugerida || 0), reps: p ? p.reps : (i.reps_max || i.reps_min || 10), prev: p ? `${fmt.num(p.carga, 1)}×${p.reps}` : '—', done: false }; }) };
+        })
+      };
+    }
+    saveRun();
+    openFocus();
+  };
+  function openFocus() {
+    if (W.el) W.el.remove();
+    W.el = document.createElement('div');
+    W.el.className = 'focus-mode';
+    document.body.appendChild(W.el);
+    document.body.style.overflow = 'hidden';
+    try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then((l) => { W.lock = l; }).catch(() => {}); } catch (e) { /* noop */ }
+    drawFocus();
+    clearInterval(W.timer);
+    W.timer = setInterval(tickFocus, 250);
+    W.el.addEventListener('click', onFocusClick);
+    W.el.addEventListener('change', onFocusChange);
+  }
+  function closeFocus() {
+    clearInterval(W.timer);
+    if (W.lock) { try { W.lock.release(); } catch (e) { /* noop */ } W.lock = null; }
+    if (W.el) W.el.remove();
+    W.el = null; document.body.style.overflow = '';
+  }
+  function tickFocus() {
+    if (!W.el || !W.s) return;
+    const el = W.el.querySelector('[data-clock]'); if (el) el.textContent = fmt.clock((Date.now() - W.s.t0) / 1000);
+    const r = W.s.rest;
+    const bar = W.el.querySelector('.rest-bar');
+    if (r) {
+      const left = Math.max(0, r.end - Date.now()) / 1000;
+      if (bar) { bar.querySelector('[data-rest]').textContent = fmt.clock(Math.ceil(left)); bar.querySelector('.progress > i').style.width = (left / r.total) * 100 + '%'; }
+      if (left <= 3 && left > 0 && Math.ceil(left) !== r.tick) { r.tick = Math.ceil(left); FT.beep(0); }
+      if (left <= 0) { W.s.rest = null; saveRun(); FT.beep(3); if (navigator.vibrate) navigator.vibrate([250, 100, 250]); drawFocus(); }
+    }
+  }
+  function drawFocus() {
+    const s = W.s, e = s.ex[s.cur];
+    const ex = e ? FT.ex(e.exercicio_id) || {} : null;
+    const done = P.sum(s.ex, (x) => x.sets.filter((z) => z.done).length), total = P.sum(s.ex, (x) => x.sets.length);
+    const best = e ? FT.bestE1rm(e.exercicio_id) : 0;
+    W.el.innerHTML = P.toHtml(h`<header class="focus-head"><button class="btn-icon" data-f="close" aria-label="Sair">${icon('x')}</button><div class="grow" style="text-align:center"><b>${s.nome}</b><div class="num muted" data-clock>${fmt.clock((Date.now() - s.t0) / 1000)}</div></div><button class="btn btn-primary btn-sm" data-f="finish">Finalizar</button></header>
+      <div class="focus-progress">${ui.progress((done / (total || 1)) * 100, { size: 'thin' })}</div>
+      <div class="focus-chips">${s.ex.map((x, i) => { const n = (FT.ex(x.exercicio_id) || {}).nome || '—'; const ok = x.sets.every((z) => z.done); return h`<button class="fchip ${i === s.cur ? 'on' : ''}" data-f="go" data-i="${i}">${ok ? icon('check', 'xs') : ''}${i + 1}. ${n.split(' ').slice(0, 2).join(' ')}</button>`; })}<button class="fchip" data-f="addEx">${icon('plus', 'xs')}Exercício</button></div>
+      <div class="focus-body">
+        ${e ? h`<div class="row between"><div><h2>${ex.nome}</h2><p class="muted">${GL[ex.grupo_muscular] || ''} · alvo ${e.alvo} reps · descanso ${e.descanso_s}s${best ? ' · melhor 1RM ' + fmt.num(best, 1) + ' kg' : ''}</p></div></div>
+          <div class="sets"><div class="set head"><span>Série</span><span>Anterior</span><span>kg</span><span>Reps</span><span></span></div>
+          ${e.sets.map((z, i) => { const e1 = P.calc.oneRm(+z.carga, +z.reps).epley; const pr = z.done && best && e1 > best + 0.05; return h`<div class="set ${z.done ? 'done' : ''}"><span class="num"><b>${i + 1}</b>${pr ? h` <span class="chip acc" style="height:20px;padding:0 6px">${icon('trophy', 'xs')}PR</span>` : ''}</span><span class="faint num">${z.prev}</span>
+            <input class="input num" inputmode="decimal" data-f="carga" data-i="${i}" value="${String(z.carga ?? '').replace('.', ',')}" aria-label="Carga série ${i + 1}">
+            <input class="input num" inputmode="numeric" data-f="reps" data-i="${i}" value="${z.reps ?? ''}" aria-label="Repetições série ${i + 1}">
+            <button class="check ${z.done ? 'on' : ''}" data-f="done" data-i="${i}" aria-label="Concluir série ${i + 1}">${icon('check')}</button></div>`; })}</div>
+          <div class="row-sm mt-3"><button class="btn btn-ghost btn-sm" data-f="addSet">${icon('plus', 'sm')}Série</button>${e.sets.length > 1 ? h`<button class="btn btn-quiet btn-sm" data-f="delSet">${icon('minus', 'sm')}Remover série</button>` : ''}</div>`
+          : ui.empty({ ill: 'dumbbell', title: 'Treino livre', text: 'Adicione exercícios para registrar as séries.', action: { label: 'Adicionar exercício', act: 'fit.focusAddEx' } })}
+      </div>
+      ${s.rest ? h`<div class="rest-bar"><div class="row between"><span class="muted">Descanso</span><b class="num" data-rest style="font-size:28px">${fmt.clock(Math.ceil((s.rest.end - Date.now()) / 1000))}</b><div class="row-sm"><button class="btn btn-ghost btn-sm" data-f="rest15">+15 s</button><button class="btn btn-primary btn-sm" data-f="skipRest">Pular</button></div></div><div class="progress thin mt-2"><i style="width:100%"></i></div></div>` : ''}
+      <footer class="focus-foot"><button class="btn btn-ghost" data-f="prev" ${s.cur === 0 ? raw('disabled') : ''}>${icon('chev-l', 'sm')}Anterior</button><button class="btn btn-ghost" data-f="next" ${s.cur >= s.ex.length - 1 ? raw('disabled') : ''}>Próximo${icon('chev-r', 'sm')}</button></footer>`);
+  }
+  function onFocusChange(ev) {
+    const f = ev.target.dataset.f; if (f !== 'carga' && f !== 'reps') return;
+    const z = W.s.ex[W.s.cur].sets[+ev.target.dataset.i];
+    z[f] = f === 'carga' ? (P.parseNum(ev.target.value) || 0) : Math.round(P.parseNum(ev.target.value) || 0);
+    saveRun();
+  }
+  async function onFocusClick(ev) {
+    const b = ev.target.closest('[data-f]'); if (!b || b.tagName === 'INPUT') return;
+    const s = W.s, e = s.ex[s.cur], f = b.dataset.f;
+    if (f === 'close') {
+      const any = s.ex.some((x) => x.sets.some((z) => z.done));
+      if (any && !(await ui.confirm({ title: 'Sair do treino?', text: 'O progresso fica salvo neste aparelho e você pode retomar depois.', ok: 'Sair', cancel: 'Continuar treinando' }))) return;
+      closeFocus(); if (!any) P.ls.del('fit.session'); P.router.render(true); return;
+    }
+    if (f === 'go') s.cur = +b.dataset.i;
+    if (f === 'prev') s.cur = Math.max(0, s.cur - 1);
+    if (f === 'next') s.cur = Math.min(s.ex.length - 1, s.cur + 1);
+    if (f === 'addSet') { const l = e.sets[e.sets.length - 1] || { carga: 0, reps: 10, prev: '—' }; e.sets.push({ carga: l.carga, reps: l.reps, prev: '—', done: false }); }
+    if (f === 'delSet') e.sets.pop();
+    if (f === 'done') {
+      const i = +b.dataset.i, z = e.sets[i];
+      P.$$('input[data-i="' + i + '"]', W.el).forEach((inp) => { z[inp.dataset.f] = inp.dataset.f === 'carga' ? (P.parseNum(inp.value) || 0) : Math.round(P.parseNum(inp.value) || 0); });
+      z.done = !z.done;
+      if (z.done) {
+        if (navigator.vibrate) navigator.vibrate(20);
+        const last = e.sets.every((x) => x.done);
+        s.rest = { end: Date.now() + e.descanso_s * 1000, total: e.descanso_s };
+        if (last && s.cur < s.ex.length - 1) setTimeout(() => { if (W.s === s) { s.cur++; saveRun(); drawFocus(); } }, 700);
+      }
+    }
+    if (f === 'rest15' && s.rest) { s.rest.end += 15000; s.rest.total += 15; }
+    if (f === 'skipRest') s.rest = null;
+    if (f === 'addEx') return pickExercise((exId) => { s.ex.push({ exercicio_id: exId, descanso_s: 90, alvo: '8–12', sets: [0, 1, 2].map(() => ({ carga: (FT.lastSets(exId)[0] || {}).carga || 0, reps: 10, prev: '—', done: false })) }); s.cur = s.ex.length - 1; saveRun(); drawFocus(); });
+    if (f === 'finish') return finishWorkout();
+    saveRun(); drawFocus();
+  }
+  P.act['fit.focusAddEx'] = () => pickExercise((exId) => { W.s.ex.push({ exercicio_id: exId, descanso_s: 90, alvo: '8–12', sets: [0, 1, 2].map(() => ({ carga: 0, reps: 10, prev: '—', done: false })) }); W.s.cur = W.s.ex.length - 1; saveRun(); drawFocus(); });
+
+  function finishWorkout() {
+    const s = W.s;
+    const series = []; s.ex.forEach((e) => e.sets.forEach((z) => { if (z.done) series.push({ exercicio_id: e.exercicio_id, reps: z.reps, carga: z.carga, concluida: true }); }));
+    if (!series.length) { ui.toast('Conclua ao menos uma série para salvar.', { error: true }); return; }
+    const dur = Math.round((Date.now() - s.t0) / 1000), vol = P.sum(series, (x) => (+x.carga || 0) * (+x.reps || 0));
+    const sheet = ui.sheet({
+      title: 'Resumo do treino',
+      body: h`<div class="grid g3">${ui.metric({ label: 'Duração', value: fmt.dur(dur), size: 'md' })}${ui.metric({ label: 'Volume', value: fmt.num(vol), unit: 'kg', size: 'md' })}${ui.metric({ label: 'Séries', value: series.length, size: 'md' })}</div>
+        <div class="form mt-4"><div class="field"><label>Esforço percebido (RPE): <b data-rpe-v>7</b></label><input type="range" min="1" max="10" value="7" data-rpe style="accent-color:var(--primary)"></div>
+        <div class="field"><label>Como você se sentiu?</label><div class="seg sm" data-humor>${[1, 2, 3, 4, 5].map((n) => h`<button type="button" class="${n === 4 ? 'on' : ''}" data-v="${n}">${['Péssimo', 'Ruim', 'Ok', 'Bem', 'Ótimo'][n - 1]}</button>`)}</div></div>
+        <div class="field"><label>Observação</label><textarea class="input" rows="2" data-obs placeholder="Ex.: ombro incomodou no supino"></textarea></div></div>`,
+      foot: h`<button class="btn btn-primary" data-save>${icon('check', 'sm')}Salvar treino</button>`,
+      onMount(sh) {
+        let humor = 4;
+        sh.$('[data-rpe]').oninput = (e) => { sh.$('[data-rpe-v]').textContent = e.target.value; };
+        sh.$('[data-humor]').onclick = (e) => { const x = e.target.closest('button'); if (!x) return; humor = +x.dataset.v; P.$$('button', sh.$('[data-humor]')).forEach((y) => y.classList.toggle('on', y === x)); };
+        sh.$('[data-save]').onclick = async () => {
+          const btn = sh.$('[data-save]'); btn.classList.add('loading');
+          try {
+            const iniDate = new Date(s.t0);
+            const res = await S.route('fit.saveSession', { sessao: { id: s.id, treino_id: s.treino_id, data: D.iso(iniDate), inicio: new Date(s.t0).toISOString(), fim: new Date().toISOString(), duracao_s: dur, rpe: +sh.$('[data-rpe]').value, humor, observacao: sh.$('[data-obs]').value || null, status: 'concluida' }, series });
+            P.ls.del('fit.session'); sh.close(); closeFocus();
+            ui.toast(res.prs.length ? `Treino salvo · ${res.prs.length} recorde(s) novo(s)!` : `Treino salvo · ${fmt.num(res.resumo.kcal || 0)} kcal estimadas`, { icon: res.prs.length ? 'trophy' : 'check-circle' });
+            P.router.go('fit');
+          } catch (e) { btn.classList.remove('loading'); ui.toast(e.message, { error: true }); }
+        };
+      }
+    });
+    return sheet;
+  }
+
+  function pickExercise(cb) {
+    let q = '', g = '';
+    const s = ui.sheet({ title: 'Escolher exercício', size: 'full', body: h`<div class="stack-sm"><div class="search">${icon('search')}<input class="input" placeholder="Buscar" data-q autofocus></div>${ui.chips([['', 'Todos']].concat(GRUPOS), '', 'fit._pickG')}</div><div data-l class="mt-3"></div>` });
+    const draw = () => { s.$('[data-l]').innerHTML = P.toHtml(exRows(FT.exercises().filter((e) => (!g || e.grupo_muscular === g) && (!q || P.norm(e.nome).includes(P.norm(q)))), 'fit._pick')); };
+    s.$('[data-q]').addEventListener('input', P.debounce((e) => { q = e.target.value; draw(); }, 120));
+    P.act['fit._pickG'] = (el) => { g = el.dataset.v; P.$$('.fchip', s.el).forEach((x) => x.classList.toggle('on', x === el)); draw(); };
+    P.act['fit._pick'] = (el) => { s.close(); cb(el.dataset.id); };
+    draw();
+  }
+
+  // ================= Ações =================
+  const reRender = () => P.router.render(true);
+  Object.assign(P.act, {
+    'fit.useTpl': (el) => FT.useTemplate(el.dataset.id),
+    'fit.start': (el) => {
+      const saved = P.ls.get('fit.session');
+      if (saved && saved.ex && saved.ex.some((x) => x.sets.some((z) => z.done))) {
+        return ui.confirm({ title: 'Há um treino em andamento', text: `"${saved.nome}" começou ${fmt.rel(new Date(saved.t0).toISOString())}. Retomar?`, ok: 'Retomar', cancel: 'Começar novo' }).then((ok) => FT.start(ok ? saved.treino_id : el.dataset.id, ok));
+      }
+      FT.start(el.dataset.id);
+    },
+    'fit.pickStart': () => ui.menu('Qual treino?', FT.plans().map((t) => ({ label: t.nome, icon: 'dumbbell', sub: `${FT.items(t.id).length} exercícios`, act: () => FT.start(t.id) })).concat([{ label: 'Treino livre', icon: 'plus', act: () => FT.start(null) }])),
+    'fit.editPlan': (el) => {
+      const row = el && el.dataset.id ? S.get('fit_treinos', el.dataset.id) : null;
+      ui.editSheet({ table: 'fit_treinos', row, title: row ? 'Editar ficha' : 'Nova ficha', defaults: { objetivo: 'hipertrofia', nivel: 'intermediario', duracao_estimada_min: 60, cor: '#F2B705', ativo: true },
+        fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true, ph: 'Ex.: Treino A · Peito e tríceps' }, { k: 'dias_semana', l: 'Dias da semana', t: 'days' },
+          { k: 'objetivo', l: 'Objetivo', t: 'select', half: true, opts: [['hipertrofia', 'Hipertrofia'], ['forca', 'Força'], ['emagrecimento', 'Emagrecimento'], ['resistencia', 'Resistência'], ['condicionamento', 'Condicionamento'], ['mobilidade', 'Mobilidade']] },
+          { k: 'nivel', l: 'Nível', t: 'select', half: true, opts: [['iniciante', 'Iniciante'], ['intermediario', 'Intermediário'], ['avancado', 'Avançado']] },
+          { k: 'duracao_estimada_min', l: 'Duração estimada', t: 'int', unit: 'min', half: true }, { k: 'cor', l: 'Cor', t: 'color' }, { k: 'observacoes', l: 'Observações', t: 'textarea' }, { k: 'ativo', l: 'Ficha ativa', t: 'toggle', show: () => !!row }],
+        afterSave: (r) => { if (!row) P.router.go('fit/treino/' + r.id); }, deleteLabel: 'Ficha excluída' });
+    },
+    'fit.dupPlan': async (el) => {
+      const t = S.get('fit_treinos', el.dataset.id); const id = P.uuid();
+      await S.save('fit_treinos', { ...t, id, nome: t.nome + ' (cópia)', created_at: undefined, updated_at: undefined });
+      await S.saveMany('fit_treino_itens', FT.items(t.id).map((i) => ({ ...i, id: P.uuid(), treino_id: id, created_at: undefined, updated_at: undefined })));
+      ui.toast('Ficha duplicada'); P.router.go('fit/treino/' + id);
+    },
+    'fit.addItem': (el) => pickExercise((exId) => { const tid = el.dataset.id; const n = FT.items(tid).length; S.save('fit_treino_itens', { treino_id: tid, exercicio_id: exId, ordem: n, series: 3, reps_min: 8, reps_max: 12, descanso_s: 90, metodo: 'normal' }, { toast: 'Exercício adicionado' }); }),
+    'fit.editItem': (el) => {
+      const row = S.get('fit_treino_itens', el.dataset.id), ex = FT.ex(row.exercicio_id) || {};
+      ui.editSheet({ table: 'fit_treino_itens', row, title: ex.nome || 'Exercício',
+        fields: [{ k: 'series', l: 'Séries', t: 'int', req: true, half: true, min: 1, max: 12 }, { k: 'descanso_s', l: 'Descanso', t: 'int', unit: 's', half: true }, { k: 'reps_min', l: 'Reps mín.', t: 'int', req: true, half: true }, { k: 'reps_max', l: 'Reps máx.', t: 'int', half: true },
+          { k: 'carga_sugerida', l: 'Carga sugerida', t: 'num', unit: 'kg', half: true }, { k: 'metodo', l: 'Método', t: 'select', half: true, opts: [['normal', 'Normal'], ['dropset', 'Drop-set'], ['biset', 'Bi-set'], ['piramide', 'Pirâmide'], ['rest_pause', 'Rest-pause'], ['tempo', 'Tempo controlado']] }, { k: 'observacao', l: 'Observação', t: 'text' }],
+        deleteLabel: 'Exercício removido da ficha' });
+    },
+    'fit.moveItem': async (el) => {
+      const it = S.get('fit_treino_itens', el.dataset.id), list = FT.items(it.treino_id), i = list.findIndex((x) => x.id === it.id), j = i + +el.dataset.v;
+      if (j < 0 || j >= list.length) return;
+      [list[i], list[j]] = [list[j], list[i]];
+      await S.saveMany('fit_treino_itens', list.map((x, n) => ({ id: x.id, ordem: n })));
+    },
+    'fit.exSearch': P.debounce((el) => { st.exQ = el.value; const l = document.getElementById('ex-list'); if (l) l.innerHTML = P.toHtml(exRows(exList())); }, 150),
+    'fit.exGrupo': (el) => { st.exGrupo = el.dataset.v; reRender(); },
+    'fit.openEx': (el) => {
+      const e = FT.ex(el.dataset.id), best = FT.bestE1rm(e.id), last = FT.lastSets(e.id);
+      ui.sheet({ title: e.nome, body: h`<div class="row-sm wrap"><span class="chip">${GL[e.grupo_muscular]}</span><span class="chip">${(EQUIP.find((x) => x[0] === e.equipamento) || [])[1] || ''}</span><span class="chip">MET ${fmt.num(e.met || 0, 1)}</span></div>
+        ${e.musculos_secundarios ? h`<p class="muted mt-3">Secundários: ${e.musculos_secundarios}</p>` : ''}${e.instrucoes ? h`<p class="mt-3">${e.instrucoes}</p>` : ''}
+        <div class="grid g2 mt-4"><div class="card">${ui.metric({ label: 'Melhor 1RM est.', value: best ? fmt.num(best, 1) : '—', unit: best ? 'kg' : '', size: 'md' })}</div><div class="card">${ui.metric({ label: 'Última vez', value: last.length ? `${fmt.num(last[0].carga, 1)}×${last[0].reps}` : '—', size: 'md' })}</div></div>`,
+        foot: e.personalizado ? h`<button class="btn btn-ghost" data-edit>${icon('edit', 'sm')}Editar</button>` : '',
+        onMount(sh) { const b = sh.$('[data-edit]'); if (b) b.onclick = () => { sh.close(); setTimeout(() => P.act['fit.editEx']({ dataset: { id: e.id } }), 260); }; } });
+    },
+    'fit.editEx': (el) => {
+      const row = el && el.dataset && el.dataset.id ? S.get('fit_exercicios', el.dataset.id) : null;
+      ui.editSheet({ table: 'fit_exercicios', row, title: row ? 'Editar exercício' : 'Exercício personalizado', defaults: { tipo: 'forca', met: 5, equipamento: 'outro', personalizado: true },
+        fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true }, { k: 'grupo_muscular', l: 'Grupo muscular', t: 'select', req: true, half: true, opts: GRUPOS }, { k: 'equipamento', l: 'Equipamento', t: 'select', half: true, opts: EQUIP },
+          { k: 'tipo', l: 'Tipo', t: 'select', half: true, opts: [['forca', 'Força'], ['cardio', 'Cardio'], ['mobilidade', 'Mobilidade'], ['funcional', 'Funcional']] }, { k: 'met', l: 'MET', t: 'num', half: true, hint: 'Intensidade para estimar calorias' },
+          { k: 'musculos_secundarios', l: 'Músculos secundários', t: 'text' }, { k: 'instrucoes', l: 'Instruções', t: 'textarea' }],
+        beforeSave: (r) => ({ ...r, personalizado: true }) });
+    },
+    'fit.timerMode': (el) => { T.mode = el.dataset.v; T.running = false; T.acc = 0; T.lastPhase = ''; reRender(); },
+    'fit.timerToggle': () => {
+      if (T.running) { T.acc += (Date.now() - T.t0) / 1000; T.running = false; }
+      else { if (timerState().done) T.acc = 0; T.t0 = Date.now(); T.running = true; FT.beep(2); try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); } catch (e) { /* noop */ } }
+      drawTimerControls(); timerTick();
+    },
+    'fit.timerReset': () => { T.running = false; T.acc = 0; T.lastPhase = ''; drawTimerControls(); timerTick(); },
+    'fit.timerStep': (el) => { const k = el.dataset.k, step = k === 'rounds' ? 1 : 5; T[k] = Math.max(k === 'rest' ? 0 : 1, T[k] + step * +el.dataset.v); reRender(); },
+    'fit.timerQuick': (el) => { T.total = +el.dataset.v; T.acc = 0; T.running = false; reRender(); },
+    'fit.usePreset': (el) => { const p = S.get('fit_timers_presets', el.dataset.id); if (!p) return; T.running = false; T.acc = 0; if (p.tipo === 'regressivo') { T.mode = 'regressivo'; T.total = p.trabalho_s; } else { T.mode = 'intervalado'; T.work = p.trabalho_s; T.rest = p.descanso_s; T.rounds = p.rounds; } reRender(); ui.toast(`Preset "${p.nome}" carregado`); },
+    'fit.delPreset': (el) => S.remove('fit_timers_presets', el.dataset.id, { label: 'Preset excluído' }),
+    'fit.timerSave': () => ui.editSheet({ table: 'fit_timers_presets', title: 'Salvar preset', fields: [{ k: 'nome', l: 'Nome', t: 'text', req: true, focus: true }], defaults: { tipo: T.mode, trabalho_s: T.mode === 'regressivo' ? T.total : T.work, descanso_s: T.rest, rounds: T.mode === 'regressivo' ? 1 : T.rounds, series: 1 } }),
+    'fit.histMore': () => { st.histLimit += 30; reRender(); },
+    'fit.openSession': (el) => {
+      const s = S.get('fit_sessoes', el.dataset.id), t = S.getAny('fit_treinos', s.treino_id), sets = FT.seriesOf(s.id);
+      const byEx = P.groupBy(sets, (x) => x.exercicio_id);
+      ui.sheet({ title: t ? t.nome : 'Treino', size: 'full',
+        body: h`<p class="muted">${fmt.dayLong(s.data)}${s.inicio ? ' · ' + new Date(s.inicio).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : ''}</p>
+          <div class="grid g4 mt-3">${ui.metric({ label: 'Duração', value: fmt.dur(s.duracao_s), size: 'md' })}${ui.metric({ label: 'Volume', value: fmt.num(s.volume_total), unit: 'kg', size: 'md' })}${ui.metric({ label: 'Calorias', value: fmt.num(s.kcal_estimadas || 0), unit: 'kcal', size: 'md' })}${ui.metric({ label: 'RPE', value: s.rpe || '—', size: 'md' })}</div>
+          ${Object.keys(byEx).map((exId) => h`<div class="group-h"><span>${(FT.ex(exId) || {}).nome}</span></div><div class="list cardlist">${byEx[exId].map((x, i) => h`<div class="li" style="min-height:44px"><span class="faint num" style="width:20px">${i + 1}</span><span class="main num"><b>${fmt.num(x.carga, 1)} kg × ${x.reps}</b></span>${x.eh_pr ? h`<span class="chip acc">${icon('trophy', 'xs')}PR</span>` : ''}<span class="faint num" style="font-size:12px">${x.e1rm ? fmt.num(x.e1rm, 1) : ''}</span></div>`)}</div>`)}
+          ${s.observacao ? h`<div class="card mt-4"><p>${s.observacao}</p></div>` : ''}`,
+        foot: h`<button class="btn btn-danger" data-del>${icon('trash', 'sm')}Excluir treino</button>`,
+        onMount(sh) { sh.$('[data-del]').onclick = async () => { if (!await ui.confirm({ title: 'Excluir este treino?', ok: 'Excluir', danger: true })) return; sh.close(); S.remove('fit_sessoes', s.id, { label: 'Treino excluído' }); }; } });
+    },
+    'fit.evo': (el) => { st.evo = el.dataset.v; reRender(); },
+    'fit.forcaEx': (el) => { st.forcaEx = el.value; reRender(); },
+    'fit.addMedida': (el) => {
+      const row = el && el.dataset && el.dataset.id ? S.get('fit_medidas', el.dataset.id) : null;
+      const last = FT.weights().pop();
+      ui.editSheet({ table: 'fit_medidas', row, title: row ? 'Editar registro' : 'Registrar peso e medidas', defaults: { data: D.today(), peso_kg: last ? last.peso_kg : null },
+        fields: [{ k: 'data', l: 'Data', t: 'date', req: true, half: true }, { k: 'peso_kg', l: 'Peso', t: 'num', unit: 'kg', half: true, min: 20, max: 400 },
+          { k: 'gordura_pct', l: '% de gordura', t: 'num', unit: '%', half: true, hint: 'Deixe vazio para calcular pela Marinha' }, { k: 'cintura', l: 'Cintura', t: 'num', unit: 'cm', half: true }, { k: 'pescoco', l: 'Pescoço', t: 'num', unit: 'cm', half: true }, { k: 'quadril', l: 'Quadril', t: 'num', unit: 'cm', half: true },
+          { k: 'peito', l: 'Peito', t: 'num', unit: 'cm', half: true }, { k: 'braco_d', l: 'Braço direito', t: 'num', unit: 'cm', half: true }, { k: 'braco_e', l: 'Braço esquerdo', t: 'num', unit: 'cm', half: true }, { k: 'coxa_d', l: 'Coxa direita', t: 'num', unit: 'cm', half: true }, { k: 'coxa_e', l: 'Coxa esquerda', t: 'num', unit: 'cm', half: true }, { k: 'panturrilha', l: 'Panturrilha', t: 'num', unit: 'cm', half: true }, { k: 'observacao', l: 'Observação', t: 'text' }],
+        beforeSave: (r) => {
+          if (!r.peso_kg && !r.cintura && !r.braco_d && !r.quadril) { ui.toast('Informe ao menos o peso ou uma medida.', { error: true }); return null; }
+          if (!r.gordura_pct && r.cintura && r.pescoco && P.me.altura_cm) { const g = P.calc.navy({ sexo: P.me.sexo, cintura: r.cintura, pescoco: r.pescoco, quadril: r.quadril || 0, altura: +P.me.altura_cm }); if (g > 2 && g < 60) r.gordura_pct = g; }
+          if (r.gordura_pct && r.peso_kg) r.massa_magra_kg = P.round(r.peso_kg * (1 - r.gordura_pct / 100), 1);
+          return r;
+        }, savedMsg: 'Registro salvo' });
+    },
+    'fit.addFoto': async () => {
+      const file = await P.files.pick({ accept: 'image/\u002A', capture: false }); if (!file) return;
+      ui.toast('Enviando foto…', { icon: 'upload' });
+      try {
+        const a = await P.files.upload(file, { tipo: 'foto_progresso', modulo: 'fitness', entidade: 'fit_medidas' }, { max: 1400 });
+        const today = S.where('fit_medidas', (m) => m.data === D.today())[0];
+        if (today) await S.save('fit_medidas', { id: today.id, foto_arquivo_ids: [today.foto_arquivo_ids, a.id].filter(Boolean).join(',') });
+        else await S.save('fit_medidas', { data: D.today(), foto_arquivo_ids: a.id, peso_kg: FT.latestWeight() });
+        ui.toast('Foto adicionada');
+      } catch (e) { ui.toast(e.message, { error: true }); }
+    },
+    'fit.compare': async () => {
+      const fotos = S.all('fit_medidas').filter((m) => m.foto_arquivo_ids).sort((a, b) => (a.data < b.data ? -1 : 1)).flatMap((m) => String(m.foto_arquivo_ids).split(',').filter(Boolean).map((id) => ({ id, data: m.data })));
+      const a = fotos[0], b = fotos[fotos.length - 1];
+      const [ua, ub] = await Promise.all([P.files.url(a.id), P.files.url(b.id)]);
+      ui.sheet({ title: 'Antes e depois', size: 'full', wide: true, body: h`<div class="compare" data-cmp><img src="${ua}" alt="Antes"><div class="after" style="width:50%"><img src="${ub}" alt="Depois"></div><span class="handle" style="left:50%"></span></div>
+        <input type="range" min="0" max="100" value="50" data-r style="width:100%;accent-color:var(--primary)" aria-label="Comparar">
+        <div class="row between muted"><span>${fmt.date(a.data)}</span><span>${fmt.date(b.data)}</span></div>`,
+        onMount(sh) { const r = sh.$('[data-r]'); r.oninput = () => { sh.$('.after').style.width = r.value + '%'; sh.$('.handle').style.left = r.value + '%'; }; } });
+    },
+    'fit.editCardio': (el) => {
+      const row = el && el.dataset && el.dataset.id ? S.get('fit_cardio', el.dataset.id) : null;
+      const v = row ? { ...row, tempo: fmt.clock(row.duracao_s) } : { data: D.today(), atividade: 'corrida' };
+      ui.editSheet({ table: 'fit_cardio', row: v, title: row ? 'Editar cardio' : 'Registrar cardio',
+        fields: [{ k: 'atividade', l: 'Atividade', t: 'select', req: true, half: true, opts: Object.entries(CARDIO).map(([k, x]) => [k, x[0]]) }, { k: 'data', l: 'Data', t: 'date', req: true, half: true },
+          { k: 'tempo', l: 'Duração', t: 'text', req: true, half: true, ph: 'mm:ss ou h:mm:ss', validate: (x) => (/^\d{1,2}(:\d{2}){1,2}$/.test(x || '') ? '' : 'Use mm:ss') }, { k: 'distancia_km', l: 'Distância', t: 'num', unit: 'km', half: true },
+          { k: 'fc_media', l: 'FC média', t: 'int', unit: 'bpm', half: true }, { k: 'kcal', l: 'Calorias', t: 'int', unit: 'kcal', half: true, hint: 'Vazio = estimado por MET' }, { k: 'observacao', l: 'Observação', t: 'text' }],
+        beforeSave: (r) => {
+          const parts = r.tempo.split(':').map(Number); const secs = parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : parts[0] * 60 + parts[1];
+          const out = { ...r, duracao_s: secs }; delete out.tempo;
+          if (r.distancia_km) { const pace = secs / 60 / r.distancia_km; out.pace = `${Math.floor(pace)}:${String(Math.round((pace % 1) * 60)).padStart(2, '0')}`; }
+          if (!out.kcal) out.kcal = P.calc.kcalMet(CARDIO[r.atividade][1], FT.latestWeight() || 75, secs / 3600);
+          return out;
+        } });
+    },
+    'fit.steps': () => {
+      const today = S.where('fit_passos', (p) => p.data === D.today())[0];
+      ui.editSheet({ table: 'fit_passos', row: today, title: 'Passos de hoje', defaults: { data: D.today() }, deletable: false,
+        fields: [{ k: 'passos', l: 'Passos', t: 'int', req: true, focus: true, min: 0, max: 100000 }, { k: 'data', l: 'Data', t: 'date', req: true }],
+        extra: h`<p class="faint" style="font-size:12.5px">Copie do app de saúde do celular. Meta atual: ${fmt.num(+P.settings.get('fit.meta_passos', 8000))} passos (ajuste em Configurações).</p>` });
+    }
+  });
+
+  P.module({
+    id: 'fit', name: 'Fitness', icon: 'dumbbell', home: 'fit', plusLabel: 'Treino ou registro',
+    plus: () => ui.menu('Fitness', [{ label: 'Iniciar treino', icon: 'play', act: () => P.act['fit.pickStart']() }, { label: 'Registrar peso ou medidas', icon: 'scale', act: () => P.act['fit.addMedida']() }, { label: 'Registrar cardio', icon: 'pulse', act: () => P.act['fit.editCardio']() }, { label: 'Passos de hoje', icon: 'steps', act: () => P.act['fit.steps']() }]),
+    blurb: () => `${FT.weekSessions().length}/${FT.goalWeek()} treinos na semana`,
+    tabs: [{ id: 'resumo', label: 'Resumo', icon: 'pulse', route: 'fit' }, { id: 'treinos', label: 'Treinos', icon: 'dumbbell', route: 'fit/treinos' }, { id: 'timers', label: 'Timers', icon: 'timer', route: 'fit/timers' }, { id: 'mais', label: 'Mais', icon: 'grid', more: true }],
+    more: [{ id: 'historico', label: 'Histórico', icon: 'history', route: 'fit/historico' }, { id: 'evolucao', label: 'Evolução corporal', icon: 'trending', route: 'fit/evolucao' }, { id: 'exercicios', label: 'Exercícios', icon: 'list', route: 'fit/exercicios' }, { id: 'cardio', label: 'Cardio', icon: 'pulse', route: 'fit/cardio' }, { id: 'calc', label: 'Calculadoras', icon: 'calc', route: 'fit/calc' }]
+  });
+
+  // retoma treino interrompido
+  setTimeout(() => { const s = P.ls.get('fit.session'); if (s && s.ex && s.ex.some((x) => x.sets.some((z) => z.done)) && Date.now() - s.t0 < 5 * 3600e3) ui.toast(`Treino "${s.nome}" em andamento`, { action: { label: 'Retomar', fn: () => FT.start(s.treino_id, true) }, duration: 10000 }); }, 2500);
+})();
+</script>

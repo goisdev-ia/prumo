@@ -1,0 +1,219 @@
+<script>
+/* Prumo · Estudos: leitura do edital (conteúdo programático) para o edital verticalizado.
+   Aceita: (1) tabela colada (Excel/Planilhas/TSV/CSV, com ou sem cabeçalho DISCIPLINA, ASSUNTO, SUBASSUNTO, ITEM, PÁG., PESO, QUESTÕES);
+   (2) texto do edital (colado ou extraído do PDF, página por página). No texto, identifica os cargos, as disciplinas
+   ("DISCIPLINA: 1 - item. 2 - item."), os itens pela numeração em sequência, os subitens (1.1, 1.2 ou partes separadas
+   por ";" depois de "Título:"), a página de cada item e o quadro de provas ("Língua Portuguesa: 10 questões com valor
+   de 1,5 ponto cada") para preencher peso e quantidade de questões. É uma leitura assistida: tudo vai para a tabela
+   editável e passa pela prévia antes de gravar. Funciona no navegador e no Node (testes). */
+(function (root) {
+  'use strict';
+  const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const num = (v) => { if (v === null || v === undefined) return ''; const s = String(v).trim().replace(/\s/g, ''); if (!s) return ''; const n = Number(/,\d{1,3}$/.test(s) && !/\.\d{3},/.test(s) ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '')); return isFinite(n) ? n : ''; };
+  const MIN = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'em', 'a', 'o', 'as', 'os', 'na', 'no', 'nas', 'nos', 'para', 'com', 'por', 'ao', 'aos', 'à', 'às']);
+  const SIGLAS = new Set(['ti', 'sfn', 'lgpd', 'cmn', 'bb', 'pix', 'sql', 'ia', 'ml', 'cf', 'clt', 'stf', 'stj']);
+  function titleCase(s) {
+    return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim().split(' ').map((w, i) => {
+      if (SIGLAS.has(w.replace(/[^a-z]/g, ''))) return w.toUpperCase();
+      if (i && MIN.has(w)) return w;
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    }).join(' ');
+  }
+  const cap1 = (s) => { s = String(s || '').trim(); return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; };
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').replace(/^[\s\-–—.;:,]+|[\s\-–—.;:,]+$/g, '').trim();
+
+  // ---------------- (1) tabela colada ----------------
+  const COLS = { disciplina: ['disciplina', 'materia', 'matéria'], assunto: ['assunto', 'topico', 'tópico', 'tema'], subassunto: ['subassunto', 'sub-assunto', 'subtopico', 'subtópico', 'subtema'],
+    item_ref: ['item', 'item do edital', 'ref', 'referencia', 'referência', 'n', 'nº'], pagina: ['pag', 'pag.', 'pág', 'pág.', 'pagina', 'página'], peso: ['peso', 'valor', 'pontos'], qtd_questoes: ['questoes', 'questões', 'qtd', 'qtd questoes', 'qtd_questoes', 'n questoes', 'nº de questões'], descricao: ['descricao', 'descrição', 'observacao', 'observação'] };
+  const ORDER = ['disciplina', 'assunto', 'subassunto', 'item_ref', 'pagina', 'peso', 'qtd_questoes', 'descricao'];
+  function colOf(h) { const n = norm(h).replace(/[.:]/g, '').trim(); for (const [k, list] of Object.entries(COLS)) if (list.some((x) => norm(x).replace(/[.:]/g, '') === n)) return k; return null; }
+  function splitRow(line, sep) { if (sep === ',') { const out = []; let cur = '', q = false; for (const ch of line) { if (ch === '"') q = !q; else if (ch === ',' && !q) { out.push(cur); cur = ''; } else cur += ch; } out.push(cur); return out; } return line.split(sep); }
+  function detectSep(lines) { for (const sep of ['\t', ';', '|']) { const n = lines.filter((l) => l.split(sep).length >= 3).length; if (n >= Math.max(1, Math.ceil(lines.length * 0.4))) return sep; } const c = lines.filter((l) => splitRow(l, ',').length >= 4).length; return c >= Math.max(2, lines.length * 0.6) ? ',' : null; }
+  function parseTable(text) {
+    const lines = String(text || '').replace(/\r/g, '').split('\n').filter((l) => l.trim());
+    const sep = detectSep(lines);
+    if (!sep) return null;
+    let map = null; const rows = [], avisos = [];
+    lines.forEach((l, li) => {
+      const cells = splitRow(l, sep).map((c) => c.trim().replace(/^"|"$/g, '').trim());
+      if (sep === '|') { if (/^\|?\s*:?-{2,}/.test(l)) return; while (cells.length && cells[0] === '') cells.shift(); while (cells.length && cells[cells.length - 1] === '') cells.pop(); }
+      const filled = cells.filter(Boolean);
+      if (filled.length <= 1) return; // título de seção ("Língua Portuguesa") ou linha vazia
+      const asHead = cells.map(colOf);
+      if (asHead.filter(Boolean).length >= 2 && asHead.includes('disciplina') || asHead.filter(Boolean).length >= 3) { map = asHead; return; } // cabeçalho (repete a cada bloco)
+      const m = map || ORDER;
+      const r = {}; cells.forEach((c, i) => { const k = m[i]; if (k && !r[k]) r[k] = c; });
+      if (!r.disciplina || !r.assunto) { avisos.push(`Linha ${li + 1} ignorada: sem disciplina ou assunto.`); return; }
+      rows.push({ disciplina: clean(r.disciplina), assunto: clean(r.assunto), subassunto: clean(r.subassunto || ''), item_ref: clean(r.item_ref || ''), pagina: num(r.pagina), peso: num(r.peso), qtd_questoes: num(r.qtd_questoes), descricao: r.descricao || '' });
+    });
+    return { tipo: 'tabela', linhas: rows, cargos: [], avisos };
+  }
+
+  // ---------------- (2) texto do edital ----------------
+  const NOISE = /^(#\s*interna|p[áa]gina\s+\d+(\s+de\s+\d+)?|\d{1,4})$/i;
+  const UP = (s) => s === s.toUpperCase() && /[A-ZÀ-Ý]{3,}/.test(s);
+  /** "Quase tudo em maiúsculas" (títulos como "AGENTE DE TECNOLOGIA e AGENTE COMERCIAL"). */
+  const upish = (s) => { const L = String(s).match(/[A-Za-zÀ-ÿ]/g) || []; const U = L.filter((c) => c === c.toUpperCase() && c !== c.toLowerCase()).length; return L.length >= 4 && U / L.length >= 0.8; };
+  const CARGO_RE = /(?:NOME DE RELACIONAMENTO|CARGO(?:\s+\d+)?|FUN[CÇ][AÃ]O|ESPECIALIDADE|[ÁA]REA)\s*[:–-]\s*(.+)$/i;
+  const GROUP_RE = /^(CONHECIMENTOS\s+(B[ÁA]SICOS|GERAIS|ESPEC[ÍI]FICOS|COMPLEMENTARES)|PARTE\s+[IVX]+|M[ÓO]DULO\s+[IVX\d]+|PROVA\s+(OBJETIVA|DISCURSIVA)\b.*)\s*:?$/i;
+  const DISC_RE = /^([A-ZÀ-Ý][A-ZÀ-Ý0-9 ,()/\-–ºª'’.]{2,90}?)\s*:\s*(.*)$/;
+  const atomicCargos = (label) => clean(String(label || '').replace(/\(.*?\)/g, '').replace(/\(.*$/, '').replace(/\s*[-–]\s*$/, '')).split(/\s+e\s+|,\s*|\s*\/\s*/i).map((x) => clean(x)).filter((x) => x.length > 2);
+
+  /** Junta as páginas num texto só, guardando onde cada página começa (para descobrir a página de cada item). */
+  function joinPages(pages) {
+    let text = ''; const starts = [];
+    pages.forEach((p) => {
+      const lines = String(p.text || '').replace(/\r/g, '').split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).filter((l) => l && !NOISE.test(l));
+      starts.push([text.length, p.n]); text += lines.join('\n') + '\n';
+    });
+    return { text, pageAt: (pos) => { let n = pages.length ? pages[0].n : null; for (const [s, pn] of starts) { if (s <= pos) n = pn; else break; } return n; } };
+  }
+
+  /** Quadro de provas: "Disciplina: N questões com valor de X ponto(s)" por cargo. */
+  function scoring(text) {
+    const out = []; let cargo = '';
+    text.split('\n').forEach((l) => {
+      const c = l.match(CARGO_RE); if (c && upish(c[1].replace(/\(.*$/, ''))) cargo = c[1];
+      const re = /(?:^|[;.]\s*|\b[a-z]\)\s*)([A-ZÀ-Ý][^:;\n]{2,80}?)\s*[:–-]\s*(\d{1,3})\s*quest(?:ões|oes|ão|ao)\b[^;\n]*?(?:valor|peso)\s*(?:de|=)?\s*(\d+(?:[,.]\d+)?)/g;
+      let m; while ((m = re.exec(l))) out.push({ cargo, cargos: atomicCargos(cargo), disciplina: clean(m[1].replace(/^[a-z]\)\s*/, '')), qtd: Number(m[2]), peso: num(m[3]) });
+    });
+    return out;
+  }
+
+  /** Corta o corpo de uma disciplina nos itens numerados em sequência (1, 2, 3…), tolerando "7 -Texto", "17- Texto", "1. Texto", "10\n- Texto". */
+  function splitNumbered(body, start = 1, prefix = '', loose = false) {
+    const marks = []; let k = start, from = 0;
+    const pfx = prefix ? prefix.replace(/\./g, '\\.') + '\\.' : '';
+    for (;;) {
+      const re = loose ? new RegExp(`(^|[\\s.;:,)])(?<!\\d\\.)(${pfx}${k})(?:\\s*(?:[-–—]|\\.(?!\\d)|\\))\\s*|\\s+)(?=[A-ZÀ-Ý(“"'])`, 'g')
+        : new RegExp(`(^|[\\s.;:,)])(?<!\\d\\.)(${pfx}${k})\\s*(?:[-–—]|\\.(?!\\d)|\\))\\s*(?=[A-Za-zÀ-ÿ(“"'])`, 'g');
+      re.lastIndex = from; const m = re.exec(body);
+      if (!m) break;
+      const at = m.index + m[1].length; marks.push({ n: k, at, textAt: m.index + m[0].length }); from = m.index + m[0].length; k++;
+      if (k > start + 199) break;
+    }
+    return marks.map((mk, i) => ({ ref: (prefix ? prefix + '.' : '') + mk.n, at: mk.at, text: body.slice(mk.textAt, i + 1 < marks.length ? marks[i + 1].at : body.length) }));
+  }
+
+  /** Divide em ";" e em fim de frase (". Maiúscula"), só fora de parênteses. */
+  function splitTop(t) {
+    const out = []; let d = 0, cur = '';
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i];
+      if (c === '(') d++; else if (c === ')') d = Math.max(0, d - 1);
+      if (!d && (c === ';' || (c === '.' && /\s/.test(t[i + 1] || '') && /[A-ZÀ-Ý]/.test((t.slice(i + 1).match(/\S/) || [''])[0]) && !/\b(n|nº|art|arts|inc|al|p|pág|ex)$/i.test(cur.trim().split(/\s+/).pop() || '')))) { out.push(cur); cur = ''; continue; }
+      cur += c;
+    }
+    out.push(cur); return out;
+  }
+  /** Um item vira assunto + subassuntos: "Título: parte; parte", "Título - parte", "parte; parte" ou subitens 1.1, 1.2. */
+  function itemToRows(it, loose) {
+    let t = clean(it.text);
+    const sub = it.ref ? splitNumbered(t, 1, it.ref, loose) : [];
+    if (sub.length >= 2 || (sub.length === 1 && sub[0].at > 0)) {
+      const head = clean(t.slice(0, sub[0].at)) || clean(sub[0].text);
+      return sub.map((s) => ({ assunto: cap1(head), subassunto: cap1(clean(s.text)), item_ref: s.ref }));
+    }
+    const ref = it.ref;
+    let title = '', rest = t;
+    const tm = t.match(/^([^:;]{3,110}?)\s*(?::\s+|:(?=[A-ZÀ-Ý])|\s[-–—]\s)(.+)$/);
+    const bal = (x) => (x.match(/\(/g) || []).length === (x.match(/\)/g) || []).length;
+    if (tm && bal(tm[1])) { title = clean(tm[1]); rest = tm[2]; }
+    // partes: ";" e frases (". Maiúscula"), sem quebrar números como 9.613/98 nem "nº 4.893"
+    const parts = splitTop(rest).map(clean).filter((x) => x.length > 1);
+    if (!title) {
+      if (parts.length <= 1) return [{ assunto: cap1(clean(rest)), subassunto: '', item_ref: ref }];
+      title = parts[0];
+    }
+    if (!parts.length) return [{ assunto: cap1(title), subassunto: '', item_ref: ref }];
+    return parts.map((p) => ({ assunto: cap1(title), subassunto: cap1(p), item_ref: ref }));
+  }
+
+  function parseText(pages, opts = {}) {
+    const { text, pageAt } = joinPages(pages);
+    const avisos = [];
+    const sc = scoring(text);
+    // seção do conteúdo programático (a última ocorrência do título; o sumário costuma citar antes)
+    const lines = text.split('\n'); let off = 0; const lineStarts = lines.map((l) => { const s = off; off += l.length + 1; return s; });
+    let ini = 0, fim = lines.length;
+    lines.forEach((l, i) => { if (/CONTE[ÚU]DOS?\s+PROGRAM[ÁA]TICOS?/i.test(l) && UP(l.replace(/[^A-Za-zÀ-ÿ ]/g, ''))) ini = i + 1; });
+    for (let i = ini; i < lines.length; i++) if (i > ini && /^ANEXO\s+[IVXL]+\b/i.test(lines[i])) { fim = i; break; }
+    // blocos: cargo → disciplina → corpo
+    const blocks = []; let cargo = '', cur = null;
+    for (let i = ini; i < fim; i++) {
+      const l = lines[i], pos = lineStarts[i];
+      const c = l.match(CARGO_RE);
+      if (c && upish(l.replace(/\(.*$/, ''))) { cargo = clean(c[1].replace(/\(.*$/, '')); cur = null; continue; }
+      if (GROUP_RE.test(l) && UP(l)) { cur = null; continue; }
+      const d = l.match(DISC_RE);
+      if (d && UP(d[1]) && !/^\d/.test(d[1]) && d[1].replace(/[^A-ZÀ-Ý]/g, '').length >= 3) { cur = { cargo, disciplina: clean(d[1]), body: '', pos: [] }; blocks.push(cur); if (d[2]) { cur.pos.push([0, pos + l.indexOf(d[2])]); cur.body += d[2]; } continue; }
+      if (cur) { const sep = cur.body && /[A-Za-zÀ-ÿ]-$/.test(cur.body) && /^[a-zà-ÿ]/.test(l) ? '' : ' '; cur.pos.push([cur.body.length + sep.length, pos]); cur.body += sep + l; }
+    }
+    if (!blocks.length) {
+      // sem disciplinas em maiúsculas: aceita "Língua Portuguesa: conteúdo" (nome curto no começo da linha)
+      cur = null;
+      for (let i = ini; i < fim; i++) {
+        const l = lines[i], pos = lineStarts[i], d = l.match(/^([A-ZÀ-Ý][A-Za-zÀ-ÿ ,()/\-–]{2,60}?)\s*:\s*(.+)$/);
+        if (d && d[1].trim().split(/\s+/).length <= 7) { cur = { cargo, disciplina: clean(d[1]), body: d[2], pos: [[0, pos + l.indexOf(d[2])]] }; blocks.push(cur); continue; }
+        if (cur) { cur.pos.push([cur.body.length + 1, pos]); cur.body += ' ' + l; }
+      }
+    }
+    if (!blocks.length) return { tipo: 'texto', linhas: [], cargos: [], avisos: ['Não encontrei disciplinas no formato "DISCIPLINA: 1 - item. 2 - item." Confira o texto ou cole a tabela.'] };
+    const cargos = [...new Set(blocks.flatMap((b) => atomicCargos(b.cargo)).concat(sc.flatMap((s) => s.cargos)))].filter(Boolean);
+    const want = opts.cargo ? norm(opts.cargo) : '';
+    const fits = (labels) => !want || !labels.length || labels.some((x) => norm(x) === want || norm(x).includes(want) || want.includes(norm(x)));
+    const linhas = [], vistos = new Set();
+    blocks.filter((b) => fits(atomicCargos(b.cargo))).forEach((b) => {
+      const body = b.body.replace(/\s+/g, ' ');
+      const posOf = (k) => { let p = b.pos.length ? b.pos[0][1] : 0; for (const [bk, tp] of b.pos) { if (bk <= k) p = tp + (k - bk); else break; } return p; };
+      const s = sc.filter((x) => norm(x.disciplina) === norm(b.disciplina) && fits(x.cargos))[0] || sc.filter((x) => norm(x.disciplina) === norm(b.disciplina))[0];
+      const disc = s ? s.disciplina : titleCase(b.disciplina);
+      const key = norm(disc) + '|' + (want || norm(b.cargo));
+      if (vistos.has(key)) return; // mesma disciplina repetida para outro cargo já incluído
+      vistos.add(key);
+      let itens = splitNumbered(body, 1), loose = false;
+      if (itens.length < 2 && /^\s*1\s+[A-ZÀ-Ý]/.test(body)) { const l2 = splitNumbered(body, 1, '', true); if (l2.length > itens.length) { itens = l2; loose = true; } }
+      if (!itens.length) { let at = 0; itens = splitTop(body).map((t) => { const i = body.indexOf(t, at); at = i >= 0 ? i + t.length : at; return { ref: '', at: Math.max(0, i), text: t }; }).filter((x) => clean(x.text).length > 2); }
+      const curto = (x) => (x.length <= 160 ? x : x.slice(0, x.lastIndexOf(' ', 150) > 60 ? x.lastIndexOf(' ', 150) : 150).replace(/[\s,;:]+$/, '') + '…');
+      itens.forEach((it) => itemToRows(it, loose).forEach((r) => linhas.push({ disciplina: disc, assunto: curto(r.assunto), subassunto: curto(r.subassunto || ''), descricao: r.assunto.length > 160 || (r.subassunto || '').length > 160 ? clean(it.text).slice(0, 1000) : '', item_ref: r.item_ref, pagina: pageAt(posOf(it.at)) || '', peso: s ? s.peso : '', qtd_questoes: s ? s.qtd : '', cargo: b.cargo })));
+      if (!s) avisos.push(`${disc}: não achei peso e número de questões no quadro de provas. Preencha na tabela.`);
+    });
+    return { tipo: 'texto', linhas, cargos, avisos, disciplinas: [...new Set(linhas.map((l) => l.disciplina))] };
+  }
+
+  /** Entrada única: texto colado (tabela ou edital) ou páginas extraídas do PDF. */
+  function parse(input, opts = {}) {
+    if (input && Array.isArray(input.pages)) return parseText(input.pages, opts);
+    const text = String((input && input.text) || input || '');
+    const t = parseTable(text);
+    if (t && t.linhas.length) return t;
+    // texto com quebras de página (\f) vira páginas sem número; o restante, uma página só
+    const pages = text.split('\f').map((x, i) => ({ n: text.includes('\f') ? i + 1 : null, text: x }));
+    return parseText(pages, opts);
+  }
+
+  /** Extrai o texto de cada página com o PDF.js, mantendo as quebras de linha. o.ocr(página, n) lê página digitalizada. */
+  async function pdfPages(pdfjs, data, o = {}) {
+    const doc = await pdfjs.getDocument({ data }).promise, pages = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const pg = await doc.getPage(i), tc = await pg.getTextContent();
+      if (o.onProgress) o.onProgress(i, doc.numPages);
+      if (o.ocr && tc.items.map((x) => x.str).join('').replace(/\s/g, '').length < 40) { const r = await o.ocr(pg, i); pages.push({ n: i, text: r.texto || '', ocr: true }); continue; }
+      let t = '', lastY = null;
+      tc.items.forEach((x) => {
+        const y = x.transform ? Math.round(x.transform[5]) : null;
+        if (lastY !== null && y !== null && Math.abs(y - lastY) > 2 && !/\n$/.test(t)) t += '\n';
+        t += x.str; if (x.hasEOL) t += '\n';
+        if (y !== null) lastY = y;
+      });
+      pages.push({ n: i, text: t });
+    }
+    try { doc.destroy(); } catch (e) { /* ok */ }
+    return pages;
+  }
+
+  const api = { parse, parseTable, parseText, pdfPages, titleCase, num, _splitNumbered: splitNumbered, _itemToRows: itemToRows };
+  if (root && root.Prumo) root.Prumo.estEdital = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof window !== 'undefined' ? window : null);
+</script>

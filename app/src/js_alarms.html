@@ -1,0 +1,324 @@
+<script>
+/* Prumo · Alarmes: água, refeições, remédios, tarefas e livres.
+   Com o app aberto o alarme toca aqui (som, vibração e tela cheia); com o app fechado o servidor manda
+   push/Telegram em até 5 min (Alarms.gs). Ao tocar aqui, avisamos o servidor (alarm.ack) para não repetir. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const TIPOS = { agua: ['Água', 'droplet'], refeicao: ['Refeição', 'utensils'], remedio: ['Remédio', 'heart'], tarefa: ['Tarefa', 'tasks'], outro: ['Outro', 'alarm'] };
+  const INTERVALOS = [[30, '30 min'], [60, '1 h'], [90, '1h30'], [120, '2 h'], [180, '3 h'], [240, '4 h']];
+  const LS_DONE = 'prumo.alarm.done', LS_SNOOZE = 'prumo.alarm.snooze';
+  const JANELA_MS = 3 * 60000, ADIAR_MIN = 10;
+  const pad = (n) => String(n).padStart(2, '0');
+  const hm = (s) => { const p = String(s || '').split(':'); return (+p[0] || 0) * 60 + (+p[1] || 0); };
+  const fmtHm = (m) => `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
+  const ls = {
+    get(k, def) { try { return JSON.parse(localStorage.getItem(k)) || def; } catch (e) { return def; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* modo privado */ } }
+  };
+  const st = { filtro: 'todos' };
+
+  // ================= Regras (iguais às do servidor) =================
+  const A = P.alarms = {
+    /** Horários (HH:mm) em que o alarme toca na data. */
+    times(a, date) {
+      if (!a || a.ativo === false || !a.hora) return [];
+      if (a.modo === 'unico') return a.data === date ? [String(a.hora).slice(0, 5)] : [];
+      const dias = String(a.dias_semana || '').split(',').filter((x) => x !== '');
+      if (dias.length && !dias.includes(String(D.dow(date)))) return [];
+      if (a.modo !== 'intervalo') return [String(a.hora).slice(0, 5)];
+      const ini = hm(a.hora), fim = a.hora_fim ? hm(a.hora_fim) : 22 * 60, passo = Math.max(15, +a.intervalo_min || 120), out = [];
+      for (let m = ini; m <= fim && m < 1440 && out.length < 96; m += passo) out.push(fmtHm(m));
+      return out;
+    },
+    at: (date, hora) => new Date(`${date}T${hora}:00`),
+    /** Próximo toque a partir de agora (até 8 dias), ou null. */
+    next(a, from = new Date()) {
+      for (let i = 0; i < 9; i++) {
+        const date = D.add(D.iso(from), i);
+        const t = A.times(a, date).map((x) => A.at(date, x)).find((d) => d > from);
+        if (t) return t;
+      }
+      return null;
+    },
+    describe(a) {
+      const dias = String(a.dias_semana || '').split(',').filter((x) => x !== '').map(Number).sort();
+      const quando = dias.length && dias.length < 7 ? (dias.join() === '1,2,3,4,5' ? 'Dias úteis' : dias.join() === '0,6' ? 'Fins de semana' : dias.map((i) => fmt.WD[i]).join(', ')) : 'Todo dia';
+      if (a.modo === 'unico') return `${a.data ? a.data.split('-').reverse().join('/') : 'Sem data'} · ${a.hora || '--:--'}`;
+      if (a.modo === 'intervalo') return `${quando} · a cada ${(INTERVALOS.find((x) => x[0] === +a.intervalo_min) || [0, (+a.intervalo_min || 120) + ' min'])[1]} · ${a.hora}–${a.hora_fim || '22:00'}`;
+      return `${quando} · ${a.hora}`;
+    },
+    nextLabel(a) {
+      const n = A.next(a);
+      if (!n) return a.modo === 'unico' ? 'Já tocou' : 'Sem próximos horários';
+      const date = D.iso(n), today = D.today();
+      const dia = date === today ? 'hoje' : date === D.add(today, 1) ? 'amanhã' : fmt.WD[n.getDay()].toLowerCase();
+      return `Próximo: ${dia} ${D.time(n)}`;
+    },
+    /** Motivo para não tocar (tarefa encerrada, meta de água batida). */
+    skip(a) {
+      if (a.tipo === 'tarefa' && a.ref_id) {
+        const t = S.getAny('tar_tarefas', a.ref_id);
+        if (!t || t.deleted_at || t.status === 'feito' || t.status === 'cancelada') return true;
+      }
+      if (a.tipo === 'agua' && a.pular_meta && P.nut && P.nut.water(D.today()) >= P.nut.waterGoal()) return true;
+      return false;
+    },
+    /** Liga/atualiza/remove o alarme de uma tarefa (ant = minutos antes; '' = sem alarme). */
+    async linkTask(task, ant) {
+      if (!task || !task.id) return;
+      const cur = S.where('alarmes', (a) => a.tipo === 'tarefa' && a.ref_id === task.id)[0];
+      if (ant === '' || ant === null || ant === undefined) { if (cur) S.remove('alarmes', cur.id, { undo: false }); return; }
+      if (!task.data_vencimento || !task.hora) { ui.toast('Para o alarme tocar, a tarefa precisa de data e hora.', { error: true }); return; }
+      const when = new Date(A.at(task.data_vencimento, String(task.hora).slice(0, 5)).getTime() - (+ant || 0) * 60000);
+      const row = { titulo: task.titulo, tipo: 'tarefa', modo: 'unico', data: D.iso(when), hora: D.time(when), ref_id: task.id, ativo: task.status !== 'feito' && task.status !== 'cancelada', som: true, observacao: +ant ? `${ant} min antes` : 'Na hora' };
+      if (cur) row.id = cur.id;
+      try { await S.save('alarmes', row, { silentError: true }); } catch (e) { ui.toast('Não deu para salvar o alarme: ' + e.message, { error: true }); }
+    },
+    /** Minutos de antecedência do alarme ligado à tarefa ('' se não houver). */
+    taskOffset(task) {
+      const a = task && task.id && S.where('alarmes', (x) => x.tipo === 'tarefa' && x.ref_id === task.id)[0];
+      if (!a || !task.data_vencimento || !task.hora) return '';
+      return Math.max(0, Math.round((A.at(task.data_vencimento, String(task.hora).slice(0, 5)) - A.at(a.data, a.hora)) / 60000));
+    }
+  };
+
+  // ================= Som e vibração =================
+  const audio = {
+    ctx: null, timer: null, stopAt: 0,
+    unlock() {
+      try {
+        if (!audio.ctx) { const C = window.AudioContext || window.webkitAudioContext; if (C) audio.ctx = new C(); }
+        if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume().catch(() => {});
+      } catch (e) { /* sem áudio */ }
+    },
+    beep() {
+      const c = audio.ctx;
+      if (!c || c.state !== 'running') return;
+      const t0 = c.currentTime;
+      [[0, 880], [0.2, 880], [0.4, 1175]].forEach(([dt, f]) => {
+        const o = c.createOscillator(), g = c.createGain();
+        o.type = 'sine'; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t0 + dt);
+        g.gain.exponentialRampToValueAtTime(0.4, t0 + dt + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dt + 0.17);
+        o.connect(g); g.connect(c.destination); o.start(t0 + dt); o.stop(t0 + dt + 0.18);
+      });
+    },
+    start(som) {
+      audio.stop();
+      audio.stopAt = Date.now() + 120000;
+      const tick = () => {
+        if (Date.now() > audio.stopAt) { audio.stop(); return; }
+        if (som) audio.beep();
+        try { navigator.vibrate && navigator.vibrate([350, 150, 350]); } catch (e) { /* sem vibração */ }
+      };
+      audio.unlock(); tick();
+      audio.timer = setInterval(tick, 1500);
+    },
+    stop() { clearInterval(audio.timer); audio.timer = null; try { navigator.vibrate && navigator.vibrate(0); } catch (e) { /* noop */ } }
+  };
+  // O navegador só libera som depois de um toque do usuário: destrava no primeiro toque.
+  ['pointerdown', 'keydown', 'touchstart'].forEach((ev) => document.addEventListener(ev, audio.unlock, { passive: true }));
+
+  // ================= Motor =================
+  const fila = [];
+  let tocando = null, intervalo = null, tituloOrig = null;
+
+  function check() {
+    if (!P.auth.token() || !P.me) return;
+    const now = new Date(), nowMs = now.getTime();
+    const done = ls.get(LS_DONE, {}), snooze = ls.get(LS_SNOOZE, {});
+    let mudou = false;
+    Object.keys(done).forEach((k) => { if (nowMs - done[k] > 2 * 864e5) { delete done[k]; mudou = true; } });
+    const datas = [D.today()];
+    if (now.getHours() === 0 && now.getMinutes() < 4) datas.unshift(D.add(D.today(), -1));
+    S.all('alarmes').forEach((a) => {
+      const sz = snooze[a.id];
+      if (sz && nowMs >= sz.until) { delete snooze[a.id]; ls.set(LS_SNOOZE, snooze); if (!A.skip(a)) ring(a, sz.hora, 'adiado'); return; }
+      if (a.ativo === false) return;
+      const criado = a.created_at ? new Date(a.created_at).getTime() : 0;
+      datas.forEach((date) => A.times(a, date).forEach((hora) => {
+        const t = A.at(date, hora).getTime(), key = `${a.id}|${date} ${hora}`;
+        if (nowMs < t || nowMs - t > JANELA_MS || done[key] || t < criado - 60000) return;
+        done[key] = nowMs; mudou = true;
+        if (!A.skip(a)) ring(a, hora);
+      }));
+    });
+    if (mudou) ls.set(LS_DONE, done);
+  }
+
+  function ring(a, hora, extra) {
+    fila.push({ a, hora, extra });
+    P.api.call('alarm.ack', { id: a.id }, { retries: 0 }).catch(() => {});
+    if (!tocando) mostrar();
+  }
+
+  function corpo(a) {
+    if (a.tipo === 'agua' && P.nut) {
+      const feito = P.nut.water(D.today()), meta = P.nut.waterGoal();
+      return `Hoje: ${fmt.num(feito / 1000, 1)} L de ${fmt.num(meta / 1000, 1)} L`;
+    }
+    if (a.tipo === 'tarefa' && a.ref_id) { const t = S.getAny('tar_tarefas', a.ref_id); if (t) return `Tarefa${t.hora ? ' às ' + t.hora : ''}${a.observacao ? ' · ' + a.observacao : ''}`; }
+    return a.observacao || TIPOS[a.tipo || 'outro'][0];
+  }
+
+  function mostrar() {
+    const item = fila.shift();
+    if (!item) { tocando = null; if (tituloOrig !== null) { document.title = tituloOrig; tituloOrig = null; } return; }
+    const { a, hora, extra } = item;
+    tocando = item;
+    const [rot, ic] = TIPOS[a.tipo] || TIPOS.outro;
+    const el = document.createElement('div');
+    el.className = 'alarm-ring';
+    el.setAttribute('role', 'alertdialog');
+    el.setAttribute('aria-modal', 'true');
+    el.setAttribute('aria-label', 'Alarme: ' + a.titulo);
+    el.innerHTML = P.toHtml(h`<div class="alarm-card">
+      <div class="alarm-ico">${icon(ic)}</div>
+      <div class="alarm-kind">${rot}${extra === 'adiado' ? ' · adiado' : ''}</div>
+      <div class="alarm-time num">${hora || D.time()}</div>
+      <h2>${a.titulo}</h2>
+      <p class="muted">${corpo(a)}</p>
+      <div class="alarm-actions">
+        ${a.tipo === 'agua' ? h`<button type="button" class="btn btn-primary" data-al="beber">${icon('droplet', 'sm')}Bebi 250 ml</button>` : ''}
+        ${a.tipo === 'tarefa' && a.ref_id && S.get('tar_tarefas', a.ref_id) ? h`<button type="button" class="btn btn-primary" data-al="concluir">${icon('check', 'sm')}Concluir tarefa</button>` : ''}
+        <div class="row-sm" style="width:100%"><button type="button" class="btn btn-ghost grow" data-al="adiar">${icon('clock', 'sm')}Adiar ${ADIAR_MIN} min</button>
+        <button type="button" class="btn ${a.tipo === 'agua' || a.tipo === 'tarefa' ? 'btn-ghost' : 'btn-primary'} grow" data-al="parar">${icon('stop', 'sm')}Parar</button></div>
+      </div></div>`);
+    document.body.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('open'));
+    if (tituloOrig === null) tituloOrig = document.title;
+    document.title = 'Alarme · ' + a.titulo;
+    audio.start(a.som !== false && P.settings.get('alarm.som', true) !== false);
+    setTimeout(() => { const b = el.querySelector('[data-al]'); if (b) b.focus(); }, 50);
+    el.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-al]');
+      if (!b) return;
+      fechar(el);
+      const act = b.dataset.al;
+      if (act === 'beber') S.save('nut_agua', { data: D.today(), hora: D.time(), ml: 250 }, { toast: '250 ml registrados' }).catch(() => {});
+      if (act === 'concluir' && P.tar && P.tar.setStatus) P.tar.setStatus(a.ref_id, 'feito');
+      if (act === 'adiar') {
+        const until = Date.now() + ADIAR_MIN * 60000, sz = ls.get(LS_SNOOZE, {});
+        sz[a.id] = { until, hora: D.time(new Date(until)) };
+        ls.set(LS_SNOOZE, sz);
+        ui.toast(`Adiado para ${D.time(new Date(until))}`, { icon: 'clock' });
+      }
+      setTimeout(mostrar, 250);
+    });
+  }
+
+  function fechar(el) {
+    audio.stop();
+    el.classList.remove('open');
+    setTimeout(() => el.remove(), 200);
+  }
+
+  A.start = () => {
+    if (intervalo) return;
+    check();
+    intervalo = setInterval(check, 15000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
+  };
+  A.check = check;
+  A.test = () => { audio.unlock(); ring({ id: 'teste', titulo: 'Teste de alarme', tipo: 'outro', som: true, observacao: 'É assim que o alarme aparece com o app aberto.' }, D.time()); };
+
+  // ================= Tela =================
+  const FILTROS = [['todos', 'Todos'], ['agua', 'Água'], ['refeicao', 'Refeições'], ['remedio', 'Remédios'], ['tarefa', 'Tarefas'], ['outro', 'Outros']];
+  const MODELOS = [
+    { id: 'agua', l: 'Água a cada 2 h', ic: 'droplet', v: { titulo: 'Hora de beber água', tipo: 'agua', modo: 'intervalo', hora: '08:00', hora_fim: '20:00', intervalo_min: 120, pular_meta: true } },
+    { id: 'cafe', l: 'Café da manhã', ic: 'coffee', v: { titulo: 'Café da manhã', tipo: 'refeicao', modo: 'diario', hora: '07:30' } },
+    { id: 'almoco', l: 'Almoço', ic: 'utensils', v: { titulo: 'Almoço', tipo: 'refeicao', modo: 'diario', hora: '12:00' } },
+    { id: 'lanche', l: 'Lanche', ic: 'apple', v: { titulo: 'Lanche da tarde', tipo: 'refeicao', modo: 'diario', hora: '16:00' } },
+    { id: 'jantar', l: 'Jantar', ic: 'utensils', v: { titulo: 'Jantar', tipo: 'refeicao', modo: 'diario', hora: '19:30' } },
+    { id: 'remedio', l: 'Remédio', ic: 'heart', v: { titulo: 'Tomar remédio', tipo: 'remedio', modo: 'diario', hora: '08:00' } }
+  ];
+
+  function render(ctx) {
+    const filtro = ctx.q.f || st.filtro;
+    const all = S.all('alarmes').sort((x, y) => (x.ativo === false) - (y.ativo === false) || ((A.next(x) || 9e15) - (A.next(y) || 9e15)));
+    const rows = filtro === 'todos' ? all : all.filter((a) => (a.tipo || 'outro') === filtro);
+    const ativos = all.filter((a) => a.ativo !== false);
+    const prox = ativos.map((a) => [a, A.next(a)]).filter((x) => x[1]).sort((x, y) => x[1] - y[1])[0];
+    return h`<div class="page-head"><div><h1>Alarmes</h1><p>${ativos.length} ativo(s)${prox ? h` · próximo <b>${prox[0].titulo}</b> ${A.nextLabel(prox[0]).replace('Próximo: ', '')}` : ''}</p></div>
+        <button class="btn btn-primary btn-sm" data-act="al.new">${icon('plus', 'sm')}Novo alarme</button></div>
+      <div class="dash"><div class="span-8 stack">
+        <div class="chips" role="tablist" aria-label="Filtrar por tipo">${FILTROS.map(([v, l]) => h`<button type="button" class="fchip ${filtro === v ? 'on' : ''}" data-act="al.filtro" data-v="${v}">${l}${v !== 'todos' ? h` <span class="faint">${all.filter((a) => (a.tipo || 'outro') === v).length || ''}</span>` : ''}</button>`)}</div>
+        ${rows.length ? h`<div class="card"><div class="list">${rows.map((a) => {
+          const [rot, ic] = TIPOS[a.tipo] || TIPOS.outro, off = a.ativo === false;
+          return h`<div class="li" data-alarm="${a.id}" style="${off ? 'opacity:.55' : ''}">
+            <span class="tile tap" data-act="al.edit" data-id="${a.id}" style="background:var(--primary-tint);color:var(--primary-ink)">${icon(ic)}</span>
+            <span class="main tap" data-act="al.edit" data-id="${a.id}" style="cursor:pointer"><span class="t">${a.titulo}</span><span class="s">${rot} · ${A.describe(a)}${off ? ' · desligado' : ' · ' + A.nextLabel(a)}</span></span>
+            <label class="toggle"><input type="checkbox" data-on-change="al.toggle" data-id="${a.id}" ${off ? '' : raw('checked')} aria-label="Ligar ou desligar ${a.titulo}"><span></span></label></div>`;
+        })}</div></div>`
+          : ui.empty({ ill: 'list', title: filtro === 'todos' ? 'Nenhum alarme ainda' : 'Nada neste filtro', text: 'Use um modelo ao lado ou crie um alarme do zero. Nas tarefas, escolha "Alarme" ao editar.', action: { act: 'al.new', label: 'Novo alarme' } })}
+      </div>
+      <div class="span-4 stack">
+        <div class="card pad-lg"><b>Modelos rápidos</b><div class="list mt-2">${MODELOS.map((m) => h`<button type="button" class="li tap" data-act="al.modelo" data-m="${m.id}" style="width:100%;text-align:left"><span class="tile sm">${icon(m.ic, 'sm')}</span><span class="main"><span class="t">${m.l}</span><span class="s">${A.describe(m.v)}</span></span>${icon('plus', 'sm')}</button>`)}</div></div>
+        <div class="card pad-lg"><b>Como tocam</b>
+          <p class="muted mt-2" style="font-size:13px;line-height:1.55">Com o Prumo aberto, o alarme toca na hora, com som, vibração e tela cheia. Com o app fechado, chega como notificação no celular (se ativou em Configurações › Notificações) e no Telegram (se ligou os avisos), em até 5 minutos.</p>
+          <div class="li mt-2" style="padding-left:0;padding-right:0"><span class="main"><span class="t">Som nos alarmes</span><span class="s">Vale para este app aberto</span></span><label class="toggle"><input type="checkbox" data-on-change="al.som" ${P.settings.get('alarm.som', true) !== false ? raw('checked') : ''}><span></span></label></div>
+          <button type="button" class="btn btn-ghost btn-sm mt-2" data-act="al.test">${icon('alarm', 'sm')}Testar alarme</button></div>
+      </div></div>`;
+  }
+
+  function edit(row, defaults = {}) {
+    const isNew = !row || !row.id;
+    const v = { tipo: 'outro', modo: 'diario', hora: '08:00', ativo: true, som: true, intervalo_min: 120, hora_fim: '20:00', data: D.today(), ...defaults, ...(row || {}) };
+    const tarefas = S.where('tar_tarefas', (t) => t.status !== 'feito' && t.status !== 'cancelada' && !t.pai_id).map((t) => [t.id, t.titulo]);
+    ui.editSheet({
+      table: 'alarmes', row: isNew ? null : v, title: isNew ? 'Novo alarme' : 'Editar alarme', defaults: v, size: 'full',
+      fields: [
+        { k: 'titulo', l: 'Nome', t: 'text', req: true, focus: isNew, max: 120, ph: 'Ex.: Beber água' },
+        { k: 'tipo', l: 'Tipo', t: 'seg', opts: Object.entries(TIPOS).map(([k, x]) => [k, x[0]]) },
+        { k: 'ref_id', l: 'Tarefa', t: 'select', ph: 'Nenhuma', opts: tarefas, show: (x) => x.tipo === 'tarefa' },
+        { k: 'modo', l: 'Repetição', t: 'seg', opts: [['diario', 'Todo dia'], ['intervalo', 'A cada…'], ['unico', 'Uma vez']] },
+        { k: 'data', l: 'Data', t: 'date', half: true, show: (x) => x.modo === 'unico' },
+        { k: 'hora', l: 'Hora', t: 'time', half: true, req: true, show: (x) => x.modo !== 'intervalo' },
+        { k: '_ini', l: 'Das', t: 'time', half: true, show: (x) => x.modo === 'intervalo' },
+        { k: 'hora_fim', l: 'Até', t: 'time', half: true, show: (x) => x.modo === 'intervalo' },
+        { k: 'intervalo_min', l: 'A cada', t: 'select', opts: INTERVALOS, show: (x) => x.modo === 'intervalo' },
+        { k: 'dias_semana', l: 'Dias da semana', t: 'days', hint: 'Nenhum marcado = todos os dias', show: (x) => x.modo !== 'unico' },
+        { k: 'pular_meta', l: 'Não tocar depois de bater a meta de água', t: 'toggle', show: (x) => x.tipo === 'agua' },
+        { k: 'som', l: 'Tocar som', t: 'toggle' },
+        { k: 'ativo', l: 'Ligado', t: 'toggle' },
+        { k: 'observacao', l: 'Observação', t: 'text', max: 200, ph: 'Ex.: 1 comprimido com água' }
+      ],
+      defaults: { ...v, _ini: v.hora },
+      beforeSave: (r, sh) => {
+        const out = { ...r };
+        if (out.modo === 'intervalo') {
+          const ini = sh.$('[data-field="_ini"] input') ? sh.$('[data-field="_ini"] input').value : v.hora;
+          if (!ini) { ui.toast('Informe a hora de início.', { error: true }); return null; }
+          out.hora = ini;
+          if (out.hora_fim && hm(out.hora_fim) <= hm(ini)) { ui.toast('"Até" precisa ser depois de "Das".', { error: true }); return null; }
+          out.intervalo_min = +out.intervalo_min || 120;
+        }
+        if (out.modo === 'unico' && !out.data) { ui.toast('Informe a data.', { error: true }); return null; }
+        if (out.tipo !== 'tarefa') out.ref_id = null;
+        if (row && (row.hora !== out.hora || row.data !== out.data || row.modo !== out.modo)) out.ultimo_disparo = null;
+        return out;
+      },
+      afterSave: () => { if (!P.router.current() || !/alarmes/.test(P.router.current().tab || '')) return; P.router.render(true); },
+      deleteLabel: 'Alarme excluído'
+    });
+  }
+  A.edit = edit;
+
+  const screen = (mod) => ({ mod, tab: 'alarmes', title: 'Alarmes', deps: ['alarmes', 'tar_tarefas', 'nut_agua'], render });
+  P.screen('tar/alarmes', screen('tar'));
+  P.screen('nut/alarmes', screen('nut'));
+
+  Object.assign(P.act, {
+    'al.new': () => edit(null, P.router.current() && P.router.current().mod === 'nut' ? { tipo: 'agua' } : {}),
+    'al.edit': (el) => { const a = S.get('alarmes', el.dataset.id); if (a) edit(a); },
+    'al.modelo': (el) => { const m = MODELOS.find((x) => x.id === el.dataset.m); if (m) edit(null, m.v); },
+    'al.filtro': (el) => { st.filtro = el.dataset.v; P.router.render(true); },
+    'al.toggle': (el) => { const a = S.get('alarmes', el.dataset.id); if (!a) return; S.save('alarmes', { id: a.id, ativo: el.checked, ultimo_disparo: null }, { toast: el.checked ? 'Alarme ligado' : 'Alarme desligado' }).catch(() => {}); },
+    'al.som': (el) => { P.settings.set({ 'alarm.som': el.checked }).catch(() => {}); ui.toast(el.checked ? 'Som ligado' : 'Alarmes sem som (só vibração e tela)'); },
+    'al.test': () => A.test()
+  });
+})();
+</script>

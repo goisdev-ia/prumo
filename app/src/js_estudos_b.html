@@ -1,0 +1,817 @@
+<script>
+/* Prumo · Estudos: biblioteca, sala de estudo (sessões), revisões, flashcards, caderno de erros, resumos e lei seca,
+   discursivas, desempenho, histórico e preferências. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const E = P.est;
+  const st = { tick: null, lixeira: null, cardQ: null, cardI: 0, cardShow: false, statsRes: null, statsPrev: null, statsLoading: false, revAberta: null };
+  const TIPOS_MAT = { pdf: ['PDF', 'file'], xlsx: ['Planilha', 'grid'], imagem: ['Imagem', 'image'], link: ['Link', 'link'], livro: ['Livro', 'book'], aula: ['Aula', 'play'], curso: ['Curso', 'layers'], outro: ['Outro', 'file'] };
+  const SIT_MAT = { a_estudar: 'A estudar', estudando: 'Estudando', concluido: 'Concluído', arquivado: 'Arquivado' };
+  const back = (to, label) => h`<a href="#/${to}" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}${label}</a>`;
+  const device = () => `${/Mobi|Android/i.test(navigator.userAgent) ? 'celular' : 'computador'} · ${innerWidth}px`;
+  const fs = (k, d) => P.settings.get(k, d);
+
+  // ================= Biblioteca =================
+  const annOf = (m) => S.where('est_pdf_anot', (a) => a.material_id === m.id && a.arquivo_id === m.arquivo_id)[0] || null;
+  const readOf = (m) => S.where('est_leitura', (r) => r.material_id === m.id)[0] || null;
+  const lidasN = (s) => String(s || '').split(',').filter(Boolean).reduce((n, p) => { const [a, b] = p.split('-').map(Number); return n + (b ? b - a + 1 : 1); }, 0);
+  E.annOf = annOf; E.readOf = readOf; E.lidasN = lidasN;
+
+  function biblioteca() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.bib', tipo = P.flt.get(fk, 'tipo', 'todos'), sit = P.flt.get(fk, 'sit', 'ativos'), disc = P.flt.get(fk, 'disc', ''), cat = P.flt.get(fk, 'cat', '');
+    st.bsel = st.bsel || new Set();
+    if (st.lixeira) return lixeira();
+    const all = S.all('est_materiais');
+    const rows = all.filter((m) => (tipo === 'todos' || m.tipo === tipo || (tipo === 'fav' && m.favorito) || (tipo === 'telegram' && m.origem === 'telegram'))
+      && (sit === 'todos' || (sit === 'ativos' ? m.situacao !== 'arquivado' : m.situacao === sit)) && (!disc || m.disciplina_id === disc) && (!cat || (m.categoria || 'outros') === cat)
+      && P.flt.match(fk, m.titulo, m.codigo, m.descricao, m.autor, m.tags, E.discNome(m.disciplina_id))).sort((a, b) => (b.favorito ? 1 : 0) - (a.favorito ? 1 : 0) || ((a.updated_at || '') < (b.updated_at || '') ? 1 : -1));
+    return h`<div class="page-head"><div><h1>Biblioteca</h1><p>${all.length} material(is) · PDFs, planilhas, imagens, links, livros e aulas</p></div>
+        <div class="row-sm wrap"><button class="btn btn-ghost btn-sm" data-act="est.libReorg">${icon('folder', 'sm')}Reorganizar</button><button class="btn btn-ghost btn-sm" data-act="est.lixeira">${icon('trash', 'sm')}Lixeira</button><button class="btn btn-ghost btn-sm" data-act="est.matLink">${icon('link', 'sm')}Link, livro ou aula</button><button class="btn btn-primary btn-sm" data-act="est.matUpload">${icon('upload', 'sm')}Enviar arquivos</button></div></div>
+      <div class="filters mb-3">${P.flt.search(fk, 'Buscar título, código, autor, etiqueta')}
+        <div class="row-f">${P.flt.chips(fk, 'tipo', [['todos', 'Todos'], ['pdf', 'PDF'], ['xlsx', 'Planilhas'], ['imagem', 'Imagens'], ['link', 'Links'], ['livro', 'Livros'], ['aula', 'Aulas'], ['fav', 'Favoritos'], ['telegram', 'Do Telegram']], 'todos')}</div>
+        <div class="row-f">${P.flt.chips(fk, 'sit', [['ativos', 'Ativos'], ['a_estudar', 'A estudar'], ['estudando', 'Estudando'], ['concluido', 'Concluídos'], ['arquivado', 'Arquivados']], 'ativos')}${P.flt.select(fk, 'disc', E.disciplinas().map((d) => [d.id, d.nome]), 'Todas as disciplinas')}${P.flt.select(fk, 'cat', Object.entries(E.CATS), 'Todas as categorias')}</div></div>
+      ${st.bsel.size ? h`<div class="card pad-lg est-hero mb-3"><div class="grow"><b>${st.bsel.size} selecionado(s)</b><p class="muted" style="font-size:12.5px">Mudar categoria ou concurso move o arquivo para a pasta certa no Drive.</p></div>
+        <div class="row-sm wrap"><select class="input sm" data-on-change="est.bibLoteCat" aria-label="Categoria"><option value="">Categoria…</option>${Object.entries(E.CATS).map(([k, l]) => h`<option value="${k}">${l}</option>`)}</select><select class="input sm" data-on-change="est.bibLoteConc" aria-label="Concurso"><option value="">Concurso…</option><option value="_geral">Geral (nenhum)</option>${E.concursos().map((c) => h`<option value="${c.id}">${c.nome}</option>`)}</select><button class="btn btn-ghost btn-sm" data-act="est.bibSelClear">Limpar seleção</button></div></div>` : ''}
+      <p class="faint mb-3" style="font-size:12px">A busca olha título, código, autor, etiquetas e disciplina. O conteúdo dos PDFs entra na busca do Telegram e do assistente depois de aberto uma vez no leitor (o ícone ${icon('scan', 'xs')} mostra quem já tem texto extraído).</p>
+      ${rows.length ? h`<div class="list cardlist">${rows.map((m) => matRow(m, true))}</div>` : ui.empty({ ill: 'file', title: all.length ? 'Nada neste filtro' : 'Biblioteca vazia', text: 'Envie PDFs (até 50 MB), planilhas e imagens, ou cadastre links, livros e aulas. Pelo Telegram também dá: mande o arquivo para o bot.', action: { act: 'est.matUpload', label: 'Enviar arquivos' } })}`;
+  }
+
+  function matRow(m, sel) {
+    const [tl, ic] = TIPOS_MAT[m.tipo] || TIPOS_MAT.outro, ann = annOf(m), rd = readOf(m), tot = (rd && rd.total_paginas) || m.paginas;
+    const lid = rd ? lidasN(rd.paginas_lidas) : 0;
+    return h`<div class="li">${sel ? h`<input type="checkbox" data-on-change="est.bibSel" data-id="${m.id}" ${raw(st.bsel && st.bsel.has(m.id) ? 'checked' : '')} aria-label="Selecionar ${m.codigo}">` : ''}<span class="tile sm tc" style="--tc:${E.discCor(m.disciplina_id)}">${icon(ic, 'sm')}</span>
+      <span class="main tap" data-act="est.matOpen" data-id="${m.id}"><span class="t">${m.favorito ? h`${icon('star', 'xs')} ` : ''}${m.codigo} · ${m.titulo}${m.versao > 1 ? ' (v' + m.versao + ')' : ''}</span>
+        <span class="s">${tl} · ${E.CATS[m.categoria || 'outros']}${E.discNome(m.disciplina_id) ? ' · ' + E.discNome(m.disciplina_id) : ''} · ${SIT_MAT[m.situacao]}${tot ? ` · ${lid}/${tot} p. lidas` : ''}${ann && ann.total ? ` · ${ann.total} marcações` : ''}${m.origem === 'telegram' ? ' · Telegram' : ''}${m.texto_paginas ? '' : m.tipo === 'pdf' ? ' · sem texto extraído' : ''}</span></span>
+      ${m.texto_paginas ? h`<span class="faint" title="Texto extraído de ${m.texto_paginas} página(s)">${icon('scan', 'xs')}</span>` : ''}
+      <button class="btn-icon sm" data-act="est.matMenu" data-id="${m.id}" aria-label="Ações">${icon('dots', 'sm')}</button></div>`;
+  }
+
+  function lixeira() {
+    const rows = st.lixeira || [];
+    return h`<div class="page-head"><div><a href="#" class="muted row-sm" data-act="est.lixeiraFechar" style="font-size:13px">${icon('chev-l', 'xs')}Biblioteca</a><h1 class="mt-2">Lixeira</h1><p>Materiais excluídos. O arquivo original continua no seu Drive.</p></div></div>
+      ${rows.length ? h`<div class="list cardlist">${rows.map((m) => h`<div class="li"><span class="main"><span class="t">${m.codigo} · ${m.titulo}</span><span class="s">excluído em ${fmt.date(String(m.deleted_at).slice(0, 10))}</span></span><button class="btn btn-ghost btn-sm" data-act="est.matRestore" data-id="${m.id}">${icon('undo', 'sm')}Restaurar</button></div>`)}</div>` : ui.empty({ ill: 'check', title: 'Lixeira vazia', small: true })}`;
+  }
+
+  function matEdit(m) {
+    const isNew = !m || !m.id;
+    ui.editSheet({ table: 'est_materiais', row: isNew ? null : m, title: isNew ? 'Novo material' : 'Dados do material', size: 'full', defaults: m || { tipo: 'link', situacao: 'a_estudar' },
+      fields: [{ k: 'titulo', l: 'Título', t: 'text', req: true, focus: isNew }, { k: 'tipo', l: 'Tipo', t: 'select', half: true, opts: Object.entries(TIPOS_MAT).map(([k, v]) => [k, v[0]]) }, { k: 'situacao', l: 'Situação', t: 'select', half: true, opts: Object.entries(SIT_MAT) }, { k: 'categoria', l: 'Categoria', t: 'select', half: true, opts: Object.entries(E.CATS), show: (v) => !!v.arquivo_id },
+        { k: 'url', l: 'Link', t: 'text', ph: 'https://', show: (v) => !v.arquivo_id }, { k: 'autor', l: 'Autor / fonte', t: 'text', half: true }, { k: 'data_ref', l: 'Data de referência', t: 'date', half: true },
+        { k: 'disciplina_id', l: 'Disciplina', t: 'select', ph: 'Nenhuma', opts: () => E.disciplinas().map((d) => [d.id, d.nome]) },
+        { k: 'paginas', l: 'Páginas', t: 'int', half: true }, { k: 'tags', l: 'Etiquetas', t: 'text', half: true, ph: 'apostila, lei seca' }, { k: 'descricao', l: 'Descrição', t: 'textarea', rows: 2 }, { k: 'favorito', l: 'Favorito', t: 'toggle' }],
+      extra: h`<div class="field"><span class="label">Assuntos</span><select class="input" multiple size="6" data-ass>${S.all('est_assuntos').sort((a, b) => E.discNome(a.disciplina_id).localeCompare(E.discNome(b.disciplina_id))).map((a) => h`<option value="${a.id}" ${String((m && m.assunto_ids) || '').split(',').includes(a.id) ? raw('selected') : ''}>${E.discNome(a.disciplina_id)} › ${a.titulo}</option>`)}</select></div>
+        ${m && m.arquivo_id ? h`<p class="faint" style="font-size:12px">${icon('folder', 'xs')} Pasta no Drive: ${m.pasta ? 'Estudos / ' + m.pasta.split('/').join(' / ') : 'estrutura antiga (use Biblioteca › Reorganizar)'}</p>` : ''}
+        <div class="field"><span class="label">Concursos</span><select class="input" multiple size="3" data-conc>${E.concursos().map((c) => h`<option value="${c.id}" ${String((m && m.concurso_ids) || '').split(',').includes(c.id) ? raw('selected') : ''}>${c.nome}</option>`)}</select></div>`,
+      save: async (r, sh) => {
+        const out = { ...r, id: m && m.id, assunto_ids: Array.from(sh.$('[data-ass]').selectedOptions).map((o) => o.value).join(','), concurso_ids: Array.from(sh.$('[data-conc]').selectedOptions).map((o) => o.value).join(','), paginas: r.paginas ? +r.paginas : null };
+        const res = await P.api.call('est.materialSave', out, { mutation: true }); S.put('est_materiais', res.material); return res.material;
+      } });
+  }
+
+  async function matOpen(id, pagina) {
+    await E.ensure();
+    const m = E.mat(id); if (!m) return;
+    if (m.tipo === 'pdf' && m.arquivo_id) { P.estPdf.open(m, { pagina }); return; }
+    if (m.tipo === 'link' || (!m.arquivo_id && m.url)) { if (m.url) window.open(m.url, '_blank', 'noopener'); else matEdit(m); return; }
+    if (m.tipo === 'imagem' && m.arquivo_id) {
+      const s = ui.sheet({ title: m.codigo + ' · ' + m.titulo, size: 'full', body: h`<div class="skel" style="height:300px" data-img></div>`, foot: h`<button class="btn btn-ghost" data-act="est.matMenu" data-id="${m.id}">${icon('dots', 'sm')}Ações</button>` });
+      try { const u = await P.files.url(m.arquivo_id); s.$('[data-img]').outerHTML = `<img alt="${P.esc(m.titulo)}" src="${P.esc(u)}" style="max-width:100%;border-radius:12px">`; } catch (e) { s.$('[data-img]').outerHTML = '<p class="muted">Não foi possível carregar a imagem.</p>'; }
+      return;
+    }
+    matMenu(m);
+  }
+
+  function matMenu(m) {
+    const ann = annOf(m);
+    ui.menu(m.codigo + ' · ' + m.titulo, [
+      m.arquivo_id || m.url ? { label: m.tipo === 'pdf' ? 'Abrir no leitor' : 'Abrir', icon: 'book', act: () => (m.tipo === 'pdf' || m.tipo === 'imagem' || m.tipo === 'link' ? matOpen(m.id) : openDrive(m.arquivo_id)) } : null,
+      { label: 'Estudar com este material', icon: 'play', act: () => P.act['est.start']({ dataset: { mat: m.id, disc: m.disciplina_id || '' } }) },
+      (m.tipo === 'xlsx') ? { label: 'Importar dados da planilha', icon: 'upload', act: () => P.estQ.importer(null, { materialId: m.id }) } : null,
+      m.tipo === 'pdf' && m.arquivo_id ? { label: 'Imprimir ou baixar', sub: 'Original ou anotado; todas as páginas ou um intervalo', icon: 'file', act: () => P.estPdf.printSheet(m) } : null,
+      m.tipo === 'pdf' && E.aiOn() ? { label: 'Resumir com IA', sub: 'Objetivo, direcionado ou detalhado (PDF grande em blocos)', icon: 'zap', act: () => E.resumoIA(m) } : null,
+      m.tipo === 'pdf' ? { label: 'Importar as questões deste PDF', sub: 'Enunciados, textos, alternativas, gabarito, banca e ano', icon: 'list', act: () => P.estQ.importPdf({ materialId: m.id }) } : null,
+      m.tipo === 'pdf' ? { label: 'Ler como edital (conteúdo programático)', sub: 'Disciplinas, assuntos, itens, páginas, peso e questões', icon: 'layers', act: () => { const cid = String(m.concurso_ids || '').split(',').filter(Boolean)[0] || E.ctx() || (E.principal() || {}).id; if (!cid) { ui.toast('Cadastre o concurso primeiro (Estudos › Concursos).', { error: true }); return; } E.editalNew(cid, { materialId: m.id }); } } : null,
+      { label: 'Editar dados', icon: 'edit', act: () => matEdit(m) },
+      { label: m.favorito ? 'Tirar dos favoritos' : 'Favoritar', icon: 'star', act: () => P.api.call('est.materialSave', { id: m.id, favorito: !m.favorito }, { mutation: true }).then((r) => S.put('est_materiais', r.material)).catch((e) => ui.toast(e.message, { error: true })) },
+      m.arquivo_id ? { label: 'Nova versão do arquivo', icon: 'layers', act: () => newVersion(m) } : null,
+      m.arquivo_id ? { label: 'Enviar original para meu Telegram', icon: 'message', act: () => E.sendTg({ tipo: 'material', id: m.id, variante: 'original' }) } : null,
+      m.tipo === 'pdf' && ann && ann.total ? { label: 'Enviar cópia anotada para meu Telegram', icon: 'message', act: () => P.estPdf.sendAnnotated(m) } : null,
+      m.arquivo_id ? { label: 'Abrir no Google Drive', icon: 'external', act: () => openDrive(m.arquivo_id) } : null,
+      m.versao_de ? { label: 'Ver versão anterior', icon: 'history', act: () => { const old = S.getAny('est_materiais', m.versao_de); if (old) matMenu(old); } } : null,
+      { label: 'Agendar revisão de páginas', icon: 'refresh', act: () => revAgendar('material', m.id) },
+      { label: 'Mover para a lixeira', icon: 'trash', danger: true, act: () => S.remove('est_materiais', m.id, { label: 'Material na lixeira (o arquivo continua no Drive)' }) }
+    ]);
+  }
+  async function openDrive(arquivoId) { try { const r = await P.api.call('files.link', { id: arquivoId }); window.open(r.url, '_blank', 'noopener'); } catch (e) { ui.toast(e.message, { error: true }); } }
+  E.openDrive = openDrive; E.matOpen = matOpen; E.matMenu = matMenu;
+
+  async function newVersion(m) {
+    const f = await P.files.pick({ accept: m.tipo === 'pdf' ? 'application/pdf' : '' }); if (!f) return;
+    const ok = await ui.confirm({ title: 'Nova versão de ' + m.codigo + '?', text: 'O arquivo novo vira a versão ' + ((m.versao || 1) + 1) + '. As anotações da versão atual continuam nela e não são movidas automaticamente.', ok: 'Enviar' }); if (!ok) return;
+    try {
+      const r = await E.upload(f);
+      if (r.duplicado) { ui.toast('Esse arquivo já está na biblioteca' + (r.material ? ' (' + r.material.codigo + ')' : '') + '.', { error: true }); return; }
+      const nv = await P.api.call('est.materialVersion', { material_id: m.id, arquivo_id: r.arquivo.id }, { mutation: true });
+      S.put('arquivos', r.arquivo); S.put('est_materiais', nv.material); S.put('est_materiais', { ...m, situacao: 'arquivado' });
+      ui.toast(`${nv.material.codigo} · versão ${nv.material.versao} criada`);
+    } catch (e) { ui.toast(e.message, { error: true }); }
+  }
+
+  // ================= Sala de estudo =================
+  async function startFlow(ds) {
+    await E.ensure();
+    const ab = E.open();
+    if (ab) { P.router.go('est/sala'); ui.toast('Você já tem uma sessão aberta.'); return; }
+    const tk = ds.tarefa ? S.get('tar_tarefas', ds.tarefa) : null;
+    const ass = ds.ass ? E.ass(ds.ass) : null;
+    const v = { tipo: tk && tk.est_tipo && tk.est_tipo !== 'projeto' ? tk.est_tipo : 'teoria', concurso_id: (tk && tk.est_concurso_id) || E.ctx() || null, disciplina_id: (tk && tk.est_disciplina_id) || (ass && ass.disciplina_id) || ds.disc || null, assunto_id: (tk && tk.est_assunto_id) || (ass && ass.id) || null, material_id: (tk && tk.est_material_id) || ds.mat || null, objetivo: tk ? tk.titulo : '', tarefa_id: tk ? tk.id : null };
+    ui.editSheet({ table: 'est_sessoes', title: 'Iniciar estudo', defaults: v, createLabel: 'Começar',
+      fields: [{ k: 'tipo', l: 'Atividade', t: 'seg', opts: Object.entries(E.TIPO_SES) }].concat(E.fieldsCtx(), [{ k: 'material_id', l: 'Material', t: 'select', ph: 'Nenhum', opts: () => S.all('est_materiais').filter((m) => m.situacao !== 'arquivado').map((m) => [m.id, m.codigo + ' · ' + m.titulo]) }, { k: 'objetivo', l: 'Resultado esperado', t: 'text', ph: 'Ex.: terminar o capítulo 3 e fazer 20 questões' }]),
+      save: (row) => doStart({ ...row, tarefa_id: v.tarefa_id }),
+      afterSave: (s) => { P.router.go('est/sala'); const m = s.material_id && E.mat(s.material_id); if (m && m.tipo === 'pdf') setTimeout(() => P.estPdf.open(m, { sessao: s }), 300); } });
+  }
+
+  async function doStart(row, encerrarOutra) {
+    const payload = { ...row, aparelho: device(), op_key: P.uuid(), encerrar_outra: !!encerrarOutra };
+    try { const r = await P.api.call('est.sessionStart', payload, { mutation: true }); S.put('est_sessoes', r.sessao); return r.sessao; }
+    catch (e) {
+      if (e.code !== 'CONFLICT') throw e;
+      const out = e.data && e.data.sessao;
+      if (out) S.put('est_sessoes', out);
+      const choice = await new Promise((res) => {
+        const s = ui.sheet({ title: 'Sessão já aberta', body: h`<p class="muted">${e.message} Começou às ${out ? fmt.time(out.inicio) : '?'}${out && out.disciplina_id ? ' — ' + E.discNome(out.disciplina_id) : ''}.</p><p class="faint mt-2" style="font-size:12.5px">Só existe uma sessão aberta por vez, para o tempo não contar duas vezes.</p>`,
+          foot: h`<button class="btn btn-ghost" data-c="continuar">Continuar aquela</button><button class="btn btn-primary" data-c="encerrar">Encerrar aquela e começar esta</button>`,
+          onMount(sh) { sh.el.addEventListener('click', (ev) => { const b = ev.target.closest('[data-c]'); if (b) { const c = b.dataset.c; res(c); sh.close(); } }); }, onClose: () => res(null) });
+      });
+      if (choice === 'encerrar') return doStart(row, true);
+      if (choice === 'continuar') { P.router.go('est/sala'); }
+      const err = new Error('Sessão aberta mantida.'); err.code = 'CANCEL'; throw err;
+    }
+  }
+
+  function sala() {
+    const g = E.gate(); if (g) return g;
+    const s = E.open();
+    const recentes = S.where('est_sessoes', (x) => x.status === 'encerrada').sort((a, b) => (a.fim < b.fim ? 1 : -1)).slice(0, 6);
+    if (!s) {
+      return h`<div class="page-head"><div><h1>Sala de estudo</h1><p>Material, cronômetro, anotações e prática no mesmo lugar</p></div><button class="btn btn-ghost btn-sm" data-act="est.manual">${icon('plus', 'sm')}Registrar estudo externo</button></div>
+        <div class="card pad-lg est-hero"><div class="grow"><b>Nenhuma sessão aberta</b><p class="muted mt-2" style="font-size:13px">O tempo é calculado no servidor pelos horários de início, pausas e fim. Pode fechar o app: a sessão continua e você retoma de qualquer aparelho.</p></div><button class="btn btn-primary" data-act="est.start">${icon('play', 'sm')}Iniciar estudo</button></div>
+        ${recentes.length ? h`<div class="section-title"><h2>Últimas sessões</h2><a class="link-btn" href="#/est/historico">Histórico</a></div><div class="list cardlist">${recentes.map((x) => E.sessionRow(x))}</div>` : ''}`;
+    }
+    const m = s.material_id ? E.mat(s.material_id) : null, rd = m ? readOf(m) : null;
+    const pomo = +fs('est.pomodoro_min', 0);
+    return h`<div class="page-head"><div><h1>Sala de estudo</h1><p>${E.TIPO_SES[s.tipo]}${s.disciplina_id ? ' · ' + E.discNome(s.disciplina_id) : ''}${s.assunto_id ? ' — ' + E.assNome(s.assunto_id) : ''}</p></div></div>
+      <div class="dash"><div class="span-5 stack">
+        <div class="card pad-lg est-timer ${s.status === 'pausada' ? 'paused' : ''}"><div class="label faint">${s.status === 'pausada' ? 'Pausada' : 'Tempo líquido'}</div><div class="num big" data-timer>${clock(E.liveSecs(s))}</div>
+          <p class="faint" style="font-size:12px">Início ${fmt.time(s.inicio)} · ${(s.pausas_json || []).length} pausa(s)${s.aparelho ? ' · aberta no ' + String(s.aparelho).split(' · ')[0] : ''}${pomo ? ' · Pomodoro de ' + pomo + ' min' : ''}</p>
+          ${s.objetivo ? h`<p class="mt-2" style="font-size:13.5px">${icon('target', 'xs')} ${s.objetivo}</p>` : ''}
+          <div class="row-sm mt-3 wrap">${s.status === 'pausada' ? h`<button class="btn btn-primary" data-act="est.sessResume" data-id="${s.id}">${icon('play', 'sm')}Retomar</button>` : h`<button class="btn btn-ghost" data-act="est.sessPause" data-id="${s.id}">${icon('pause', 'sm')}Pausar</button>`}<button class="btn btn-primary" data-act="est.sessEnd" data-id="${s.id}">${icon('stop', 'sm')}Encerrar</button></div></div>
+        <div class="card pad-lg"><b>Notas da sessão</b><p class="faint" style="font-size:12px">Guardadas neste aparelho até você encerrar a sessão.</p>
+          <div class="field mt-2"><label for="ses-duv">Dúvidas</label><textarea id="ses-duv" class="input" rows="3" data-on-input="est.sessNote" data-k="duvidas">${localGet(s.id).duvidas || ''}</textarea></div>
+          <div class="field mt-2"><label for="ses-px">Próximo passo</label><input id="ses-px" class="input" data-on-input="est.sessNote" data-k="proximo_passo" value="${localGet(s.id).proximo_passo || ''}"></div></div>
+      </div><div class="span-7 stack">
+        <div class="card pad-lg"><div class="card-head">${icon('book')}<h3>Material</h3>${m ? '' : h`<button class="btn btn-ghost btn-sm" data-act="est.sessMat" data-id="${s.id}">${icon('plus', 'sm')}Escolher</button>`}</div>
+          ${m ? h`<b>${m.codigo} · ${m.titulo}</b><p class="muted" style="font-size:13px">${rd ? `parou na página ${rd.pagina}${rd.total_paginas ? ' de ' + rd.total_paginas : ''} · ${lidasN(rd.paginas_lidas)} marcadas como lidas` : 'ainda não aberto'}</p><div class="row-sm mt-3 wrap"><button class="btn btn-primary" data-act="est.matOpen" data-id="${m.id}">${icon('book', 'sm')}${rd ? 'Continuar leitura' : 'Abrir no leitor'}</button></div>` : h`<p class="muted" style="font-size:13px">Estudando sem material digital (livro, aula presencial…).</p>`}</div>
+        <div class="card pad-lg"><div class="card-head">${icon('zap')}<h3>Atalhos</h3></div><div class="row-sm wrap">
+          <button class="btn btn-ghost btn-sm" data-act="est.treinar" data-ass="${s.assunto_id || ''}" data-disc="${s.disciplina_id || ''}">${icon('list', 'sm')}Questões ${s.assunto_id ? 'do assunto' : ''}</button>
+          <button class="btn btn-ghost btn-sm" data-act="est.cardNew" data-ass="${s.assunto_id || ''}" data-disc="${s.disciplina_id || ''}">${icon('layers', 'sm')}Criar flashcard</button>
+          <button class="btn btn-ghost btn-sm" data-act="est.noteNew" data-ass="${s.assunto_id || ''}" data-disc="${s.disciplina_id || ''}" data-mat="${s.material_id || ''}">${icon('edit', 'sm')}Resumo</button>
+          <button class="btn btn-ghost btn-sm" data-act="est.erroNew" data-ass="${s.assunto_id || ''}" data-disc="${s.disciplina_id || ''}">${icon('alert', 'sm')}Registrar dúvida/erro</button></div></div>
+      </div></div>`;
+  }
+  const clock = (sec) => { sec = Math.max(0, Math.round(sec)); const hh = Math.floor(sec / 3600), mm = Math.floor((sec % 3600) / 60), ss = sec % 60; return `${hh}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`; };
+  const localKey = (id) => 'prumo.sess.' + id;
+  const localGet = (id) => { try { return JSON.parse(localStorage.getItem(localKey(id))) || {}; } catch (e) { return {}; } };
+  const localSet = (id, o) => { try { localStorage.setItem(localKey(id), JSON.stringify(o)); } catch (e) { /* modo privado */ } };
+
+  function salaMount(root) {
+    clearInterval(st.tick);
+    const el = root.querySelector('[data-timer]'), s = E.open(), pomo = +fs('est.pomodoro_min', 0);
+    let lastPomo = s ? Math.floor(E.liveSecs(s) / 60 / (pomo || 1e9)) : 0;
+    if (el && s) st.tick = setInterval(() => {
+      if (!document.body.contains(el)) { clearInterval(st.tick); return; }
+      const sec = E.liveSecs(E.open()); el.textContent = clock(sec);
+      if (pomo && s.status !== 'pausada') { const n = Math.floor(sec / 60 / pomo); if (n > lastPomo) { lastPomo = n; ui.toast(`${n} Pomodoro(s) de ${pomo} min. Hora de uma pausa curta.`, { icon: 'timer', duration: 8000 }); try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch (e) { /* sem vibração */ } } }
+    }, 1000);
+  }
+
+  function endSheet(s) {
+    const ass = s.assunto_id ? E.ass(s.assunto_id) : null, loc = localGet(s.id), visit = P.estPdf && P.estPdf.visited(s.material_id);
+    const tk = s.tarefa_id ? S.get('tar_tarefas', s.tarefa_id) : null;
+    ui.editSheet({ table: 'est_sessoes', title: 'Encerrar sessão', createLabel: 'Encerrar', size: 'full',
+      defaults: { duvidas: loc.duvidas || '', proximo_passo: loc.proximo_passo || '', teoria: ass ? (ass.teoria === 'nao_iniciada' ? 'em_andamento' : ass.teoria) : '', paginas: '', concluir_tarefa: !!tk },
+      fields: [
+        { k: 'paginas', l: 'Páginas efetivamente estudadas', t: 'text', ph: 'Ex.: 12-30, 35', hint: visit ? `Você visitou ${visit}. Visitar a última página não conta como leitura: informe só o que estudou.` : 'Opcional. Marca as páginas como lidas no material.' },
+        { k: 'questoes_n', l: 'Questões feitas fora do banco', t: 'int', half: true, min: 0 }, { k: 'acertos_n', l: 'Acertos', t: 'int', half: true, min: 0 },
+        { k: 'dificuldade', l: 'Dificuldade sentida', t: 'seg', opts: [[1, '1'], [2, '2'], [3, '3'], [4, '4'], [5, '5']] },
+        ass ? { k: 'teoria', l: `Teoria de "${ass.titulo}"`, t: 'select', opts: [['em_andamento', 'Em andamento'], ['concluida', 'Concluída']] } : null,
+        { k: 'duvidas', l: 'Dúvidas', t: 'textarea', rows: 2 }, { k: 'proximo_passo', l: 'Próximo passo', t: 'text' },
+        tk ? { k: 'concluir_tarefa', l: `Concluir a atividade "${tk.titulo}"`, t: 'toggle' } : null].filter(Boolean),
+      save: async (row) => {
+        if (row.paginas && !/^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/.test(row.paginas)) throw Object.assign(new Error('Use páginas como 12-30, 35.'), { field: 'paginas' });
+        const r = await P.api.call('est.sessionEnd', { id: s.id, ...row, dificuldade: +row.dificuldade || null, questoes_n: row.questoes_n === '' || row.questoes_n == null ? null : +row.questoes_n, acertos_n: row.acertos_n === '' || row.acertos_n == null ? null : +row.acertos_n }, { mutation: true });
+        S.put('est_sessoes', r.sessao); localStorage.removeItem(localKey(s.id));
+        if (r.aviso) ui.toast(r.aviso, { duration: 9000 });
+        return r.sessao;
+      },
+      savedMsg: 'Sessão encerrada',
+      afterSave: async (saved) => {
+        await E.reload().catch(() => {});
+        // ciclo: se era a disciplina "próxima", avança
+        const plano = S.all('est_planos').find((p) => p.ativo !== false);
+        if (plano) { const ciclo = S.where('est_ciclo_itens', (c) => c.plano_id === plano.id).sort((a, b) => a.ordem - b.ordem); if (ciclo.length && ciclo[(+plano.ciclo_pos || 0) % ciclo.length].disciplina_id === saved.disciplina_id) S.save('est_planos', { id: plano.id, ciclo_pos: (+plano.ciclo_pos || 0) + 1 }).catch(() => {}); }
+        const m = saved.material_id && E.mat(saved.material_id);
+        if (m && m.tipo === 'pdf' && P.estPdf) P.estPdf.exportIfNeeded(m, { silent: false });
+        ui.toast(`Sessão encerrada: ${fmt.dur(saved.liquido_s)} de estudo líquido`);
+      } });
+  }
+
+  function manualSheet() {
+    const now = new Date(), ini = new Date(now.getTime() - 3600e3);
+    const loc = (d) => `${D.iso(d)}T${D.time(d)}`;
+    ui.editSheet({ table: 'est_sessoes', title: 'Registrar estudo externo', createLabel: 'Registrar', defaults: { tipo: 'aula', _ini: loc(ini), _fim: loc(now), pausa_min: 0, concurso_id: E.ctx() || null },
+      fields: [{ k: 'tipo', l: 'Atividade', t: 'seg', opts: Object.entries(E.TIPO_SES) }, { k: '_ini', l: 'Começou', t: 'text', half: true, ph: 'AAAA-MM-DDTHH:MM' }, { k: '_fim', l: 'Terminou', t: 'text', half: true }, { k: 'pausa_min', l: 'Pausas', t: 'int', unit: 'min', half: true }].concat(E.fieldsCtx(), [{ k: 'objetivo', l: 'O que estudou', t: 'text' }, { k: 'paginas', l: 'Páginas', t: 'text', half: true }]),
+      extra: h`<p class="faint" style="font-size:12px">Use para aulas presenciais, livros físicos ou estudo sem o app. Fica marcado como lançamento manual.</p>`,
+      mount(sh) { ['_ini', '_fim'].forEach((k) => { const i = sh.$(`[data-k="${k}"]`); if (i) i.type = 'datetime-local'; }); },
+      save: async (row, sh) => {
+        const ini2 = sh.$('[data-k="_ini"]').value, fim2 = sh.$('[data-k="_fim"]').value;
+        const r = await P.api.call('est.sessionManual', { ...row, inicio: new Date(ini2).toISOString(), fim: new Date(fim2).toISOString(), pausa_min: +row.pausa_min || 0, op_key: P.uuid() }, { mutation: true });
+        S.put('est_sessoes', r.sessao); return r.sessao;
+      }, savedMsg: 'Estudo registrado', afterSave: () => E.reload().catch(() => {}) });
+  }
+
+  function sessEdit(s) {
+    if (!s) return;
+    if (s.status !== 'encerrada') { P.router.go('est/sala'); return; }
+    const loc = (iso) => { const d = new Date(iso); return `${D.iso(d)}T${D.time(d)}`; };
+    const pausaMin = Math.round(((s.pausas_json || []).reduce((a, p) => a + (p[0] === 'manual' ? +p[1] || 0 : (new Date(p[1]) - new Date(p[0])) / 1000), 0)) / 60);
+    ui.editSheet({ table: 'est_sessoes', row: s, title: 'Corrigir sessão', deletable: false, defaults: { _ini: loc(s.inicio), _fim: loc(s.fim), pausa_min: pausaMin, motivo: '' },
+      fields: [{ k: '_ini', l: 'Início', t: 'text', half: true }, { k: '_fim', l: 'Fim', t: 'text', half: true }, { k: 'pausa_min', l: 'Pausas', t: 'int', unit: 'min', half: true }, { k: 'tipo', l: 'Atividade', t: 'select', half: true, opts: Object.entries(E.TIPO_SES) }, { k: 'motivo', l: 'Motivo da correção', t: 'text', req: true, ph: 'Ex.: esqueci de pausar no almoço' }],
+      extra: h`<p class="faint" style="font-size:12px">Correções ficam na auditoria (antes e depois). Hoje: ${fmt.dur(s.liquido_s)} líquidos.${s.edicao_motivo ? ' Última correção: ' + s.edicao_motivo : ''}</p><button type="button" class="btn btn-ghost btn-sm mt-2" data-cancel style="color:var(--danger)">${icon('trash', 'sm')}Cancelar esta sessão</button>`,
+      mount(sh) { ['_ini', '_fim'].forEach((k) => { const i = sh.$(`[data-k="${k}"]`); if (i) i.type = 'datetime-local'; }); sh.$('[data-cancel]').onclick = async () => { const motivo = sh.$('[data-k="motivo"]').value.trim(); if (!motivo) { ui.toast('Escreva o motivo.', { error: true }); return; } try { const r = await P.api.call('est.sessionCancel', { id: s.id, motivo }, { mutation: true }); S.put('est_sessoes', r.sessao); sh.close(); ui.toast('Sessão cancelada (não conta mais tempo)'); } catch (e) { ui.toast(e.message, { error: true }); } }; },
+      save: async (row, sh) => { const r = await P.api.call('est.sessionEdit', { id: s.id, inicio: new Date(sh.$('[data-k="_ini"]').value).toISOString(), fim: new Date(sh.$('[data-k="_fim"]').value).toISOString(), pausa_min: +row.pausa_min || 0, tipo: row.tipo, motivo: row.motivo }, { mutation: true }); S.put('est_sessoes', r.sessao); return r.sessao; },
+      savedMsg: 'Sessão corrigida' });
+  }
+
+  // ================= Revisões =================
+  const prio = (r) => { const atraso = Math.max(0, D.diff(r.vencimento, D.today())); const prev = S.where('est_revisoes', (x) => x.alvo_id === r.alvo_id && x.status === 'feita').sort((a, b) => (a.feita_em < b.feita_em ? 1 : -1))[0]; const a = r.assunto_id ? E.ass(r.assunto_id) : null; return atraso * 2 + (prev && prev.resultado === 'errei' ? 5 : prev && prev.resultado === 'dificil' ? 3 : 0) + ((a && +a.dificuldade) || 3) + (r.alvo_tipo === 'questao' ? 2 : 0); };
+  function revisoes() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.rev', tipo = P.flt.get(fk, 'tipo', 'todos'), disc = P.flt.get(fk, 'disc', ''), hoje = D.today(), cap = +fs('est.rev_max_dia', 30) || 30;
+    const ok = (r) => (tipo === 'todos' || r.alvo_tipo === tipo) && (!disc || r.disciplina_id === disc);
+    const pend = S.where('est_revisoes', (r) => r.status === 'pendente' && ok(r));
+    const due = pend.filter((r) => r.vencimento <= hoje).map((r) => ({ r, p: prio(r) })).sort((a, b) => b.p - a.p);
+    const hojeL = due.slice(0, cap), exced = due.slice(cap), prox = pend.filter((r) => r.vencimento > hoje && r.vencimento <= D.add(hoje, 7)).sort((a, b) => (a.vencimento < b.vencimento ? -1 : 1));
+    const feitas = S.where('est_revisoes', (r) => r.status === 'feita' && ok(r)).sort((a, b) => (a.feita_em < b.feita_em ? 1 : -1)).slice(0, 15);
+    const iv = (fs('est.rev_intervalos', null) || [1, 7, 15, 30, 60, 120]).join(', ');
+    const row = (r, done) => h`<div class="li"><span class="tile sm">${icon({ assunto: 'layers', material: 'book', questao: 'list', erro: 'alert', nota: 'edit' }[r.alvo_tipo] || 'refresh', 'sm')}</span>
+      <span class="main tap" data-act="est.revOpen" data-id="${r.id}"><span class="t">${r.titulo}</span><span class="s">${{ assunto: 'Assunto', material: 'Material', questao: 'Questão', erro: 'Erro', nota: 'Nota' }[r.alvo_tipo]}${r.paginas ? ' p. ' + r.paginas : ''}${r.disciplina_id ? ' · ' + E.discNome(r.disciplina_id) : ''} · ${done ? 'feita ' + fmt.date(String(r.feita_em).slice(0, 10)) + ' (' + r.resultado + ')' : r.vencimento < hoje ? 'desde ' + fmt.dm(r.vencimento) : r.vencimento === hoje ? 'hoje' : fmt.day(r.vencimento)} · ${r.seq + 1}ª revisão</span></span>
+      ${done ? '' : h`<div class="rev-btns">${[['errei', 'Errei'], ['dificil', 'Difícil'], ['bom', 'Bom'], ['facil', 'Fácil']].map(([k, l]) => h`<button class="btn btn-ghost btn-sm" data-act="est.revDone" data-id="${r.id}" data-v="${k}">${l}</button>`)}</div>`}</div>`;
+    return h`<div class="page-head"><div><h1>Revisões</h1><p>${due.length} para hoje${exced.length ? ` · ${exced.length} redistribuídas` : ''} · ${prox.length} nos próximos 7 dias</p></div><button class="btn btn-ghost btn-sm" data-act="est.revAgendar">${icon('plus', 'sm')}Agendar</button></div>
+      <div class="filters mb-3"><div class="row-f">${P.flt.chips(fk, 'tipo', [['todos', 'Tudo'], ['assunto', 'Assuntos'], ['material', 'Materiais'], ['questao', 'Questões'], ['erro', 'Erros'], ['nota', 'Notas']], 'todos')}${P.flt.select(fk, 'disc', E.disciplinas().map((d) => [d.id, d.nome]), 'Todas as disciplinas')}</div></div>
+      ${hojeL.length ? h`<div class="group-h"><span>Hoje (até ${cap} por dia, mais urgentes primeiro)</span><span>${hojeL.length}</span></div><div class="list cardlist">${hojeL.map((x) => row(x.r))}</div>` : ui.empty({ ill: 'check', title: 'Nada para revisar hoje', text: 'Revisões nascem quando você estuda a teoria de um assunto, erra uma questão ou agenda manualmente.', small: true })}
+      ${exced.length ? h`<details class="mt-4"><summary class="group-h" style="cursor:pointer">Excedente do dia · ${exced.length} (continuam pendentes, nada é apagado)</summary><div class="list cardlist">${exced.map((x) => row(x.r))}</div></details>` : ''}
+      ${prox.length ? h`<div class="group-h mt-4"><span>Próximos 7 dias</span><span>${prox.length}</span></div><div class="list cardlist">${prox.map((r) => row(r))}</div>` : ''}
+      ${feitas.length ? h`<details class="mt-4"><summary class="group-h" style="cursor:pointer">Histórico recente</summary><div class="list cardlist">${feitas.map((r) => row(r, true))}</div></details>` : ''}
+      <div class="card pad-lg mt-4"><b>Como as revisões são agendadas</b><p class="muted mt-2" style="font-size:13px">Intervalos: ${iv} dias (ajuste em Preferências). Errei → volta para o 1º intervalo; Difícil → repete o intervalo atual; Bom → próximo; Fácil → pula um. A fila do dia põe primeiro o que está mais atrasado, o que você errou ou achou difícil e os assuntos mais difíceis. Se passar do limite diário, o resto fica no excedente sem ser apagado.</p></div>`;
+  }
+
+  function revAgendar(tipo, id) {
+    const opts = { assunto: () => S.all('est_assuntos').map((a) => [a.id, E.discNome(a.disciplina_id) + ' › ' + a.titulo]), material: () => S.all('est_materiais').map((m) => [m.id, m.codigo + ' · ' + m.titulo]), nota: () => S.all('est_anotacoes').map((n) => [n.id, n.titulo]), erro: () => S.all('est_erros').map((e) => [e.id, e.titulo]) };
+    ui.editSheet({ table: 'est_revisoes', title: 'Agendar revisão', createLabel: 'Agendar', defaults: { alvo_tipo: tipo || 'assunto', alvo_id: id || null, vencimento: D.add(D.today(), 1) },
+      fields: [{ k: 'alvo_tipo', l: 'O que revisar', t: 'seg', opts: [['assunto', 'Assunto'], ['material', 'Material'], ['nota', 'Nota'], ['erro', 'Erro']] },
+        { k: 'alvo_id', l: 'Item', t: 'select', req: true, opts: (v) => (opts[v.alvo_tipo] || opts.assunto)() }, { k: 'paginas', l: 'Páginas', t: 'text', ph: '10-25', show: (v) => v.alvo_tipo === 'material' }, { k: 'vencimento', l: 'Data', t: 'date', req: true }],
+      save: async (row) => { const r = await P.api.call('est.reviewSchedule', row, { mutation: true }); S.put('est_revisoes', r.revisao); return r.revisao; }, savedMsg: 'Revisão agendada' });
+  }
+  E.revAgendar = revAgendar;
+
+  function revOpen(r) {
+    if (r.alvo_tipo === 'assunto') P.act['est.assunto']({ dataset: { id: r.alvo_id } });
+    else if (r.alvo_tipo === 'material') matOpen(r.alvo_id, r.paginas ? +String(r.paginas).split(/[-,]/)[0] : null);
+    else if (r.alvo_tipo === 'questao') P.estQ.runOne(r.alvo_id);
+    else if (r.alvo_tipo === 'erro') erroEdit(S.get('est_erros', r.alvo_id));
+    else if (r.alvo_tipo === 'nota') noteEdit(S.get('est_anotacoes', r.alvo_id));
+  }
+
+  // ================= Flashcards =================
+  const cloze = (s, show) => String(s || '').replace(/\{\{c\d+::(.+?)\}\}/g, (m, t) => (show ? `[${t}]` : '[…]'));
+  function flashcards() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.fc', bar = P.flt.get(fk, 'baralho', ''), modo = P.flt.get(fk, 'modo', 'todos'), hoje = D.today();
+    const cards = S.all('est_flashcards').filter((c) => (!bar || c.baralho === bar) && (modo === 'todos' || (modo === 'dificeis' && (c.lapsos > 0 || c.facilidade < 2.2)) || (modo === 'favoritos' && c.favorito) || (modo === 'suspensos' && c.suspenso)) && P.flt.match(fk, c.frente, c.verso, c.tags, c.baralho));
+    const decks = P.groupBy(S.all('est_flashcards'), (c) => c.baralho || 'Geral');
+    const novosHoje = S.where('est_flashcard_revisoes', (r) => String(r.data).slice(0, 10) === hoje && r.intervalo_antes === 0).length, lim = +fs('est.cards_novos_dia', 20) || 20;
+    const venc = cards.filter((c) => !c.suspenso && !c.novo && c.vencimento && c.vencimento <= hoje), novos = cards.filter((c) => !c.suspenso && c.novo).slice(0, Math.max(0, lim - novosHoje));
+    if (st.cardQ) return cardStudy();
+    return h`<div class="page-head"><div><h1>Flashcards</h1><p>${venc.length} para revisar · ${novos.length} novos hoje (limite ${lim})</p></div><div class="row-sm wrap"><button class="btn btn-ghost btn-sm" data-act="est.import" data-tabela="flashcards">${icon('upload', 'sm')}Importar</button>${P.rep.button('est_cards', 'Exportar')}<button class="btn btn-primary btn-sm" data-act="est.cardNew">${icon('plus', 'sm')}Cartão</button></div></div>
+      ${venc.length + novos.length ? h`<div class="card pad-lg est-hero"><div class="grow"><b>Sessão de hoje</b><p class="muted mt-2" style="font-size:13px">${venc.length} vencidos + ${novos.length} novos${bar ? ' em ' + bar : ''}</p></div><button class="btn btn-primary" data-act="est.cardStart">${icon('play', 'sm')}Estudar</button></div>` : ''}
+      <div class="filters mt-3 mb-3">${P.flt.search(fk, 'Buscar cartão')}<div class="row-f">${P.flt.chips(fk, 'modo', [['todos', 'Todos'], ['dificeis', 'Só dificuldades'], ['favoritos', 'Favoritos'], ['suspensos', 'Suspensos']], 'todos')}${P.flt.select(fk, 'baralho', Object.keys(decks).map((d) => [d, `${d} (${decks[d].length})`]), 'Todos os baralhos')}</div></div>
+      ${cards.length ? h`<div class="list cardlist">${cards.slice(0, 300).map((c) => h`<div class="li tap" data-act="est.cardEdit" data-id="${c.id}"><span class="main"><span class="t">${cloze(c.frente)}</span><span class="s">${c.baralho}${c.assunto_id ? ' · ' + E.assNome(c.assunto_id) : ''} · ${c.novo ? 'novo' : c.vencimento ? 'próxima ' + fmt.dm(c.vencimento) : ''}${c.lapsos ? ' · ' + c.lapsos + ' erro(s)' : ''}${c.suspenso ? ' · suspenso' : ''}${c.origem_ref ? ' · ' + c.origem_ref : ''}</span></span>${c.favorito ? icon('star', 'sm') : ''}</div>`)}</div>`
+        : ui.empty({ ill: 'list', title: 'Nenhum cartão', text: 'Crie cartões aqui, a partir de um trecho marcado no PDF ou importe de planilha.', action: { act: 'est.cardNew', label: 'Criar cartão' } })}
+      <p class="faint mt-3" style="font-size:12px">Agendamento: errei → amanhã; difícil → intervalo × 1,2; bom → 1, 3 e depois intervalo × facilidade; fácil → bom × 1,3. A facilidade sobe e desce conforme as respostas.</p>`;
+  }
+  function cardStudy() {
+    const q = st.cardQ, c = S.get('est_flashcards', q[st.cardI]);
+    if (!c) { st.cardQ = null; return flashcards(); }
+    return h`<div class="page-head"><div><a href="#" class="muted row-sm" data-act="est.cardStop" style="font-size:13px">${icon('chev-l', 'xs')}Encerrar sessão</a><h1 class="mt-2">Cartão ${st.cardI + 1} de ${q.length}</h1><p>${c.baralho}${c.assunto_id ? ' · ' + E.assNome(c.assunto_id) : ''}</p></div></div>
+      <div class="card pad-lg flash"><div class="flash-front">${cloze(c.frente, false)}</div>${c.imagem_arquivo_id ? h`<div class="skel mt-3" style="height:180px" data-cimg="${c.imagem_arquivo_id}"></div>` : ''}
+        ${st.cardShow ? h`<hr class="mt-4"><div class="flash-back mt-3">${c.tipo === 'lacuna' ? cloze(c.frente, true) : c.verso || '(sem verso)'}</div>${c.origem_ref ? h`<p class="faint mt-3" style="font-size:12px">Origem: ${c.origem_ref}</p>` : ''}
+          <div class="rev-btns mt-4">${[['errei', 'Errei'], ['dificil', 'Difícil'], ['bom', 'Bom'], ['facil', 'Fácil']].map(([k, l], i) => h`<button class="btn ${k === 'bom' ? 'btn-primary' : 'btn-ghost'}" data-act="est.cardGrade" data-v="${k}" aria-keyshortcuts="${i + 1}">${l}</button>`)}</div>`
+          : h`<button class="btn btn-primary mt-4" data-act="est.cardReveal">Mostrar resposta</button>`}</div>`;
+  }
+
+  function cardEdit(c, defaults = {}) {
+    ui.editSheet({ table: 'est_flashcards', row: c, title: c ? 'Editar cartão' : 'Novo cartão', size: 'full', defaults: { baralho: (c && c.baralho) || P.flt.get('est.fc', 'baralho', '') || 'Geral', tipo: 'basico', ...defaults },
+      fields: [{ k: 'baralho', l: 'Baralho', t: 'text', req: true, half: true }, { k: 'tipo', l: 'Tipo', t: 'select', half: true, opts: [['basico', 'Pergunta e resposta'], ['lacuna', 'Lacuna ({{c1::texto}})'], ['imagem', 'Com imagem'], ['audio', 'Com áudio']] },
+        { k: 'frente', l: 'Frente', t: 'textarea', rows: 3, req: true, focus: !c }, { k: 'verso', l: 'Verso', t: 'textarea', rows: 3, show: (v) => v.tipo !== 'lacuna' },
+        { k: 'disciplina_id', l: 'Disciplina', t: 'select', half: true, ph: 'Nenhuma', opts: () => E.disciplinas().map((d) => [d.id, d.nome]) }, { k: 'assunto_id', l: 'Assunto', t: 'select', half: true, ph: 'Nenhum', opts: (v) => (v.disciplina_id ? E.assuntosDe(v.disciplina_id) : S.all('est_assuntos')).map((a) => [a.id, a.titulo]) },
+        { k: 'tags', l: 'Etiquetas', t: 'text', half: true }, { k: 'origem_ref', l: 'Origem', t: 'text', half: true, ph: 'M3 p. 12, Lei 8.112 art. 5' }, { k: 'favorito', l: 'Favorito', t: 'toggle' }, { k: 'suspenso', l: 'Suspenso (fora das sessões)', t: 'toggle' }],
+      extra: h`<div class="row-sm wrap"><button type="button" class="btn btn-ghost btn-sm" data-img>${icon('image', 'sm')}${c && c.imagem_arquivo_id ? 'Trocar imagem' : 'Imagem'}</button><button type="button" class="btn btn-ghost btn-sm" data-aud>${icon('play', 'sm')}${c && c.audio_arquivo_id ? 'Trocar áudio' : 'Áudio'}</button></div><p class="faint mt-2" style="font-size:12px">Áudio: arquivos MP3/M4A são guardados no Drive pelo envio de arquivos do Prumo quando suportados pelo navegador.</p>`,
+      mount(sh) {
+        sh.$('[data-img]').onclick = async () => { const f = await P.files.pick({ accept: 'image/\u002A' }); if (!f) return; try { const cmp = await P.files.compress(f, { max: 1400 }); const r = await P.api.call('files.upload', { nome: f.name, mime: cmp.mime, base64: cmp.dataUrl, modulo: 'estudos' }, { mutation: true }); sh._img = r.arquivo.id; ui.toast('Imagem anexada'); } catch (e) { ui.toast(e.message, { error: true }); } };
+        sh.$('[data-aud]').onclick = () => ui.toast('Áudio: envie o arquivo para a biblioteca e cole o código em "Origem" (o player toca pelo Drive).');
+      },
+      beforeSave: (r, sh) => { const out = { ...r }; if (out.tipo === 'lacuna' && !/\{\{c\d+::.+?\}\}/.test(out.frente)) { ui.toast('Na lacuna, marque o trecho assim: {{c1::texto}}', { error: true }); return null; } if (sh._img) out.imagem_arquivo_id = sh._img; return out; },
+      deleteLabel: 'Cartão excluído' });
+  }
+  E.cardEdit = cardEdit;
+
+  // ================= Caderno de erros =================
+  const CAUSA = { conteudo: 'Não sabia o conteúdo', interpretacao: 'Interpretação', atencao: 'Falta de atenção', tempo: 'Tempo', chute: 'Chute', pegadinha: 'Pegadinha', outro: 'Outro' };
+  const ESTADO = { aberta: ['Aberta', 'down'], em_estudo: ['Em estudo', 'info'], aguardando_pratica: ['Aguardando prática', ''], resolvida: ['Resolvida', 'up'] };
+  function erros() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.err', sit = P.flt.get(fk, 'sit', 'abertos'), causa = P.flt.get(fk, 'causa', ''), disc = P.flt.get(fk, 'disc', '');
+    const all = S.all('est_erros');
+    const rows = all.filter((e) => (sit === 'abertos' ? e.status !== 'resolvida' : sit === 'recorrentes' ? e.recorrencias > 1 && e.status !== 'resolvida' : e.status === sit) && (!causa || e.causa === causa) && (!disc || e.disciplina_id === disc) && P.flt.match(fk, e.titulo, e.raciocinio, e.explicacao, e.acao, E.assNome(e.assunto_id))).sort((a, b) => (b.recorrencias || 1) - (a.recorrencias || 1) || (a.updated_at < b.updated_at ? 1 : -1));
+    return h`<div class="page-head"><div><h1>Caderno de erros</h1><p>${all.filter((e) => e.status !== 'resolvida').length} em aberto · ${all.filter((e) => e.recorrencias > 1 && e.status !== 'resolvida').length} recorrentes</p></div><div class="row-sm">${E.tgBtn('est.tgErros', {}, 'Telegram')}<button class="btn btn-primary btn-sm" data-act="est.erroNew">${icon('plus', 'sm')}Registrar</button></div></div>
+      <div class="filters mb-3">${P.flt.search(fk, 'Buscar erro, assunto, explicação')}<div class="row-f">${P.flt.chips(fk, 'sit', [['abertos', 'Abertos'], ['recorrentes', 'Recorrentes'], ['em_estudo', 'Em estudo'], ['aguardando_pratica', 'Aguardando prática'], ['resolvida', 'Resolvidos']], 'abertos')}${P.flt.select(fk, 'causa', Object.entries(CAUSA), 'Qualquer causa')}${P.flt.select(fk, 'disc', E.disciplinas().map((d) => [d.id, d.nome]), 'Todas as disciplinas')}</div></div>
+      ${rows.length ? h`<div class="list cardlist">${rows.map((e) => h`<div class="li tap" data-act="est.erroEdit" data-id="${e.id}"><span class="main"><span class="t">${e.titulo}</span><span class="s">${CAUSA[e.causa]}${e.assunto_id ? ' · ' + E.assNome(e.assunto_id) : ''}${e.proxima_tentativa ? ' · próxima tentativa ' + fmt.dm(e.proxima_tentativa) : ''}${e.acao ? ' · ação: ' + String(e.acao).slice(0, 60) : ''}</span></span>${e.recorrencias > 1 ? h`<span class="chip down">${e.recorrencias}x</span>` : ''}<span class="chip ${ESTADO[e.status][1]}">${ESTADO[e.status][0]}</span></div>`)}</div>`
+        : ui.empty({ ill: 'check', title: all.length ? 'Nada neste filtro' : 'Caderno vazio', text: 'Ao errar uma questão, toque em "Caderno de erros" no resultado. Registre o raciocínio, a explicação certa e a ação corretiva.', small: true })}`;
+  }
+  function erroEdit(e, defaults = {}) {
+    ui.editSheet({ table: 'est_erros', row: e, title: e ? 'Erro' : 'Registrar erro ou dúvida', size: 'full', defaults: { causa: 'conteudo', status: 'aberta', proxima_tentativa: D.add(D.today(), 3), ...defaults },
+      fields: [{ k: 'titulo', l: 'O que errou / qual a dúvida', t: 'text', req: true, focus: !e }, { k: 'causa', l: 'Causa', t: 'select', half: true, opts: Object.entries(CAUSA) }, { k: 'status', l: 'Situação', t: 'select', half: true, opts: Object.entries(ESTADO).map(([k, v]) => [k, v[0]]) },
+        { k: 'disciplina_id', l: 'Disciplina', t: 'select', half: true, ph: 'Nenhuma', opts: () => E.disciplinas().map((d) => [d.id, d.nome]) }, { k: 'assunto_id', l: 'Assunto', t: 'select', half: true, ph: 'Nenhum', opts: (v) => (v.disciplina_id ? E.assuntosDe(v.disciplina_id) : S.all('est_assuntos')).map((a) => [a.id, a.titulo]) },
+        { k: 'raciocinio', l: 'Meu raciocínio', t: 'textarea', rows: 3 }, { k: 'explicacao', l: 'Explicação correta', t: 'textarea', rows: 3 }, { k: 'fonte', l: 'Fonte', t: 'text' }, { k: 'acao', l: 'Ação corretiva', t: 'textarea', rows: 2, ph: 'Reler art. 5º, fazer 10 questões de crase…' }, { k: 'proxima_tentativa', l: 'Próxima tentativa', t: 'date', half: true }],
+      extra: e && e.questao_id ? h`<button type="button" class="btn btn-ghost btn-sm" data-q>${icon('list', 'sm')}Refazer a questão</button>` : '',
+      mount(sh) { const b = sh.$('[data-q]'); if (b) b.onclick = () => { sh.close(); P.estQ.runOne(e.questao_id); }; },
+      deleteLabel: 'Registro excluído' });
+  }
+  E.erroEdit = erroEdit;
+
+  // ================= Resumos, fichamentos e lei seca =================
+  const NTIPO = { resumo: 'Resumo', fichamento: 'Fichamento', cornell: 'Cornell', memoria: 'Explicação de memória', nota: 'Nota', lei_seca: 'Lei seca', duvida: 'Dúvida', trecho: 'Trecho do PDF' };
+  const MODELOS = { fichamento: '## Referência\n\n## Ideias principais\n- \n\n## Citações\n> \n\n## Comentários\n', cornell: '## Perguntas\n- \n\n## Anotações\n\n## Resumo\n', memoria: '## Explique com suas palavras\n\n## Exemplo\n\n## O que eu confundo\n', lei_seca: '## Regra\n\n## Exceções\n- \n\n## Prazos\n- \n\n## Competência\n' };
+  /** Markdown simples e seguro (o texto é escapado antes): títulos, listas, tabelas, citações, links http(s), negrito, itálico, código, fórmulas e [[nota ligada]]. */
+  function md(src) {
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const inl = (s) => esc(s).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\$([^$]+)\$/g, '<code class="formula" title="fórmula">$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/(^|\W)_([^_]+)_(?=\W|$)/g, '$1<i>$2</i>')
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>').replace(/\[\[([^\]]+)\]\]/g, '<a href="#" data-act="est.noteLink" data-t="$1">$1</a>').replace(/!\[([^\]]*)\]\(arquivo:([\w-]+)\)/g, '<span class="md-img" data-img="$2" title="$1">[imagem]</span>');
+    const lines = String(src || '').split('\n'), out = []; let list = null, table = [];
+    const flushT = () => { if (table.length) { const rows = table.filter((r) => !/^\s*\|?\s*-{2,}/.test(r)); out.push('<div class="ed-table"><table class="table">' + rows.map((r, i) => '<tr>' + r.replace(/^\||\|$/g, '').split('|').map((c) => (i ? '<td>' : '<th>') + inl(c.trim()) + (i ? '</td>' : '</th>')).join('') + '</tr>').join('') + '</table></div>'); table = []; } };
+    const flushL = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+    lines.forEach((l) => {
+      if (/^\s*\|.*\|\s*$/.test(l)) { flushL(); table.push(l.trim()); return; } flushT();
+      let m;
+      if ((m = l.match(/^(#{1,3})\s+(.*)$/))) { flushL(); out.push(`<h${m[1].length + 2}>${inl(m[2])}</h${m[1].length + 2}>`); }
+      else if ((m = l.match(/^\s*[-*]\s+(.*)$/))) { if (list !== 'ul') { flushL(); out.push('<ul>'); list = 'ul'; } out.push('<li>' + inl(m[1]) + '</li>'); }
+      else if ((m = l.match(/^\s*\d+[.)]\s+(.*)$/))) { if (list !== 'ol') { flushL(); out.push('<ol>'); list = 'ol'; } out.push('<li>' + inl(m[1]) + '</li>'); }
+      else if ((m = l.match(/^>\s?(.*)$/))) { flushL(); out.push('<blockquote>' + inl(m[1]) + '</blockquote>'); }
+      else if (!l.trim()) { flushL(); out.push(''); }
+      else { flushL(); out.push('<p>' + inl(l) + '</p>'); }
+    });
+    flushL(); flushT();
+    return out.join('\n');
+  }
+  E.md = md;
+
+  function resumos() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.nt', tipo = P.flt.get(fk, 'tipo', 'todos'), disc = P.flt.get(fk, 'disc', '');
+    const all = S.all('est_anotacoes');
+    const rows = all.filter((n) => (tipo === 'todos' || n.tipo === tipo || (tipo === 'fav' && n.favorito) || (tipo === 'ia' && n.gerado_ia)) && (!disc || n.disciplina_id === disc) && P.flt.match(fk, n.titulo, n.conteudo, n.tags, n.norma, n.artigo, E.assNome(n.assunto_id))).sort((a, b) => (b.favorito ? 1 : 0) - (a.favorito ? 1 : 0) || (a.updated_at < b.updated_at ? 1 : -1));
+    const pend = all.filter((n) => n.gerado_ia && n.aprovado === false).length;
+    return h`<div class="page-head"><div><h1>Resumos e anotações</h1><p>${all.length} nota(s)${pend ? ` · ${pend} rascunho(s) da IA para revisar` : ''}</p></div><button class="btn btn-primary btn-sm" data-act="est.noteNew">${icon('plus', 'sm')}Nova</button></div>
+      <div class="filters mb-3">${P.flt.search(fk, 'Buscar no título e no texto')}<div class="row-f">${P.flt.chips(fk, 'tipo', [['todos', 'Todas'], ['resumo', 'Resumos'], ['fichamento', 'Fichamentos'], ['cornell', 'Cornell'], ['memoria', 'Memória'], ['lei_seca', 'Lei seca'], ['duvida', 'Dúvidas'], ['trecho', 'Trechos'], ['fav', 'Favoritas'], ['ia', 'Geradas por IA']], 'todos')}${P.flt.select(fk, 'disc', E.disciplinas().map((d) => [d.id, d.nome]), 'Todas as disciplinas')}</div></div>
+      ${rows.length ? h`<div class="list cardlist">${rows.map((n) => h`<div class="li tap" data-act="${n.gerado_ia && n.tipo === 'resumo' ? 'est.resumoView' : 'est.noteEdit'}" data-id="${n.id}"><span class="tile sm">${icon(n.tipo === 'lei_seca' ? 'shield' : n.tipo === 'duvida' ? 'info' : 'edit', 'sm')}</span><span class="main"><span class="t">${n.favorito ? h`${icon('star', 'xs')} ` : ''}${n.titulo}</span><span class="s">${NTIPO[n.tipo]}${n.norma ? ' · ' + n.norma + (n.artigo ? ' ' + n.artigo : '') : ''}${n.assunto_id ? ' · ' + E.assNome(n.assunto_id) : ''} · v${n.versao || 1} · ${fmt.date(String(n.updated_at).slice(0, 10))}${n.gerado_ia ? (n.aprovado === false ? ' · rascunho da IA' : ' · gerada por IA') : ''}</span></span></div>`)}</div>`
+        : ui.empty({ ill: 'file', title: all.length ? 'Nada neste filtro' : 'Nenhuma anotação', text: 'Resumos, fichamentos, método Cornell, explicação de memória e lei seca (norma, artigo, fonte e data da versão).', action: { act: 'est.noteNew', label: 'Nova anotação' } })}`;
+  }
+
+  function noteEdit(n, defaults = {}) {
+    const isNew = !n || !n.id;
+    const v = isNew ? { tipo: 'resumo', titulo: '', conteudo: '', ...defaults } : { ...n };
+    let preview = false;
+    const s = ui.sheet({ title: isNew ? 'Nova anotação' : v.titulo, size: 'full', wide: true,
+      body: h`<form class="form" novalidate data-f>
+        <div class="field full"><label>Título</label><input class="input" name="titulo" value="${v.titulo}" maxlength="200" ${raw(isNew ? 'autofocus' : '')}></div>
+        <div class="field half"><label>Tipo</label><select class="input" name="tipo">${Object.entries(NTIPO).map(([k, l]) => h`<option value="${k}" ${k === v.tipo ? raw('selected') : ''}>${l}</option>`)}</select></div>
+        <div class="field half"><label>Disciplina</label><select class="input" name="disciplina_id"><option value="">Nenhuma</option>${E.disciplinas().map((d) => h`<option value="${d.id}" ${d.id === v.disciplina_id ? raw('selected') : ''}>${d.nome}</option>`)}</select></div>
+        <div class="field half"><label>Assunto</label><select class="input" name="assunto_id"><option value="">Nenhum</option>${S.all('est_assuntos').map((a) => h`<option value="${a.id}" ${a.id === v.assunto_id ? raw('selected') : ''}>${E.discNome(a.disciplina_id)} › ${a.titulo}</option>`)}</select></div>
+        <div class="field half"><label>Etiquetas</label><input class="input" name="tags" value="${v.tags || ''}"></div>
+        <div class="field half" data-lei><label>Norma</label><input class="input" name="norma" value="${v.norma || ''}" placeholder="Lei 8.112/1990"></div><div class="field half" data-lei><label>Artigo</label><input class="input" name="artigo" value="${v.artigo || ''}" placeholder="art. 5º"></div>
+        <div class="field half" data-lei><label>Fonte</label><input class="input" name="fonte" value="${v.fonte || ''}" placeholder="planalto.gov.br"></div><div class="field half" data-lei><label>Versão conferida em</label><input class="input" type="date" name="fonte_data" value="${v.fonte_data || ''}"></div>
+        <div class="field full"><div class="row between"><label>Texto</label><div class="row-sm"><button type="button" class="btn btn-ghost btn-sm" data-tpl>${icon('layers', 'sm')}Modelo</button><button type="button" class="btn btn-ghost btn-sm" data-pv>${icon('eye', 'sm')}Prévia</button></div></div>
+          <textarea class="input mono" name="conteudo" rows="16" data-txt>${v.conteudo || ''}</textarea><div class="note-preview" data-preview hidden></div>
+          <span class="hint">Títulos (#), listas (-), tabelas (| a | b |), citações (>), **negrito**, _itálico_, \`código\`, $fórmula$, links [texto](https://…) e notas ligadas [[Título da nota]].</span></div>
+        ${v.trecho ? h`<div class="field full"><label>Trecho de origem${v.material_id ? ' · ' + ((E.mat(v.material_id) || {}).codigo || '') + (v.pagina ? ' p. ' + v.pagina : '') : ''}</label><blockquote class="muted">${v.trecho}</blockquote></div>` : ''}
+        ${v.gerado_ia ? h`<div class="field full"><span class="chip ${v.aprovado === false ? 'down' : 'info'}">${v.aprovado === false ? 'Rascunho gerado por IA: confira antes de usar' : 'Gerada por IA e aprovada por você'}</span></div>` : ''}
+        <label class="row-sm"><input type="checkbox" name="favorito" ${raw(v.favorito ? 'checked' : '')}> Favorita</label></form>
+        <p class="faint mt-2" data-leiwarn style="font-size:12px">Lei seca: o Prumo não confere se a norma está atualizada. Registre a fonte e a data em que você conferiu a versão.</p>`,
+      foot: h`${!isNew ? h`<button class="btn btn-ghost" data-more>${icon('dots', 'sm')}</button>` : ''}${v.gerado_ia && v.aprovado === false ? h`<button class="btn btn-ghost" data-approve>${icon('check', 'sm')}Aprovar</button>` : ''}<button class="btn btn-primary" data-save>${isNew ? 'Salvar' : 'Salvar alterações'}</button>`,
+      onMount(sh) {
+        const f = sh.$('[data-f]'), lei = () => { const isLei = f.tipo.value === 'lei_seca'; sh.$$('[data-lei]').forEach((x) => { x.hidden = !isLei; }); sh.$('[data-leiwarn]').hidden = !isLei; };
+        lei(); f.tipo.addEventListener('change', lei);
+        sh.$('[data-tpl]').onclick = () => { const t = MODELOS[f.tipo.value] || MODELOS.fichamento; f.conteudo.value = (f.conteudo.value ? f.conteudo.value + '\n\n' : '') + t; };
+        sh.$('[data-pv]').onclick = () => { preview = !preview; const pv = sh.$('[data-preview]'); pv.hidden = !preview; f.conteudo.hidden = preview; if (preview) { pv.innerHTML = md(f.conteudo.value); P.$$('[data-img]', pv).forEach(async (el) => { try { const u = await P.files.url(el.dataset.img); el.outerHTML = `<img src="${P.esc(u)}" alt="" style="max-width:100%">`; } catch (e) { /* mantém marcador */ } }); } };
+        const save = async (extra = {}) => {
+          const btn = sh.$('[data-save]'); btn.classList.add('loading');
+          const row = { id: v.id, titulo: f.titulo.value.trim(), tipo: f.tipo.value, disciplina_id: f.disciplina_id.value || null, assunto_id: f.assunto_id.value || null, tags: f.tags.value || null, conteudo: f.conteudo.value, favorito: f.favorito.checked, norma: f.norma.value || null, artigo: f.artigo.value || null, fonte: f.fonte.value || null, fonte_data: f.fonte_data.value || null, base_versao: v.versao || null, ...extra };
+          if (isNew) { row.material_id = v.material_id || null; row.pagina = v.pagina || null; row.trecho = v.trecho || null; }
+          if (!row.titulo) { ui.toast('Dê um título.', { error: true }); btn.classList.remove('loading'); return; }
+          try { const r = await P.api.call('est.noteSave', row, { mutation: true }); S.put('est_anotacoes', r.nota); sh.close(); ui.toast('Anotação salva'); }
+          catch (e) {
+            btn.classList.remove('loading');
+            if (e.code === 'CONFLICT') { const ok = await ui.confirm({ title: 'A nota mudou em outro aparelho', text: `A versão ${e.data.atual.versao} foi salva depois que você abriu. Salvar a sua por cima? (A outra fica no histórico de versões.)`, ok: 'Salvar a minha' }); if (ok) { v.versao = e.data.atual.versao; save(); } }
+            else ui.toast(e.message, { error: true });
+          }
+        };
+        sh.$('[data-save]').onclick = () => save();
+        const ap = sh.$('[data-approve]'); if (ap) ap.onclick = () => save({ aprovado: true });
+        const more = sh.$('[data-more]');
+        if (more) more.onclick = () => ui.menu('Anotação', [
+          { label: 'Versões anteriores', icon: 'history', act: () => versions(v) },
+          { label: 'Enviar para meu Telegram (texto)', icon: 'message', act: () => E.sendTg({ tipo: 'nota', id: v.id, formato: 'texto' }) },
+          { label: 'Enviar para meu Telegram (PDF)', icon: 'message', act: () => E.sendTg({ tipo: 'nota', id: v.id, formato: 'pdf' }) },
+          { label: 'Agendar revisão', icon: 'refresh', act: () => revAgendar('nota', v.id) },
+          E.ia && E.ia.configurado ? { label: 'Gerar flashcards com IA (rascunho)', icon: 'zap', act: () => P.estQ.aiCards({ nota_id: v.id }) } : null,
+          { label: 'Prévia, compartilhar e mais', sub: 'Duplicar, mover, copiar, PDF, imprimir', icon: 'eye', act: () => { sh.close(); E.resumoView(S.get('est_anotacoes', v.id) || v); } },
+          { label: 'Excluir', icon: 'trash', danger: true, act: () => { sh.close(); E.removeEst('est_anotacoes', v.id, 'Anotação excluída'); } }]);
+      } });
+    return s;
+  }
+  E.noteEdit = noteEdit;
+  E.noteVersions = (n) => versions(n);
+
+  async function versions(v) {
+    try {
+      const r = await P.api.call('est.noteVersions', { entidade: 'nota', id: v.id });
+      ui.sheet({ title: 'Versões · ' + v.titulo, size: 'full', body: r.versoes.length ? h`<div class="stack">${r.versoes.map((x) => h`<details class="card pad-lg"><summary><b>Versão ${x.versao}</b> · ${fmt.date(String(x.em).slice(0, 10))} ${fmt.time(x.em)}</summary><div class="note-preview mt-2">${raw(md(x.conteudo))}</div></details>`)}</div>` : ui.empty({ ill: 'list', title: 'Sem versões anteriores', small: true }) });
+    } catch (e) { ui.toast(e.message, { error: true }); }
+  }
+
+  // ================= Discursivas =================
+  function discursivas() {
+    const g = E.gate(); if (g) return g;
+    const all = S.all('est_discursivas').sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+    const fk = 'est.dsc', sit = P.flt.get(fk, 'sit', 'todas');
+    const rows = all.filter((d) => (sit === 'todas' || d.status === sit) && P.flt.match(fk, d.titulo, d.proposta));
+    return h`<div class="page-head"><div><h1>Discursivas</h1><p>Textos, correções por critério e reescritas</p></div><div class="row-sm wrap"><button class="btn btn-ghost btn-sm" data-act="est.discTreinar">${icon('timer', 'sm')}Treinar</button>${E.aiOn() ? h`<button class="btn btn-ghost btn-sm" data-act="est.discTemas">${icon('zap', 'sm')}Temas com IA</button>` : ''}<button class="btn btn-primary btn-sm" data-act="est.discNew">${icon('plus', 'sm')}Nova</button></div></div>
+      <div class="filters mb-3">${all.length > 4 ? P.flt.search(fk, 'Buscar proposta') : ''}${P.flt.chips(fk, 'sit', [['todas', 'Todas'], ['rascunho', 'Rascunhos'], ['escrita', 'Escritas'], ['corrigida', 'Corrigidas'], ['reescrita', 'Reescritas']], 'todas')}</div>
+      ${rows.length ? h`<div class="list cardlist">${rows.map((d) => { const av = (d.avaliacoes_json || []).slice(-1)[0]; return h`<div class="li tap" data-act="est.discEdit" data-id="${d.id}"><span class="main"><span class="t">${d.titulo}</span><span class="s">${d.tipo} · v${d.versao} · ${d.status}${av ? ` · última nota ${fmt.num(av.total, 1)}/${fmt.num(av.max, 1)} (${{ humana: 'humana', automatizada: 'automatizada', oficial: 'oficial', autoavaliacao: 'autoavaliação' }[av.tipo]})` : ''}</span></span></div>`; })}</div>`
+        : ui.empty({ ill: 'file', title: 'Nenhuma discursiva', text: 'Cadastre a proposta, os limites, o tempo e os critérios da banca. Escreva, avalie por critério e reescreva guardando as versões.', action: { act: 'est.discNew', label: 'Nova discursiva' } })}`;
+  }
+
+  function discEdit(d, o = {}) {
+    const isNew = !d;
+    const v = d ? { ...d } : { titulo: '', tipo: 'dissertativa', criterios_json: [{ nome: 'Conteúdo', max: 10 }, { nome: 'Estrutura', max: 5 }, { nome: 'Língua portuguesa', max: 5 }], texto: '', status: 'rascunho' };
+    let t0 = null, timer = null;
+    const crit = () => (v.criterios_json || []).map((c, i) => h`<div class="row-sm" data-ci="${i}"><input class="input sm grow" data-ck="nome" value="${c.nome}" aria-label="Critério"><input class="input sm num" style="width:70px" data-ck="max" value="${c.max}" aria-label="Máximo"><button type="button" class="btn-icon sm" data-cdel aria-label="Remover">${icon('trash', 'sm')}</button></div>`);
+    ui.sheet({ title: isNew ? 'Nova discursiva' : v.titulo, size: 'full', wide: true,
+      body: h`<form class="form" novalidate data-f><div class="field full"><label>Título</label><input class="input" name="titulo" value="${v.titulo}"></div>
+        <div class="field half"><label>Tipo</label><select class="input" name="tipo">${[['dissertativa', 'Dissertativa'], ['peca', 'Peça'], ['estudo_caso', 'Estudo de caso'], ['parecer', 'Parecer'], ['redacao', 'Redação'], ['outra', 'Outra']].map(([k, l]) => h`<option value="${k}" ${k === v.tipo ? raw('selected') : ''}>${l}</option>`)}</select></div>
+        <div class="field half"><label>Concurso</label><select class="input" name="concurso_id"><option value="">Nenhum</option>${E.concursos().map((c) => h`<option value="${c.id}" ${c.id === v.concurso_id ? raw('selected') : ''}>${c.nome}</option>`)}</select></div>
+        <div class="field full"><label>Proposta${v.gerado_ia ? h` <span class="chip info">sugerida por IA${v.ia_meta && v.ia_meta.modelo ? ' · ' + v.ia_meta.modelo : ''}</span>` : ''}</label><textarea class="input" name="proposta" rows="3">${v.proposta || ''}</textarea></div>
+        <div class="field half"><label>Limite de linhas</label><input class="input num" name="limite_linhas" value="${v.limite_linhas || ''}"></div><div class="field half"><label>Limite de palavras</label><input class="input num" name="limite_palavras" value="${v.limite_palavras || ''}"></div>
+        <div class="field half"><label>Tempo (min)</label><input class="input num" name="tempo_min" value="${v.tempo_min || ''}"></div>
+        <div class="field full"><span class="label">Critérios da prova (nome e nota máxima)</span><div data-crit class="stack-sm">${crit()}</div><button type="button" class="btn btn-ghost btn-sm mt-2" data-cadd>${icon('plus', 'sm')}Critério</button></div>
+        <div class="field full"><div class="row between"><label>Texto (versão ${v.versao || 1})</label><span class="faint num" data-cnt></span></div><textarea class="input" name="texto" rows="16" data-txt>${v.texto || ''}</textarea>
+          <div class="row-sm mt-2"><button type="button" class="btn btn-ghost btn-sm" data-timer>${icon('timer', 'sm')}Cronômetro</button><span class="num" data-tv></span></div></div></form>
+        ${(v.avaliacoes_json || []).length ? h`<div class="group-h mt-3">Avaliações</div><div class="list">${v.avaliacoes_json.map((a) => h`<div class="li"><span class="main"><span class="t">${fmt.num(a.total, 1)} / ${fmt.num(a.max, 1)} · ${a.sugestao_ia ? 'Sugestão de IA' : { humana: 'Avaliação humana', automatizada: 'Automatizada', oficial: 'Oficial (banca)', autoavaliacao: 'Autoavaliação' }[a.tipo]}${a.avaliador && !a.sugestao_ia ? ' (' + a.avaliador + ')' : a.ia && a.ia.modelo ? ' · ' + a.ia.modelo : ''}</span><span class="s">v${a.versao} · ${fmt.date(String(a.em).slice(0, 10))} · ${(a.notas || []).map((n, i) => ((v.criterios_json || [])[i] || {}).nome + ' ' + fmt.num(n, 1)).join(' · ')}${a.comentario ? ' · ' + a.comentario : ''}</span>${(a.comentarios || []).length ? h`<span class="s">${a.comentarios.map((c) => `"${c.trecho}": ${c.comentario}`).join(' | ')}</span>` : ''}</span>${a.sugestao_ia ? h`<button type="button" class="btn btn-ghost btn-sm" data-avia="${v.avaliacoes_json.indexOf(a)}">Ver correção</button>` : ''}</div>`)}</div>` : ''}`,
+      foot: h`${!isNew ? h`<button class="btn btn-ghost" data-more style="flex:0 0 auto" aria-label="Mais ações">${icon('dots', 'sm')}Mais</button>` : ''}<button class="btn btn-primary" data-save>Salvar</button>`,
+      onClose: () => clearInterval(timer),
+      onMount(sh) {
+        const f = sh.$('[data-f]'), cnt = () => { const t = f.texto.value, words = (t.match(/\S+/g) || []).length, lines = t.split('\n').reduce((a, l) => a + Math.max(1, Math.ceil(l.length / 70)), 0); sh.$('[data-cnt]').textContent = `${words} palavras · ~${t ? lines : 0} linhas${v.limite_linhas ? ' de ' + v.limite_linhas : ''}`; };
+        cnt(); f.texto.addEventListener('input', cnt);
+        const cbox = sh.$('[data-crit]');
+        const readCrit = () => Array.from(cbox.querySelectorAll('[data-ci]')).map((r) => ({ nome: r.querySelector('[data-ck="nome"]').value.trim(), max: P.parseNum(r.querySelector('[data-ck="max"]').value) || 0 })).filter((c) => c.nome);
+        sh.$('[data-cadd]').onclick = () => { v.criterios_json = readCrit().concat([{ nome: 'Critério', max: 5 }]); cbox.innerHTML = P.toHtml(crit()); };
+        cbox.addEventListener('click', (e) => { const r = e.target.closest('[data-cdel]'); if (r) { r.closest('[data-ci]').remove(); } });
+        sh.$('[data-timer]').onclick = () => { if (timer) { clearInterval(timer); timer = null; sh.$('[data-tv]').textContent = ''; return; } t0 = Date.now(); const lim = (+f.tempo_min.value || 0) * 60; timer = setInterval(() => { const s2 = Math.round((Date.now() - t0) / 1000); sh.$('[data-tv]').textContent = lim ? `restam ${clock(Math.max(0, lim - s2))}` : clock(s2); if (lim && s2 === lim) ui.toast('Tempo da discursiva esgotado', { icon: 'timer', duration: 8000 }); }, 1000); };
+        const payload = (extra = {}) => ({ id: v.id, titulo: f.titulo.value.trim() || 'Discursiva', tipo: f.tipo.value, concurso_id: f.concurso_id.value || null, proposta: f.proposta.value, limite_linhas: +f.limite_linhas.value || null, limite_palavras: +f.limite_palavras.value || null, tempo_min: +f.tempo_min.value || null, criterios_json: readCrit(), texto: f.texto.value, status: v.status === 'rascunho' && f.texto.value.trim() ? 'escrita' : v.status, base_versao: v.versao || null, ...extra });
+        const save = async (extra) => { try { const r = await P.api.call('est.discSave', payload(extra), { mutation: true }); S.put('est_discursivas', r.discursiva); sh.close(); ui.toast(extra && extra.nova_versao ? `Reescrita salva como versão ${r.discursiva.versao}` : 'Discursiva salva'); } catch (e) { if (e.code === 'CONFLICT') ui.toast('O texto mudou em outro aparelho. Reabra para ver a versão nova.', { error: true }); else ui.toast(e.message, { error: true }); } };
+        sh.$('[data-save]').onclick = () => save();
+        const more = sh.$('[data-more]'); if (more) more.onclick = () => {
+          const atual = S.get('est_discursivas', v.id), mudou = f.texto.value !== (atual.texto || '');
+          ui.menu('Discursiva', [
+            { label: 'Avaliar', sub: 'Notas por critério (você, outra pessoa ou a banca)', icon: 'check-circle', act: () => { sh.close(); avaliar(S.get('est_discursivas', v.id)); } },
+            { label: 'Salvar como reescrita', sub: 'Nova versão; a atual fica no histórico', icon: 'layers', act: () => save({ nova_versao: true }) },
+            E.aiOn() ? { label: 'Revisar e corrigir com IA', sub: mudou ? 'Salve antes: a correção usa o texto salvo' : 'Nota por critério, pontos fortes, problemas, trechos reescritos e plano', icon: 'zap', act: () => { if (mudou) { ui.toast('Salve o texto antes de pedir a correção.', { error: true }); return; } sh.close(); E.discAi.corrigir(atual); } } : null,
+            E.aiOn() ? { label: 'Texto de exemplo (IA)', sub: 'Material de referência; vai para Resumos', icon: 'file', act: () => E.discAi.exemplo(atual) } : null,
+            { label: 'Versões anteriores', icon: 'history', act: () => discVersions(atual) },
+            { label: 'Excluir', icon: 'trash', danger: true, act: () => { sh.close(); E.removeEst('est_discursivas', v.id, 'Discursiva excluída'); } }]);
+        };
+        sh.el.querySelectorAll('[data-avia]').forEach((b) => { b.onclick = () => { sh.close(); E.discAi.mostrar(S.get('est_discursivas', v.id), +b.dataset.avia); }; });
+        if (o.treino) setTimeout(() => { const tb = sh.$('[data-timer]'); if (tb && !timer) tb.click(); }, 50);
+      } });
+  }
+  E.discEdit = discEdit;
+  async function discVersions(d) {
+    try {
+      const r = await P.api.call('est.noteVersions', { entidade: 'discursiva', id: d.id });
+      ui.sheet({ title: 'Versões · ' + d.titulo, size: 'full', body: r.versoes.length ? h`<div class="stack">${r.versoes.map((x) => h`<details class="card pad-lg"><summary><b>Versão ${x.versao}</b> · ${fmt.date(String(x.em).slice(0, 10))} ${fmt.time(x.em)}</summary><p class="mt-2" style="white-space:pre-wrap;font-size:13.5px">${x.conteudo}</p></details>`)}</div>` : ui.empty({ ill: 'list', title: 'Sem versões anteriores', small: true }) });
+    } catch (e) { ui.toast(e.message, { error: true }); }
+  }
+
+  function avaliar(d) {
+    const crit = d.criterios_json || [];
+    ui.sheet({ title: 'Avaliar · ' + d.titulo, size: 'full', body: h`<form class="form" novalidate data-f>
+      <div class="field full"><label>Quem avaliou</label><select class="input" name="tipo"><option value="autoavaliacao">Eu (autoavaliação)</option><option value="humana">Outra pessoa (professor, colega)</option><option value="oficial">Resultado oficial da banca</option>${E.ia && E.ia.configurado ? h`<option value="automatizada">Sugestão automatizada (IA)</option>` : ''}</select></div>
+      <div class="field full"><label>Avaliador (opcional)</label><input class="input" name="avaliador"></div>
+      ${crit.map((c, i) => h`<div class="field half"><label>${c.nome} (máx. ${fmt.num(c.max, 1)})</label><input class="input num" data-n="${i}" inputmode="decimal"></div>`)}
+      <div class="field full"><label>Comentário geral</label><textarea class="input" name="comentario" rows="3"></textarea></div>
+      <div class="field full"><label>Comentários por trecho (um por linha: "trecho" → comentário)</label><textarea class="input" name="trechos" rows="4" placeholder='"conforme dispõe" → evitar clichê'></textarea></div></form>
+      <p class="faint" style="font-size:12px">A avaliação fica ligada à versão ${d.versao} do texto. Reescreva depois para comparar a evolução.</p>`,
+      foot: h`<button class="btn btn-primary" data-save>Registrar avaliação</button>`,
+      onMount(sh) {
+        sh.$('[data-save]').onclick = async () => {
+          const f = sh.$('[data-f]'), notas = crit.map((c, i) => P.parseNum(sh.$(`[data-n="${i}"]`).value) || 0);
+          const comentarios = f.trechos.value.split('\n').map((l) => l.match(/^\s*"(.+?)"\s*(?:→|->|:)\s*(.+)$/)).filter(Boolean).map((m) => ({ trecho: m[1], comentario: m[2] }));
+          try { const r = await P.api.call('est.discSave', { id: d.id, avaliacao: { tipo: f.tipo.value, avaliador: f.avaliador.value, notas, comentario: f.comentario.value, comentarios } }, { mutation: true }); S.put('est_discursivas', r.discursiva); sh.close(); ui.toast('Avaliação registrada'); }
+          catch (e) { ui.toast(e.message, { error: true }); }
+        };
+      } });
+  }
+
+  // ================= Desempenho =================
+  const DES_PF = { def: '30d', modes: ['7d', '30d', 'mes', '90d', 'ano', 'intervalo'], tables: ['est_tentativas', 'est_flashcard_revisoes'] };
+  E.statsRes = () => st.statsRes;
+  async function loadStats() {
+    const r = P.pf.range('est.des', DES_PF), fk = 'est.des';
+    const p = { de: r.from || D.add(D.today(), -29), ate: r.to && r.to < D.today() ? r.to : D.today(), concurso_id: P.flt.get(fk, 'conc', '') || null, disciplina_id: P.flt.get(fk, 'disc', '') || null, banca: P.flt.get(fk, 'banca', '') || null, tipo: P.flt.get(fk, 'tipo', '') || null };
+    const dias = D.diff(p.de, p.ate) + 1, prev = { ...p, de: D.add(p.de, -dias), ate: D.add(p.de, -1) };
+    st.statsLoading = true;
+    try { const [a, b] = await Promise.all([P.api.call('est.stats', p, { timeout: 90000 }), P.api.call('est.stats', prev, { timeout: 90000 })]); st.statsRes = a; st.statsPrev = b; st.statsKey = JSON.stringify(p); }
+    catch (e) { ui.toast(e.message, { error: true }); } finally { st.statsLoading = false; if (P.router.current() && P.router.current().tab === 'desempenho') P.router.render(true); }
+  }
+  function desempenho() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.des', r = st.statsRes, pv = st.statsPrev;
+    const bancas = [...new Set(S.all('est_questoes').map((q) => q.banca).filter(Boolean))].sort();
+    const filtros = h`<div class="filters mb-3">${P.pf.bar('est.des', { ...DES_PF, onChange: () => loadStats() })}<div class="row-f">${P.flt.select(fk, 'conc', E.concursos().map((c) => [c.id, c.nome]), 'Todos os concursos')}${P.flt.select(fk, 'disc', E.disciplinas().map((d) => [d.id, d.nome]), 'Todas as disciplinas')}${bancas.length ? P.flt.select(fk, 'banca', bancas.map((b) => [b, b]), 'Todas as bancas') : ''}${P.flt.select(fk, 'tipo', Object.entries(E.TIPO_SES), 'Toda atividade')}<button class="btn btn-ghost btn-sm" data-act="est.desLoad">${icon('refresh', 'sm')}Aplicar</button></div></div>`;
+    if (!r) { if (!st.statsLoading) loadStats(); return h`<div class="page-head"><div><h1>Desempenho</h1></div></div>${filtros}${ui.skeleton()}`; }
+    const q = r.questoes.geral, d = (cur, prev, inv) => ui.delta(cur, prev, { invert: inv, empty: '' });
+    const pct = (v) => (v == null ? 'sem dados' : fmt.num(v, 1) + '%');
+    return h`<div class="page-head"><div><h1>Desempenho</h1><p>${fmt.date(r.periodo.de)} a ${fmt.date(r.periodo.ate)} · comparado aos ${r.periodo.dias} dias anteriores</p></div>
+        <div class="row-sm wrap">${P.rep.button('est_des')}${E.tgBtn('est.desTg', {}, 'Telegram')}</div></div>
+      ${filtros}${st.statsLoading ? h`<p class="faint">${icon('refresh', 'xs')} atualizando…</p>` : ''}
+      <div class="grid g4">
+        <button type="button" class="card link" data-act="est.desDrill" data-k="tempo" style="text-align:left">${ui.metric({ label: 'Tempo líquido', value: fmt.dur(r.tempo.total_s), size: 'md', sub: h`${r.tempo.sessoes} sessões · ${r.tempo.dias_com_estudo}/${r.periodo.dias} dias ${d(r.tempo.total_s, pv && pv.tempo.total_s)}` })}</button>
+        <button type="button" class="card link" data-act="est.desDrill" data-k="plano" style="text-align:left">${ui.metric({ label: 'Planejado × realizado', value: r.plano.planejado_min ? pct(r.plano.pct) : 'sem plano', size: 'md', sub: `${fmt.dur(r.plano.realizado_min * 60)} de ${fmt.dur(r.plano.planejado_min * 60)} · ${r.plano.concluidas}/${r.plano.tarefas} tarefas` })}</button>
+        <button type="button" class="card link" data-act="est.desDrill" data-k="questoes" style="text-align:left">${ui.metric({ label: 'Precisão nas respondidas', value: pct(q.precisao), size: 'md', sub: h`${q.respondidas} resp. de ${q.total}${q.amostra_pequena ? ' · amostra pequena' : ''} ${d(q.precisao, pv && pv.questoes.geral.precisao)}` })}</button>
+        <div class="card">${ui.metric({ label: 'Cobertura do edital', value: pct(r.cobertura.pct), size: 'md', sub: r.cobertura.total ? `ponderada ${pct(r.cobertura.ponderada)} · ${r.cobertura.concluidos}/${r.cobertura.total}` : (r.cobertura.motivo || '') })}</div></div>
+      <div class="dash mt-4">
+        <div class="card span-7"><div class="card-head">${icon('chart')}<h3>Tempo por dia</h3></div><div id="des-dia"></div></div>
+        <div class="card span-5"><div class="card-head">${icon('pie')}<h3>Teoria, prática, revisão e simulados</h3></div><div id="des-tipo"></div></div>
+        <div class="card span-6"><div class="card-head">${icon('layers')}<h3>Tempo por disciplina</h3></div><div id="des-disc"></div></div>
+        <div class="card span-6"><div class="card-head">${icon('list')}<h3>Questões</h3></div>
+          <div class="ed-table"><table class="table"><thead><tr><th></th><th class="r">Tentativas</th><th class="r">Certas</th><th class="r">Erradas</th><th class="r">Brancos</th><th class="r">Anuladas</th><th class="r">Precisão</th></tr></thead><tbody>
+          ${[['Geral', q], ['1ª tentativa', r.questoes.primeira], ['Repetições', r.questoes.repeticoes]].map(([l, o]) => h`<tr><td>${l}</td><td class="r num">${o.total}</td><td class="r num">${o.certas}</td><td class="r num">${o.erradas}</td><td class="r num">${o.brancos}</td><td class="r num">${o.anuladas}</td><td class="r num">${pct(o.precisao)}${o.amostra_pequena && o.respondidas ? ' *' : ''}</td></tr>`)}</tbody></table></div>
+          <p class="faint mt-2" style="font-size:12px">${q.tempo_medio_s ? `Tempo médio: ${q.tempo_medio_s} s por questão. ` : ''}* amostra pequena (menos de ${r.questoes.amostra_min} respondidas). Sem gabarito: ${q.sem_gabarito}.</p>
+          ${r.questoes.por_disciplina.length ? h`<div class="list mt-2">${r.questoes.por_disciplina.map((x) => h`<div class="li" style="min-height:40px"><span class="main"><span class="t">${x.disciplina}</span></span><span class="v num">${pct(x.precisao)} <span class="faint">(${x.respondidas})</span></span></div>`)}</div>` : ''}</div>
+        <div class="card span-4"><div class="card-head">${icon('refresh')}<h3>Revisões</h3></div><div class="kv"><span>Feitas no período</span><b>${r.revisoes.feitas}</b></div><div class="kv"><span>No prazo</span><b>${pct(r.revisoes.no_prazo_pct)}</b></div><button type="button" class="kv link-btn" data-act="est.desDrill" data-k="atrasadas" style="width:100%"><span>Atrasadas pendentes</span><b>${r.revisoes.atrasadas_pendentes}</b></button><div class="kv"><span>Flashcards vencidos</span><b>${r.flashcards.vencidos}</b></div></div>
+        <div class="card span-4"><div class="card-head">${icon('alert')}<h3>Dificuldades</h3></div>${r.dificuldades.length ? h`<div class="list">${r.dificuldades.map((x) => h`<button type="button" class="li tap" data-act="est.assunto" data-id="${x.assunto_id}" style="width:100%;text-align:left;min-height:40px"><span class="main"><span class="t">${x.titulo}</span><span class="s">${x.disciplina}</span></span><span class="chip down">${fmt.num(x.precisao, 0)}% · ${x.respondidas}</span></button>`)}</div>` : h`<p class="muted" style="font-size:13px">Nenhum assunto abaixo de 60 % (mínimo 5 respostas).</p>`}
+          <button type="button" class="kv link-btn mt-2" data-act="est.desDrill" data-k="erros" style="width:100%"><span>Erros recorrentes</span><b>${r.erros.recorrentes}</b></button></div>
+        <div class="card span-4"><div class="card-head">${icon('target')}<h3>Metas e consistência</h3></div><div class="kv"><span>Dias com estudo</span><b>${r.tempo.dias_com_estudo}/${r.periodo.dias} (${pct(r.tempo.consistencia_pct)})</b></div><div class="kv"><span>Média por dia</span><b>${fmt.dur(r.tempo.media_dia_s)}</b></div>
+          ${r.metas.length ? r.metas.map((m) => h`<div class="kv"><span>${m.titulo}</span><b>${fmt.num(m.atual, 1)}${m.unidade ? ' ' + m.unidade : ''} / ${m.alvo ?? '—'}</b></div>`) : h`<p class="faint mt-2" style="font-size:12px">Crie metas de estudo em Preferências.</p>`}</div>
+        <div class="card span-6"><div class="card-head">${icon('flag')}<h3>Simulados</h3></div>${r.simulados.length ? h`<div id="des-sim"></div><p class="faint mt-2" style="font-size:12px">Provas reais aparecem separadas dos simulados.</p>` : h`<p class="muted" style="font-size:13px">Nenhum simulado finalizado no período.</p>`}</div>
+        <div class="card span-6"><div class="card-head">${icon('file')}<h3>Discursivas</h3></div>${r.discursivas.length ? h`<div class="list">${r.discursivas.map((x) => h`<div class="li"><span class="main"><span class="t">${x.titulo}</span><span class="s">${x.avaliacoes.map((a) => `v${a.versao}: ${pct(a.pct)} (${a.tipo})`).join(' → ')}</span></span></div>`)}</div>` : h`<p class="muted" style="font-size:13px">Nenhuma avaliação no período.</p>`}</div>
+      </div>
+      <div class="card pad-lg mt-4"><b>Definições</b><p class="muted mt-2" style="font-size:13px">Tempo líquido: sessões encerradas, pausas descontadas. Precisão = certas ÷ (certas + erradas); brancos, anuladas e sem gabarito ficam fora. Cobertura: assuntos-folha do edital em uso com teoria concluída (itens retirados e itens-pai não contam); a ponderada usa peso ou nº de questões. Nota de simulado: regra própria de cada prova (acerto, erro, branco e anuladas). Sem dados não vira 0 %.</p></div>`;
+  }
+  function desMount() {
+    const r = st.statsRes; if (!r) return;
+    const days = P.pf.days('est.des', r.periodo.de, DES_PF).filter((x) => x >= r.periodo.de && x <= r.periodo.ate).slice(-120);
+    P.charts.mount('#des-dia', { type: 'bar', labels: days.map((x) => fmt.dm(x)), series: [{ label: 'min', data: days.map((x) => Math.round((r.tempo.por_dia[x] || 0) / 60)) }], fmt: (v) => fmt.dur(v * 60), height: 200 });
+    const tp = [['teoria', 'Teoria'], ['pratica', 'Prática'], ['revisao', 'Revisão'], ['simulados', 'Simulados'], ['discursivas', 'Discursivas']].filter(([k]) => r.tempo.por_tipo[k]);
+    if (tp.length) P.charts.mount('#des-tipo', { type: 'doughnut', labels: tp.map((x) => x[1]), series: [{ data: tp.map(([k]) => Math.round(r.tempo.por_tipo[k] / 60)) }], noScales: true, legend: true, height: 220, fmt: (v) => fmt.dur(v * 60) });
+    else document.getElementById('des-tipo').innerHTML = '<p class="muted" style="font-size:13px">Sem sessões no período.</p>';
+    const dk = Object.keys(r.tempo.por_disciplina).sort((a, b) => r.tempo.por_disciplina[b] - r.tempo.por_disciplina[a]).slice(0, 12);
+    if (dk.length) P.charts.mount('#des-disc', { type: 'bar', horizontal: true, labels: dk, series: [{ label: 'min', data: dk.map((k) => Math.round(r.tempo.por_disciplina[k] / 60)) }], fmt: (v) => fmt.dur(v * 60), height: Math.max(160, dk.length * 30) });
+    else document.getElementById('des-disc').innerHTML = '<p class="muted" style="font-size:13px">Sem sessões no período.</p>';
+    if (r.simulados.length) { const sims = r.simulados.filter((s) => s.tipo !== 'prova_real'), reais = r.simulados.filter((s) => s.tipo === 'prova_real'); P.charts.mount('#des-sim', { type: 'line', labels: r.simulados.map((s) => fmt.dm(String(s.fim).slice(0, 10))), series: [{ label: 'Simulados %', data: r.simulados.map((s) => (s.tipo !== 'prova_real' ? s.pct : null)) }].concat(reais.length ? [{ label: 'Provas reais %', data: r.simulados.map((s) => (s.tipo === 'prova_real' ? s.pct : null)) }] : []), legend: !!reais.length, fmt: (v) => fmt.num(v, 1) + '%', height: 200, max: 100 }); }
+  }
+  function desDrill(k) {
+    const r = st.statsRes; if (!r) return;
+    if (k === 'tempo') { const ids = new Set(r.tempo.ids); const rows = S.where('est_sessoes', (s) => ids.has(s.id)).sort((a, b) => (a.inicio < b.inicio ? 1 : -1)); ui.sheet({ title: `Sessões (${rows.length})`, body: h`<div class="list">${rows.map((s) => E.sessionRow(s))}</div>` }); }
+    if (k === 'plano') { const ids = new Set(r.plano.ids); const rows = S.where('tar_tarefas', (t) => ids.has(t.id)); ui.sheet({ title: `Tarefas planejadas (${rows.length})`, body: h`<div class="list">${rows.map((t) => h`<div class="li tap" data-act="est.ativEdit" data-id="${t.id}"><span class="main"><span class="t">${t.titulo}</span><span class="s">${fmt.date(t.data_vencimento)} · ${t.duracao_estimada_min || 0} min · ${t.status}</span></span></div>`)}</div>` }); }
+    if (k === 'questoes') { const ids = new Set(r.questoes.ids); const rows = S.where('est_tentativas', (t) => ids.has(t.id)).sort((a, b) => (a.created_at < b.created_at ? 1 : -1)); ui.sheet({ title: `Tentativas (${rows.length})`, body: h`<div class="list">${rows.slice(0, 300).map((t) => { const qq = S.getAny('est_questoes', t.questao_id) || {}; const res = E.res(t); return h`<div class="li tap" data-act="est.qOne" data-id="${qq.id}"><span class="chip ${res === 'certa' ? 'up' : res === 'errada' ? 'down' : ''}">${res.replace('_', ' ')}</span><span class="main"><span class="t">${qq.codigo || ''} · ${String(qq.enunciado || '').slice(0, 70)}</span><span class="s">${fmt.date(String(t.created_at).slice(0, 10))} · ${t.modo}${t.primeira ? ' · 1ª' : ''}</span></span></div>`; })}</div>` }); }
+    if (k === 'atrasadas') { const ids = new Set(r.revisoes.ids_atrasadas); P.router.go('est/revisoes'); ui.toast(`${ids.size} revisão(ões) atrasada(s) no topo da fila`); }
+    if (k === 'erros') { P.flt.set('est.err', 'sit', 'recorrentes'); P.router.go('est/erros'); }
+  }
+
+  // ================= Histórico =================
+  function historico() {
+    const g = E.gate(); if (g) return g;
+    const fk = 'est.hist', fo = { def: '30d', modes: ['7d', '30d', 'mes', 'ano', 'intervalo', 'tudo'], tables: ['est_tentativas'] }, tipo = P.flt.get(fk, 'tipo', 'todos');
+    const ev = [];
+    if (tipo === 'todos' || tipo === 'sessoes') S.all('est_sessoes').forEach((s) => ev.push({ t: s.inicio, k: 's', s }));
+    if (tipo === 'todos' || tipo === 'simulados') S.where('est_simulados', (s) => s.status === 'finalizado').forEach((s) => ev.push({ t: s.fim, k: 'sim', s }));
+    if (tipo === 'todos' || tipo === 'revisoes') S.where('est_revisoes', (r) => r.status === 'feita').forEach((r) => ev.push({ t: r.feita_em, k: 'rev', r }));
+    if (tipo === 'todos' || tipo === 'gabaritos') S.all('est_questoes').forEach((q) => (q.gabarito_hist_json || []).slice(1).forEach((x) => ev.push({ t: x.em, k: 'gab', q, x })));
+    if (tipo === 'todos' || tipo === 'editais') S.all('est_editais').forEach((e) => ev.push({ t: e.created_at, k: 'ed', e }));
+    const rows = P.pf.filter(fk, ev, (x) => String(x.t || '').slice(0, 10), fo).sort((a, b) => (a.t < b.t ? 1 : -1)).slice(0, 400);
+    const by = P.groupBy(rows, (x) => String(x.t).slice(0, 10));
+    const line = (x) => x.k === 's' ? E.sessionRow(x.s)
+      : x.k === 'sim' ? h`<div class="li tap" data-act="est.simOpen" data-id="${x.s.id}"><span class="tile sm">${icon('flag', 'sm')}</span><span class="main"><span class="t">Simulado finalizado · ${x.s.titulo}</span><span class="s">${fmt.time(x.t)} · ${(x.s.resultado_json || {}).total ? fmt.num(x.s.resultado_json.total.pct, 1) + '%' : ''}</span></span></div>`
+      : x.k === 'rev' ? h`<div class="li"><span class="tile sm">${icon('refresh', 'sm')}</span><span class="main"><span class="t">Revisão · ${x.r.titulo}</span><span class="s">${fmt.time(x.t)} · ${x.r.resultado}</span></span></div>`
+      : x.k === 'gab' ? h`<div class="li"><span class="tile sm">${icon('edit', 'sm')}</span><span class="main"><span class="t">Gabarito alterado · ${x.q.codigo}</span><span class="s">${x.x.anterior || '—'} → ${x.x.gabarito || '—'} (${x.x.status})${x.x.motivo ? ' · ' + x.x.motivo : ''}</span></span></div>`
+      : h`<div class="li"><span class="tile sm">${icon('layers', 'sm')}</span><span class="main"><span class="t">Edital v${x.e.versao} · ${(E.conc(x.e.concurso_id) || {}).nome || ''}</span><span class="s">${x.e.titulo || ''}</span></span></div>`;
+    return h`<div class="page-head"><div><h1>Histórico</h1><p>Sessões e alterações relevantes</p></div><button class="btn btn-ghost btn-sm" data-act="est.manual">${icon('plus', 'sm')}Estudo externo</button></div>
+      <div class="filters mb-3">${P.pf.bar(fk, fo)}${P.flt.chips(fk, 'tipo', [['todos', 'Tudo'], ['sessoes', 'Sessões'], ['simulados', 'Simulados'], ['revisoes', 'Revisões'], ['gabaritos', 'Gabaritos'], ['editais', 'Editais']], 'todos')}</div>
+      ${rows.length ? Object.keys(by).sort().reverse().map((dd) => h`<div class="group-h"><span>${fmt.day(dd)}</span><span>${by[dd].filter((x) => x.k === 's' && x.s.status === 'encerrada').length ? fmt.dur(P.sum(by[dd].filter((x) => x.k === 's' && x.s.status === 'encerrada'), (x) => +x.s.liquido_s || 0)) : ''}</span></div><div class="list cardlist">${by[dd].map(line)}</div>`) : ui.empty({ ill: 'list', title: 'Nada neste período', small: true })}`;
+  }
+
+  // ================= Preferências =================
+  function prefs() {
+    const g = E.gate(); if (g) return g;
+    const tgOn = fs('est.tg_avisos', false) === true, tipos = fs('est.tg_tipos', ['plano', 'revisoes', 'prazos', 'metas']) || [];
+    const iv = (fs('est.rev_intervalos', null) || [1, 7, 15, 30, 60, 120]).join(', ');
+    const sw = (k, label, hint, def) => h`<div class="li"><span class="main"><span class="t">${label}</span>${hint ? h`<span class="s" style="white-space:normal">${hint}</span>` : ''}</span><label class="toggle"><input type="checkbox" data-on-change="est.pref" data-k="${k}" ${raw(fs(k, def) === true ? 'checked' : '')}><span></span></label></div>`;
+    const num = (k, label, def, min, max, unit) => h`<div class="li"><span class="main"><span class="t">${label}</span></span><span class="input-wrap" style="width:120px"><input class="input num" inputmode="numeric" data-on-change="est.prefNum" data-k="${k}" data-min="${min}" data-max="${max}" value="${fs(k, def)}">${unit ? h`<span class="suffix">${unit}</span>` : ''}</span></div>`;
+    const ia = E.ia || {};
+    return h`<div class="page-head"><div><h1>Preferências de Estudos</h1></div></div>
+      <div class="dash"><div class="span-6 stack">
+        <div class="card pad-lg"><b>Revisões e flashcards</b><div class="list mt-2">
+          <div class="li"><span class="main"><span class="t">Intervalos (dias)</span><span class="s">Sequência usada após cada revisão "Bom"</span></span><input class="input sm" style="width:160px" data-on-change="est.prefIv" value="${iv}" aria-label="Intervalos"></div>
+          ${num('est.rev_max_dia', 'Revisões por dia', 30, 5, 300)}${num('est.cards_novos_dia', 'Cartões novos por dia', 20, 0, 200)}
+          ${sw('est.rev_auto', 'Revisão automática após estudar a teoria', 'Agenda a 1ª revisão do assunto ao encerrar a sessão', true)}${sw('est.rev_questao_errada', 'Revisar questões erradas', 'A questão errada volta no dia seguinte', true)}</div></div>
+        <div class="card pad-lg"><b>Sala de estudo e leitor</b><div class="list mt-2">
+          ${num('est.pomodoro_min', 'Pomodoro (0 = desligado)', 0, 0, 120, 'min')}${num('est.sessao_max_h', 'Avisar sessão acima de', 8, 1, 24, 'h')}
+          ${sw('est.exportar_ao_sair', 'Disponibilizar a cópia anotada ao sair do leitor', 'Gera e guarda o PDF com as marcações para você pedir pelo Telegram com o app fechado', true)}
+          <div class="li"><span class="main"><span class="t">Cores de marcação</span><span class="s">Separadas por vírgula (hex)</span></span><input class="input sm" style="width:200px" data-on-change="est.prefCores" value="${(fs('est.cores', null) || ['#F2B705', '#5F9E8F', '#E06C75', '#61AFEF', '#C678DD']).join(', ')}" aria-label="Cores"></div>
+          ${sw('est.ocr_auto', 'Ler PDF digitalizado (OCR)', 'Página sem texto: a aberta primeiro, as demais em segundo plano, com cancelar. O resultado fica guardado e nunca é refeito', true)}
+          <div class="li"><span class="main"><span class="t">Motor de OCR</span><span class="s" style="white-space:normal">No aparelho: Tesseract.js (por), com posição das palavras para selecionar e marcar. Google Drive: no servidor, só o texto (até 300 páginas por dia)</span></span>${ui.seg([['aparelho', 'Aparelho'], ['drive', 'Drive']], fs('est.ocr_motor', 'aparelho'), 'est.prefOcr', { cls: 'sm' })}</div>
+          ${sw('est.gamificacao', 'Conquistas e sequência de dias', 'Desligue se preferir sem gamificação; dias de descanso do plano não quebram a sequência', true)}</div></div>
+        <div class="card pad-lg"><b>Metas de estudo</b><p class="muted mt-2" style="font-size:13px">Metas automáticas aparecem no módulo Metas e medem sozinhas.</p><div class="row-sm wrap mt-2">
+          ${[['est_horas', 'Horas de estudo', 'h', 20], ['est_questoes', 'Questões resolvidas', 'questões', 300], ['est_precisao', 'Precisão nas questões', '%', 75], ['est_revisoes', 'Revisões feitas', 'revisões', 60], ['est_cobertura', 'Cobertura do edital', '%', 100], ['est_redacoes', 'Discursivas escritas', 'textos', 8]].map(([k, l, u, alvo]) => h`<button class="btn btn-ghost btn-sm" data-act="est.metaNew" data-k="${k}" data-l="${l}" data-u="${u}" data-alvo="${alvo}">${icon('target', 'sm')}${l}</button>`)}</div></div>
+      </div><div class="span-6 stack">
+        <div class="card pad-lg"><b>Telegram</b><p class="muted mt-2" style="font-size:13px">${E.tg() ? 'Conectado. Pedidos (/estudos, /pdf, /resumo…) funcionam mesmo com os avisos desligados.' : 'Conecte em Configurações › Telegram para pedir materiais e receber avisos.'} As respostas chegam em até 5 minutos (ou na hora com "Verificar").</p>
+          <div class="list mt-2"><div class="li"><span class="main"><span class="t">Avisos automáticos de Estudos</span><span class="s">Um resumo por dia no horário escolhido</span></span><label class="toggle"><input type="checkbox" data-on-change="est.prefTg" ${raw(tgOn ? 'checked' : '')} ${raw(E.tg() ? '' : 'disabled')}><span></span></label></div>
+            <div class="li"><span class="main"><span class="t">Horário</span></span><input class="input sm" type="time" style="width:120px" data-on-change="est.prefTxt" data-k="est.tg_hora" value="${fs('est.tg_hora', '07:00')}"></div>
+            <div class="li"><span class="main"><span class="t">Silêncio</span><span class="s">Ex.: 22:00-07:00</span></span><input class="input sm" style="width:140px" data-on-change="est.prefTxt" data-k="est.tg_silencio" value="${fs('est.tg_silencio', '')}" placeholder="22:00-07:00"></div>
+            <div class="li"><span class="main"><span class="t">Dias</span></span><div class="row-sm wrap" data-tgdias>${fmt.WD.map((w, i) => h`<button type="button" class="fchip ${String(fs('est.tg_dias', '0,1,2,3,4,5,6')).split(',').includes(String(i)) ? 'on' : ''}" data-act="est.prefDia" data-v="${i}">${w}</button>`)}</div></div>
+            <div class="li"><span class="main"><span class="t">Conteúdo</span></span><div class="row-sm wrap">${[['plano', 'Plano do dia'], ['revisoes', 'Revisões'], ['prazos', 'Prazos'], ['metas', 'Metas']].map(([k, l]) => h`<button type="button" class="fchip ${tipos.includes(k) ? 'on' : ''}" data-act="est.prefTgTipo" data-v="${k}">${l}</button>`)}</div></div>
+            <div class="li"><span class="main"><span class="t">Resumo do desempenho</span></span>${ui.seg([['nao', 'Não'], ['diario', 'Diário'], ['semanal', 'Domingo']], fs('est.tg_resumo', 'semanal'), 'est.prefResumo', { cls: 'sm' })}</div>
+            ${sw('est.tg_relatorio_pdf', 'Relatório semanal em PDF', 'Domingo, como anexo', false)}${num('est.tg_avisos_dia', 'Máximo de avisos por dia', 6, 1, 30)}${num('est.tg_pedidos_dia', 'Máximo de pedidos por dia', 60, 5, 200)}</div></div>
+        <div class="card pad-lg"><b>Assistente de IA (opcional)</b><p class="muted mt-2" style="font-size:13px">${ia.configurado ? `${(ia.provedores || []).length} provedor(es) · ${ia.uso_hoje}/${ia.limite_dia} usos hoje. Cada pessoa escolhe o modelo na hora; tudo que a IA gera vem identificado para você conferir.` : 'Desligado. Estudos funciona inteiro sem IA. O dono do app cadastra provedores (há modelos prontos com nível gratuito); as chaves ficam só no servidor.'}</p>
+          <div class="row-sm wrap mt-2">${ia.configurado ? h`<a class="btn btn-ghost btn-sm" href="#/est/ia">${icon('zap', 'sm')}Abrir o assistente</a>` : ''}${ia.dono ? h`<button class="btn btn-ghost btn-sm" data-act="est.iaProv">${icon('sliders', 'sm')}Provedores e modelos</button>` : ''}</div></div>
+        <div class="card pad-lg"><b>Arquivos e segurança</b><p class="muted mt-2" style="font-size:13px">Originais, anotações (JSON) e cópias exportadas ficam privados no seu Drive. O backup semanal copia os originais (uma vez por conteúdo), as anotações e um manifesto. Uploads de até 50 MB.</p>
+          <div class="row-sm wrap mt-2"><button class="btn btn-ghost btn-sm" data-act="est.checkFiles">${icon('shield', 'sm')}Verificar arquivos</button><button class="btn btn-ghost btn-sm" data-act="est.dupScan">${icon('copy', 'sm')}Procurar duplicados</button></div>
+          <p class="faint mt-3" style="font-size:12px">O acesso ao Prumo é por e-mail digitado e senha compartilhada: isso não comprova a posse do e-mail. Para uso pessoal está ok; para várias pessoas independentes, use contas com identidade verificada antes de confiar na separação de arquivos e no vínculo do bot.</p></div>
+      </div></div>`;
+  }
+
+  async function bibLote(patch, el) {
+    const ids = [...(st.bsel || [])]; if (!ids.length || Object.values(patch).some((v) => v === undefined)) return;
+    if (patch.categoria === '') return;
+    el.disabled = true;
+    try { const r = await P.api.call('est.materialBatch', { ids, ...patch }, { mutation: true, timeout: 180000 }); r.materiais.forEach((m) => S.put('est_materiais', m)); ui.toast(`${r.materiais.length} material(is) atualizado(s) e movido(s)`); st.bsel = new Set(); }
+    catch (e) { ui.toast(e.message, { error: true }); }
+    P.router.render(true);
+  }
+
+  // ================= Rotas e ações =================
+  const T = E.T;
+  P.screen('est/biblioteca', { mod: 'est', tab: 'biblioteca', title: 'Biblioteca', deps: T.concat(['arquivos']), render: biblioteca });
+  P.screen('est/sala', { mod: 'est', tab: 'sala', title: 'Sala de estudo', deps: T, render: sala, mount: salaMount, unmount() { clearInterval(st.tick); } });
+  P.screen('est/revisoes', { mod: 'est', tab: 'revisoes', title: 'Revisões', deps: T, render: revisoes });
+  P.screen('est/flashcards', { mod: 'est', tab: 'flashcards', title: 'Flashcards', deps: T, render: flashcards, mount(root) { P.$$('[data-cimg]', root).forEach(async (el) => { try { const u = await P.files.url(el.dataset.cimg); el.outerHTML = `<img src="${P.esc(u)}" alt="" style="max-width:100%;border-radius:12px">`; } catch (e) { el.remove(); } }); } });
+  P.screen('est/erros', { mod: 'est', tab: 'erros', title: 'Caderno de erros', deps: T, render: erros });
+  P.screen('est/resumos', { mod: 'est', tab: 'resumos', title: 'Resumos e anotações', deps: T, render: resumos });
+  P.screen('est/discursivas', { mod: 'est', tab: 'discursivas', title: 'Discursivas', deps: T, render: discursivas });
+  P.screen('est/desempenho', { mod: 'est', tab: 'desempenho', title: 'Desempenho', deps: ['est_sessoes'], render: desempenho, mount: desMount });
+  P.screen('est/historico', { mod: 'est', tab: 'historico', title: 'Histórico', deps: T, render: historico });
+  P.screen('est/prefs', { mod: 'est', tab: 'prefs', title: 'Preferências de Estudos', deps: [], render: prefs });
+
+  const setPref = (vals) => P.settings.set(vals).then(() => ui.toast('Preferência salva')).catch(() => {});
+  document.addEventListener('keydown', (e) => {
+    if (!st.cardQ || !st.cardShow || /INPUT|TEXTAREA/.test((document.activeElement || {}).tagName || '')) return;
+    const k = { 1: 'errei', 2: 'dificil', 3: 'bom', 4: 'facil' }[e.key]; if (k) P.act['est.cardGrade']({ dataset: { v: k } });
+  });
+
+  Object.assign(P.act, {
+    'est.start': (el) => startFlow(el.dataset || {}).catch((e) => { if (e.code !== 'CANCEL') ui.toast(e.message, { error: true }); }),
+    'est.startTask': (el) => startFlow({ tarefa: el.dataset.id }).catch((e) => { if (e.code !== 'CANCEL') ui.toast(e.message, { error: true }); }),
+    'est.sessPause': async (el) => { try { const r = await P.api.call('est.sessionPause', { id: el.dataset.id }, { mutation: true }); S.put('est_sessoes', r.sessao); } catch (e) { ui.toast(e.message, { error: true }); } },
+    'est.sessResume': async (el) => { try { const r = await P.api.call('est.sessionResume', { id: el.dataset.id }, { mutation: true }); S.put('est_sessoes', r.sessao); } catch (e) { ui.toast(e.message, { error: true }); } },
+    'est.sessEnd': (el) => endSheet(S.get('est_sessoes', el.dataset.id)),
+    'est.sessNote': P.debounce((el) => { const s = E.open(); if (!s) return; const o = localGet(s.id); o[el.dataset.k] = el.value; localSet(s.id, o); }, 400),
+    'est.sessMat': (el) => { const s = S.get('est_sessoes', el.dataset.id); ui.menu('Material da sessão', S.all('est_materiais').filter((m) => m.situacao !== 'arquivado').slice(0, 40).map((m) => ({ label: m.codigo + ' · ' + m.titulo, icon: 'book', act: () => matOpen(m.id) }))); return s; },
+    'est.sessEdit': (el) => sessEdit(S.getAny('est_sessoes', el.dataset.id)),
+    'est.manual': () => manualSheet(),
+    'est.matUpload': async () => { const files = await P.files.pick({ accept: 'application/pdf,image/\u002A,.xlsx,.csv,.txt', multiple: true }); if (files && files.length) E.uploadToLibrary(files, { disciplina_id: P.flt.get('est.bib', 'disc', '') || undefined }); },
+    'est.matLink': () => matEdit(null),
+    'est.matOpen': (el) => matOpen(el.dataset.id, el.dataset.p ? +el.dataset.p : null),
+    'est.matMenu': (el) => matMenu(E.mat(el.dataset.id)),
+    'est.lixeira': async () => { try { const r = await P.api.call('est.trashList', {}); st.lixeira = r.materiais; } catch (e) { ui.toast(e.message, { error: true }); } P.router.render(true); },
+    'est.lixeiraFechar': () => { st.lixeira = null; P.router.render(true); },
+    'est.matRestore': async (el) => { try { const r = await P.api.call('db.restore', { table: 'est_materiais', id: el.dataset.id }, { mutation: true }); S.put('est_materiais', r.row); st.lixeira = st.lixeira.filter((m) => m.id !== el.dataset.id); ui.toast('Material restaurado'); } catch (e) { ui.toast(e.message, { error: true }); } P.router.render(true); },
+    'est.revDone': async (el) => { const btns = el.parentNode; btns.querySelectorAll('button').forEach((b) => { b.disabled = true; }); try { const r = await P.api.call('est.reviewDone', { id: el.dataset.id, resultado: el.dataset.v }, { mutation: true }); S.put('est_revisoes', r.revisao); if (r.proxima) S.put('est_revisoes', r.proxima); ui.toast(r.proxima ? `Próxima revisão em ${fmt.date(r.proxima.vencimento)}` : 'Revisão registrada'); } catch (e) { ui.toast(e.message, { error: true }); btns.querySelectorAll('button').forEach((b) => { b.disabled = false; }); } },
+    'est.revOpen': (el) => revOpen(S.get('est_revisoes', el.dataset.id)),
+    'est.revAgendar': (el) => revAgendar(el.dataset && el.dataset.tipo, el.dataset && el.dataset.id),
+    'est.cardNew': (el) => cardEdit(null, { disciplina_id: (el && el.dataset && el.dataset.disc) || null, assunto_id: (el && el.dataset && el.dataset.ass) || null }),
+    'est.cardEdit': (el) => cardEdit(S.get('est_flashcards', el.dataset.id)),
+    'est.cardStart': () => {
+      const hoje = D.today(), bar = P.flt.get('est.fc', 'baralho', ''), lim = +fs('est.cards_novos_dia', 20) || 20;
+      const novosHoje = S.where('est_flashcard_revisoes', (r) => String(r.data).slice(0, 10) === hoje && r.intervalo_antes === 0).length;
+      const pool = S.all('est_flashcards').filter((c) => !c.suspenso && (!bar || c.baralho === bar));
+      const q = pool.filter((c) => !c.novo && c.vencimento && c.vencimento <= hoje).sort((a, b) => (a.vencimento < b.vencimento ? -1 : 1)).concat(pool.filter((c) => c.novo).slice(0, Math.max(0, lim - novosHoje)));
+      if (!q.length) { ui.toast('Nada para estudar agora.'); return; }
+      st.cardQ = q.map((c) => c.id); st.cardI = 0; st.cardShow = false; P.router.render();
+    },
+    'est.cardReveal': () => { st.cardShow = true; P.router.render(true); },
+    'est.cardStop': () => { st.cardQ = null; P.router.render(); },
+    'est.cardGrade': async (el) => {
+      const id = st.cardQ && st.cardQ[st.cardI]; if (!id) return;
+      st.cardShow = false; st.cardI++;
+      if (st.cardI >= st.cardQ.length) { const n = st.cardQ.length; st.cardQ = null; ui.toast(`Sessão concluída: ${n} cartão(ões)`); }
+      P.router.render(true);
+      try { const r = await P.api.call('est.cardAnswer', { card_id: id, nota: el.dataset.v, op_key: P.uuid() }, { mutation: true }); S.put('est_flashcards', r.card); S.put('est_flashcard_revisoes', r.revisao); } catch (e) { ui.toast(e.message, { error: true }); }
+    },
+    'est.erroNew': (el) => erroEdit(null, { disciplina_id: (el && el.dataset && el.dataset.disc) || null, assunto_id: (el && el.dataset && el.dataset.ass) || null }),
+    'est.erroEdit': (el) => erroEdit(S.get('est_erros', el.dataset.id)),
+    'est.tgErros': (el) => E.sendTg({ tipo: 'erros', termo: P.flt.get('est.err', 'q', '') }, el),
+    'est.noteNew': (el) => noteEdit(null, { disciplina_id: (el && el.dataset && el.dataset.disc) || null, assunto_id: (el && el.dataset && el.dataset.ass) || null, material_id: (el && el.dataset && el.dataset.mat) || null }),
+    'est.noteEdit': (el) => noteEdit(S.get('est_anotacoes', el.dataset.id)),
+    'est.resumoView': (el) => E.resumoView(S.get('est_anotacoes', el.dataset.id)),
+    'est.resumoIA': (el) => E.resumoIA(E.mat(el.dataset.id)),
+    'est.noteLink': (el) => { const n = S.all('est_anotacoes').find((x) => P.norm(x.titulo) === P.norm(el.dataset.t)); if (n) { ui.closeAll(); noteEdit(n); } else ui.toast('Nenhuma nota com esse título.'); },
+    'est.discNew': () => discEdit(null),
+    'est.discEdit': (el) => discEdit(S.get('est_discursivas', el.dataset.id)),
+    'est.desLoad': () => loadStats(),
+    'est.desDrill': (el) => desDrill(el.dataset.k),
+    'est.desTg': (el) => { const r0 = st.statsRes; if (!r0) return; E.sendTg({ tipo: 'relatorio', de: r0.periodo.de, ate: r0.periodo.ate, concurso_id: r0.filtros.concurso_id, disciplina_id: r0.filtros.disciplina_id, formato: 'pdf' }, el); },
+    'est.pref': (el) => setPref({ [el.dataset.k]: el.checked }),
+    'est.prefNum': (el) => { const v = Math.round(P.parseNum(el.value)); if (!(v >= +el.dataset.min && v <= +el.dataset.max)) { ui.toast(`Use um valor entre ${el.dataset.min} e ${el.dataset.max}.`, { error: true }); return; } setPref({ [el.dataset.k]: v }); },
+    'est.prefOcr': (el) => setPref({ 'est.ocr_motor': el.dataset.v }).then(() => P.router.render(true)),
+    'est.prefTxt': (el) => { if (el.dataset.k === 'est.tg_silencio' && el.value && !/^\d\d:\d\d-\d\d:\d\d$/.test(el.value)) { ui.toast('Use o formato 22:00-07:00', { error: true }); return; } setPref({ [el.dataset.k]: el.value }); },
+    'est.prefIv': (el) => { const v = el.value.split(/[,; ]+/).map(Number).filter((n) => n > 0 && n < 3650); if (!v.length) { ui.toast('Informe dias, ex.: 1, 7, 15, 30', { error: true }); return; } setPref({ 'est.rev_intervalos': v }); },
+    'est.prefCores': (el) => { const v = el.value.split(/[,; ]+/).filter((c) => /^#[0-9a-f]{6}$/i.test(c)); if (!v.length) { ui.toast('Use cores como #F2B705', { error: true }); return; } setPref({ 'est.cores': v }); },
+    'est.prefTg': (el) => setPref({ 'est.tg_avisos': el.checked }),
+    'est.prefDia': (el) => { const cur = new Set(String(fs('est.tg_dias', '0,1,2,3,4,5,6')).split(',').filter(Boolean)); cur.has(el.dataset.v) ? cur.delete(el.dataset.v) : cur.add(el.dataset.v); setPref({ 'est.tg_dias': [...cur].sort().join(',') }).then(() => P.router.render(true)); },
+    'est.prefTgTipo': (el) => { const cur = new Set(fs('est.tg_tipos', ['plano', 'revisoes', 'prazos', 'metas']) || []); cur.has(el.dataset.v) ? cur.delete(el.dataset.v) : cur.add(el.dataset.v); setPref({ 'est.tg_tipos': [...cur] }).then(() => P.router.render(true)); },
+    'est.prefResumo': (el) => setPref({ 'est.tg_resumo': el.dataset.v }).then(() => P.router.render(true)),
+    'est.metaNew': (el) => { const ds = el.dataset; S.save('met_metas', { titulo: ds.l, area: 'estudos', horizonte: 'curto', medicao: 'automatica', origem_metrica: ds.k, origem_id: ds.k === 'est_cobertura' ? E.ctx() || null : null, valor_alvo: +ds.alvo, unidade: ds.u, data_inicio: D.today(), prazo: D.add(D.today(), 90), status: 'ativa' }).then((m) => { ui.toast('Meta criada: ajuste o alvo e o prazo em Metas.'); P.router.go('met/meta/' + m.id); }).catch(() => {}); },
+    'est.iaCfg': () => P.act['est.iaProv'](),
+    'est.bibSel': (el) => { el.checked ? st.bsel.add(el.dataset.id) : st.bsel.delete(el.dataset.id); P.router.render(true); },
+    'est.bibSelClear': () => { st.bsel = new Set(); P.router.render(true); },
+    'est.bibLoteCat': (el) => { if (el.value) bibLote({ categoria: el.value }, el); },
+    'est.bibLoteConc': (el) => { if (el.value) bibLote({ concurso_ids: el.value === '_geral' ? '' : el.value }, el); },
+    'est.libReorg': async (el) => {
+      el.classList.add('loading');
+      let r; try { r = await P.api.call('est.libReorg', { dry: true }, { timeout: 120000 }); } catch (e) { ui.toast(e.message, { error: true }); el.classList.remove('loading'); return; }
+      el.classList.remove('loading');
+      if (!r.total) { ui.toast('A biblioteca já está organizada nas pastas certas.', { icon: 'check' }); return; }
+      const destinos = {}; r.itens.forEach((x) => { destinos[x.para] = (destinos[x.para] || 0) + 1; });
+      ui.sheet({ title: 'Reorganizar biblioteca', body: h`<p class="muted" style="font-size:13px">${r.total} arquivo(s) vão para a estrutura Estudos / tipo / concurso / data do envio / categoria. Mover não muda o arquivo: os links, o histórico e as anotações continuam valendo. Materiais sem categoria vão para "Outros" (classifique depois em lote).</p>
+        <div class="group-h mt-3">Destinos</div><div class="list">${Object.entries(destinos).map(([d, n]) => h`<div class="li"><span class="main"><span class="t">${d.split('/').join(' / ')}</span></span><span class="v num">${n}</span></div>`)}</div>
+        <details class="mt-3"><summary class="faint" style="font-size:12.5px">Ver arquivo por arquivo</summary><div class="list mt-2">${r.itens.map((x) => h`<div class="li"><span class="main"><span class="t">${x.codigo} · ${x.titulo}</span><span class="s">${x.de} → ${x.para}</span></span></div>`)}</div></details>`,
+        foot: h`<button class="btn btn-primary grow" data-ok>Mover ${r.total} arquivo(s)</button>`,
+        onMount(sh) { sh.$('[data-ok]').onclick = async (ev) => { ev.currentTarget.classList.add('loading'); try { const o = await P.api.call('est.libReorg', { dry: false }, { mutation: true, timeout: 330000 }); sh.close(); await E.reload().catch(() => {}); ui.toast(`${o.movidos} arquivo(s) reorganizado(s)${o.pendentes ? `; faltam ${o.pendentes} (clique de novo para continuar)` : ''}`); } catch (e) { ui.toast(e.message, { error: true }); ev.currentTarget && ev.currentTarget.classList.remove('loading'); } }; } });
+    },
+    'est.dupScan': async (el) => {
+      el.classList.add('loading');
+      let r; try { r = await P.api.call('est.dupScan', {}, { timeout: 120000 }); } catch (e) { ui.toast(e.message, { error: true }); el.classList.remove('loading'); return; }
+      el.classList.remove('loading');
+      const mb = (b) => fmt.num(b / 1048576, 1) + ' MB';
+      if (!r.itens.length) { ui.toast('Nenhum arquivo duplicado nas pastas de Estudos.', { icon: 'check' }); return; }
+      ui.sheet({ title: 'Arquivos duplicados', body: h`<p class="muted" style="font-size:13px">${r.itens.length} arquivo(s) que não são a versão atual: cópias anotadas antigas do mesmo material e arquivos com conteúdo igual que nada usa. Vão para a lixeira (do Drive e do app); dá para desfazer. Libera ${mb(r.bytes)}.</p>
+        <div class="list mt-2">${r.itens.map((x) => h`<label class="li"><input type="checkbox" data-dup="${x.id}" checked><span class="main"><span class="t">${x.nome}</span><span class="s">${x.tipo} · ${x.motivo}${x.material ? ' · ' + x.material : ''}</span></span><span class="v num">${mb(x.bytes)}</span></label>`)}</div>`,
+        foot: h`<button class="btn btn-primary grow" data-ok style="background:var(--danger);border-color:var(--danger)">Mandar para a lixeira</button>`,
+        onMount(sh) {
+          sh.$('[data-ok]').onclick = async (ev) => {
+            const btn = ev.currentTarget, ids = P.$$('[data-dup]', sh.el).filter((c) => c.checked).map((c) => c.dataset.dup); if (!ids.length) return;
+            if (!(await ui.confirm({ title: `Mandar ${ids.length} arquivo(s) para a lixeira?`, text: 'Ficam na lixeira do Drive por 30 dias e você pode desfazer agora.', ok: 'Mandar para a lixeira', danger: true }))) return;
+            btn.classList.add('loading');
+            try {
+              const out = await P.api.call('est.dupClean', { ids }, { mutation: true, timeout: 120000 }); sh.close();
+              ui.toast(`${out.removidos.length} arquivo(s) na lixeira · ${mb(out.bytes)} liberados`, { undo: async () => { try { const rr = await P.api.call('est.dupRestore', { ids: out.removidos }, { mutation: true, timeout: 120000 }); ui.toast(`${rr.restaurados} arquivo(s) restaurado(s)`); } catch (e) { ui.toast(e.message, { error: true }); } }, duration: 10000 });
+            } catch (e) { ui.toast(e.message, { error: true }); }
+          };
+        } });
+    },
+    'est.checkFiles': async (el) => {
+      el.classList.add('loading');
+      try {
+        const r = await P.api.call('est.checkFiles', {}, { timeout: 120000 });
+        if (!r.faltando.length) ui.toast('Todos os arquivos da biblioteca estão no Drive.', { icon: 'check' });
+        else ui.sheet({ title: 'Arquivos ausentes', body: h`<div class="list">${r.faltando.map((x) => h`<div class="li"><span class="main"><span class="t">${x.codigo} · ${x.titulo}</span><span class="s">${x.copia ? 'há cópia no backup' : 'sem cópia no backup'}</span></span></div>`)}</div>`, foot: r.faltando.some((x) => x.copia) ? h`<button class="btn btn-primary" data-r>Restaurar do backup</button>` : '', onMount(sh) { const b = sh.$('[data-r]'); if (b) b.onclick = async () => { try { const r2 = await P.api.call('est.checkFiles', { restaurar: true }, { mutation: true, timeout: 180000 }); sh.close(); ui.toast(`${r2.faltando.filter((x) => x.restaurado).length} arquivo(s) restaurado(s)`); } catch (e) { ui.toast(e.message, { error: true }); } }; } });
+      } catch (e) { ui.toast(e.message, { error: true }); } el.classList.remove('loading');
+    }
+  });
+})();
+</script>

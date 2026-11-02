@@ -1,0 +1,703 @@
+<script>
+/* Prumo · componentes de interface: shell, sheets, diálogos, toasts, formulários, gráficos SVG, uploads, paleta e bloqueio. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, esc, icon, fmt, d: D } = P;
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  P.$ = $; P.$$ = $$;
+  P.PALETTE = ['#F2B705', '#F6D365', '#B98900', '#C4684A', '#5F9E8F', '#8FA3B8', '#9A9A9A', '#5A5A5A'];
+
+  // ================= Módulos e shell =================
+  P.modules = {};
+  P.moduleOrder = [];
+  /** Registra um módulo (menu próprio, aba Mais e ação "+"). */
+  P.module = (def) => { P.modules[def.id] = def; if (!P.moduleOrder.includes(def.id)) P.moduleOrder.push(def.id); };
+
+  const ui = P.ui = {};
+  const layers = [];
+
+  P.shell = {
+    init() {
+      document.getElementById('app').classList.toggle('collapsed', !!P.ls.get('sidebar.collapsed', false));
+      window.addEventListener('scroll', P.throttle(() => { const t = $('.topbar'); if (t) t.classList.toggle('scrolled', window.scrollY > 4); }, 60), { passive: true });
+      P.api.onBusy((n) => { const b = $('#busy'); if (b) b.hidden = n === 0; });
+    },
+    update(screen) {
+      this.mod = screen.mod || 'home';
+      this.tab = screen.tab || '';
+      this.renderTop(screen); this.renderNav(); this.renderSide();
+    },
+    renderTop(screen) {
+      const top = $('#topbar'); if (!top) return;
+      const mod = P.modules[this.mod];
+      const unread = P.notify ? P.notify.count() : 0;
+      const bell = h`<button class="btn-icon" data-act="ui.notifications" aria-label="Notificações">${icon('bell')}${unread ? h`<span class="badge">${unread > 9 ? '9+' : unread}</span>` : ''}</button>`;
+      const isDesk = innerWidth >= 1024;
+      let left;
+      if (this.mod === 'home' && !isDesk) {
+        const nome = String(P.me.nome || '').split(' ')[0];
+        left = h`<button class="appbar grow" data-act="ui.go" data-to="cfg/perfil" style="text-align:left">${ui.avatar(P.me)}<span class="grow"><span class="hello">${ui.greeting()}</span><span class="name ellipsis" style="display:block">${nome || 'Bem-vindo'}</span></span></button>`;
+      } else if (isDesk) {
+        const title = screen.title ? (typeof screen.title === 'function' ? screen.title(screen._ctx || {}) : screen.title) : '';
+        left = h`<div class="grow row-sm" style="min-width:0"><span class="faint">${mod ? mod.name : 'Início'}</span>${title && mod && title !== mod.name ? h`${icon('chev-r', 'xs faint')}<b class="ellipsis">${title}</b>` : ''}</div>`;
+      } else {
+        left = h`<div class="grow"><button class="mod-switch" data-act="ui.modules" aria-label="Trocar de módulo"><span class="tile">${icon(mod ? mod.icon : 'home')}</span><span>${mod ? mod.name : 'Início'}</span>${icon('chev-d', 'chev')}</button></div>`;
+      }
+      top.innerHTML = P.toHtml(h`${left}
+        <span id="busy" class="spinner faint" hidden style="width:14px;height:14px"></span>
+        ${isDesk ? h`<button class="btn btn-ghost btn-sm" data-act="ui.palette" style="min-width:240px;justify-content:flex-start;color:var(--text-3)">${icon('search', 'sm')}Buscar ou executar<span class="kbd" style="margin-left:auto">Ctrl K</span></button>
+          <button class="btn-icon" data-act="ui.toggleTheme" aria-label="Alternar tema">${icon(P.theme.resolved() === 'dark' ? 'sun' : 'moon')}</button>` : h`<button class="btn-icon" data-act="ui.palette" aria-label="Buscar">${icon('search')}</button>`}
+        ${bell}
+        ${this.mod !== 'home' || isDesk ? h`<button class="btn-icon" data-act="ui.go" data-to="cfg/perfil" aria-label="Perfil">${ui.avatar(P.me, 'sm')}</button>` : ''}`);
+      $('#busy').hidden = !P.api.isBusy();
+    },
+    renderNav() {
+      const nav = $('#bottomnav'); if (!nav) return;
+      const mod = P.modules[this.mod];
+      let items;
+      if (!mod) {
+        items = [{ label: 'Início', icon: 'home', route: '', id: 'home' }, { label: 'Finanças', icon: 'wallet', route: 'fin', id: 'fin' }, null,
+          { label: 'Tarefas', icon: 'tasks', route: 'tar', id: 'tar' }, { label: 'Módulos', icon: 'grid', act: 'ui.modules', id: 'mods' }];
+      } else {
+        const t = mod.tabs;
+        items = [t[0], t[1], null, t[2], t[3]];
+      }
+      const active = mod ? this.tab : 'home';
+      nav.innerHTML = P.toHtml(items.map((it) => {
+        if (!it) return h`<div class="fab-slot"><button class="fab" data-act="ui.plus" aria-label="${mod && mod.plusLabel ? mod.plusLabel : 'Adicionar'}">${icon('plus')}</button></div>`;
+        const on = it.id === active || (it.more && mod && mod.more.some((m) => m.id === active));
+        if (it.more) return h`<button class="nav-item ${on ? 'active' : ''}" data-act="ui.more">${icon(it.icon || 'grid')}<span>${it.label}</span></button>`;
+        if (it.act) return h`<button class="nav-item" data-act="${it.act}">${icon(it.icon)}<span>${it.label}</span></button>`;
+        return h`<a class="nav-item ${on ? 'active' : ''}" href="#/${it.route}">${icon(it.icon)}<span>${it.label}</span></a>`;
+      }));
+    },
+    renderSide() {
+      const side = $('#sidebar'); if (!side) return;
+      const link = (route, ic, label, on) => h`<a class="nav-link ${on ? 'active' : ''}" href="#/${route}" title="${label}">${icon(ic)}<span class="label">${label}</span></a>`;
+      side.innerHTML = P.toHtml(h`
+        <div class="brand">${P.brand()}</div>
+        <button class="side-search" data-act="ui.palette">${icon('search', 'sm')}<span>Buscar</span><span class="kbd">Ctrl K</span></button>
+        ${link('', 'home', 'Início', this.mod === 'home')}
+        ${P.moduleOrder.filter((id) => !P.modules[id].hidden).map((id) => {
+          const m = P.modules[id], on = this.mod === id;
+          const subs = m.tabs.filter((t) => !t.more).concat(m.more || []);
+          return h`${link(m.home, m.icon, m.name, on)}${on ? h`<div class="nav-sub">${subs.map((s) => h`<a href="#/${s.route}" class="${s.id === this.tab ? 'active' : ''}">${s.label}</a>`)}</div>` : ''}`;
+        })}
+        <div class="side-foot">
+          ${link('cfg', 'settings', 'Configurações', this.mod === 'cfg')}
+          <button class="nav-link" data-act="ui.toggleSidebar">${icon('panel')}<span class="label">Recolher menu</span></button>
+        </div>`);
+    }
+  };
+
+  ui.greeting = () => { const hr = new Date().getHours(); return hr < 5 ? 'Boa noite' : hr < 12 ? 'Bom dia' : hr < 18 ? 'Boa tarde' : 'Boa noite'; };
+
+  // ================= Camadas: sheets e diálogos =================
+  function pushLayer(layer) {
+    layers.push(layer);
+    document.body.style.overflow = 'hidden';
+  }
+  function popLayer(layer, fromHistory) {
+    const i = layers.indexOf(layer);
+    if (i < 0) return;
+    layers.splice(i, 1);
+    layer.el.classList.remove('open');
+    setTimeout(() => layer.el.remove(), 260);
+    if (!layers.length) document.body.style.overflow = '';
+    if (layer.onClose) try { layer.onClose(); } catch (e) { /* noop */ }
+    if (!layers.length && P.router.pendingRefresh) { P.router.pendingRefresh = false; P.router.render(true); }
+  }
+  // Sem history.pushState/back: dentro do iframe do Apps Script o histórico é compartilhado com a página do Google
+  // e um back() atrasado desfazia a navegação feita a partir de um painel (o bug do "não troca de tela" no celular).
+  // Trocar de tela fecha os painéis abertos; o botão voltar do aparelho volta para a tela anterior.
+  window.addEventListener('hashchange', () => { while (layers.length) popLayer(layers[layers.length - 1]); });
+  ui.closeAll = () => { while (layers.length) popLayer(layers[layers.length - 1]); };
+  ui.topLayer = () => layers[layers.length - 1];
+
+  /**
+   * Abre um bottom sheet (mobile) / painel lateral (desktop).
+   * @param {{title:string, body:*, foot?:*, size?:'full'|'auto', wide?:boolean, onMount?:Function, onClose?:Function}} o
+   */
+  ui.sheet = (o) => {
+    const el = document.createElement('div');
+    el.className = 'layer';
+    el.innerHTML = P.toHtml(h`<div class="scrim" data-close></div>
+      <section class="sheet ${o.size === 'full' ? 'full' : ''} ${o.wide ? 'wide' : ''}" role="dialog" aria-modal="true" aria-label="${o.title || ''}">
+        <div class="sheet-grip"></div>
+        <header class="sheet-head"><h2 class="ellipsis">${o.title || ''}</h2>${o.headExtra || ''}<button class="btn-icon sm" data-close aria-label="Fechar">${icon('x')}</button></header>
+        <div class="sheet-body">${o.body || ''}</div>
+        ${o.foot ? h`<footer class="sheet-foot">${o.foot}</footer>` : ''}
+      </section>`);
+    document.getElementById('layers').appendChild(el);
+    const layer = { el, onClose: o.onClose };
+    const api = {
+      el, root: el.querySelector('.sheet'), body: el.querySelector('.sheet-body'),
+      close: () => popLayer(layer),
+      setBody: (html) => { api.body.innerHTML = P.toHtml(html); },
+      setFoot: (html) => { const f = el.querySelector('.sheet-foot'); if (f) f.innerHTML = P.toHtml(html); },
+      $: (s) => el.querySelector(s), $$: (s) => Array.from(el.querySelectorAll(s))
+    };
+    el.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) api.close(); });
+    pushLayer(layer);
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('open')));
+    // arrastar para fechar (mobile)
+    const grip = el.querySelector('.sheet-grip'), sheet = api.root;
+    let y0 = null;
+    const head = el.querySelector('.sheet-head');
+    [grip, head].forEach((g) => {
+      g.addEventListener('touchstart', (e) => { y0 = e.touches[0].clientY; sheet.style.transition = 'none'; }, { passive: true });
+      g.addEventListener('touchmove', (e) => { if (y0 === null) return; const dy = Math.max(0, e.touches[0].clientY - y0); sheet.style.transform = `translateY(${dy}px)`; }, { passive: true });
+      g.addEventListener('touchend', (e) => { if (y0 === null) return; const dy = e.changedTouches[0].clientY - y0; sheet.style.transition = ''; sheet.style.transform = ''; y0 = null; if (dy > 110) api.close(); });
+    });
+    if (o.onMount) { try { o.onMount(api); } catch (e) { console.error(e); P.reportError(e, 'sheet ' + o.title); } }
+    setTimeout(() => { const f = el.querySelector('[autofocus]'); if (f && innerWidth >= 640) f.focus(); }, 300);
+    return api;
+  };
+
+  /** Diálogo de confirmação. @return {Promise<boolean>} */
+  ui.confirm = (o) => new Promise((resolve) => {
+    const el = document.createElement('div');
+    el.className = 'layer';
+    el.innerHTML = P.toHtml(h`<div class="scrim" data-no></div><div class="dialog" role="alertdialog" aria-modal="true">
+      <h2>${o.title}</h2>${o.text ? h`<p>${o.text}</p>` : ''}
+      <div class="actions"><button class="btn btn-ghost" data-no>${o.cancel || 'Cancelar'}</button><button class="btn ${o.danger ? 'btn-danger' : 'btn-primary'}" data-yes>${o.ok || 'Confirmar'}</button></div></div>`);
+    document.getElementById('layers').appendChild(el);
+    const layer = { el, onClose: () => resolve(false) };
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-yes]')) { layer.onClose = null; popLayer(layer); resolve(true); }
+      else if (e.target.closest('[data-no]')) popLayer(layer);
+    });
+    pushLayer(layer);
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('open')));
+    setTimeout(() => { const b = el.querySelector('[data-yes]'); b && b.focus(); }, 50);
+  });
+
+  /** Toast com ação opcional "Desfazer". */
+  ui.toast = (msg, o = {}) => {
+    const box = document.getElementById('toasts'); if (!box) return { el: null, close() {}, set() {} };
+    const el = document.createElement('div');
+    el.className = 'toast' + (o.error ? ' err' : '');
+    el.setAttribute('role', o.error ? 'alert' : 'status');
+    el.innerHTML = P.toHtml(h`${icon(o.error ? 'alert' : (o.icon || 'check-circle'), 'sm')}<span class="grow">${msg}</span>${o.undo ? h`<button data-undo>${icon('undo', 'xs')} Desfazer</button>` : ''}${o.action ? h`<button data-action>${o.action.label}</button>` : ''}`);
+    box.appendChild(el);
+    const kill = () => { el.classList.add('out'); setTimeout(() => el.remove(), 220); };
+    const t = setTimeout(kill, o.duration || (o.undo ? 6000 : o.error ? 5500 : 3200));
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-undo]')) { clearTimeout(t); kill(); o.undo(); }
+      if (e.target.closest('[data-action]')) { clearTimeout(t); kill(); o.action.fn(); }
+    });
+    while (box.children.length > 3) box.firstElementChild.remove();
+    return { el, close: () => { clearTimeout(t); kill(); }, set: (m) => { const g = el.querySelector('.grow'); if (g) g.textContent = m; } };
+  };
+
+  // ================= Estados =================
+  const ILL = {
+    list: '<rect x="22" y="14" width="76" height="68" rx="10"/><path d="M36 34h36M36 48h48M36 62h28"/><circle class="acc" cx="92" cy="74" r="12"/><path class="acc" d="m87 74 4 4 7-8"/>',
+    money: '<rect x="14" y="26" width="92" height="52" rx="10"/><circle class="acc" cx="60" cy="52" r="12"/><path d="M28 40h8M84 64h8"/>',
+    chart: '<path d="M16 82h88"/><rect x="26" y="52" width="12" height="30" rx="4"/><rect x="46" y="38" width="12" height="44" rx="4"/><rect class="acc" x="66" y="22" width="12" height="60" rx="4"/><rect x="86" y="46" width="12" height="36" rx="4"/>',
+    target: '<circle cx="60" cy="50" r="34"/><circle cx="60" cy="50" r="20"/><circle class="acc" cx="60" cy="50" r="6"/><path class="acc" d="m60 50 34-34M86 16h8v8"/>',
+    calendar: '<rect x="20" y="18" width="80" height="66" rx="10"/><path d="M20 36h80M42 10v14M78 10v14"/><circle class="acc" cx="60" cy="60" r="9"/>',
+    dumbbell: '<path d="M30 50h60"/><rect x="18" y="34" width="12" height="32" rx="4"/><rect class="acc" x="90" y="34" width="12" height="32" rx="4"/><rect x="8" y="40" width="10" height="20" rx="3"/><rect x="102" y="40" width="10" height="20" rx="3"/>',
+    food: '<path d="M18 52h84a42 30 0 0 1-84 0Z"/><path class="acc" d="M46 40c0-8 6-10 6-18M62 40c0-8 6-10 6-18"/>',
+    file: '<path d="M38 10h30l18 18v56a6 6 0 0 1-6 6H38a6 6 0 0 1-6-6V16a6 6 0 0 1 6-6Z"/><path d="M68 10v18h18"/><path class="acc" d="M46 56h28M46 68h18"/>',
+    search: '<circle cx="54" cy="44" r="24"/><path class="acc" d="m72 62 22 22"/>',
+    check: '<circle cx="60" cy="48" r="34"/><path class="acc" d="m44 48 11 11 22-24"/>'
+  };
+  /** Estado vazio com ilustração de traço e ação. */
+  ui.empty = (o) => h`<div class="empty ${o.small ? 'sm' : ''}"><svg class="ill" viewBox="0 0 120 96">${raw(ILL[o.ill || 'list'])}</svg>
+    <h3>${o.title}</h3>${o.text ? h`<p>${o.text}</p>` : ''}
+    ${o.action ? h`<button class="btn ${o.small ? 'btn-ghost btn-sm' : 'btn-primary'}" data-act="${o.action.act}" ${raw(Object.entries(o.action.data || {}).map(([k, v]) => `data-${esc(k)}="${esc(v)}"`).join(' '))}>${icon(o.action.icon || 'plus', 'sm')}${o.action.label}</button>` : ''}</div>`;
+  ui.errorState = (msg, retry = 'ui.reload') => h`<div class="error-box mt-4"><h3>Não deu para carregar</h3><p class="muted mt-2">${msg || 'Tente novamente em instantes.'}</p><button class="btn btn-ghost mt-4" data-act="${retry}">${icon('refresh', 'sm')}Tentar novamente</button></div>`;
+  ui.skeleton = () => h`<div class="stack" aria-busy="true"><div class="skel" style="height:28px;width:45%"></div><div class="skel" style="height:44px"></div>
+    <div class="grid g2"><div class="skel" style="height:140px"></div><div class="skel" style="height:140px"></div></div><div class="skel" style="height:180px"></div><div class="skel" style="height:120px"></div></div>`;
+
+  // ================= Primitivos visuais =================
+  ui.avatar = (p, size = '') => {
+    const ini = String((p && p.nome) || '?').trim().split(/\s+/).slice(0, 2).map((x) => x[0]).join('').toUpperCase();
+    const url = p && p.foto_arquivo_id ? P.files.cached(p.foto_arquivo_id) : null;
+    if (p && p.foto_arquivo_id && !url) P.files.url(p.foto_arquivo_id).then((u) => { if (u) P.$$(`[data-avatar="${p.foto_arquivo_id}"]`).forEach((el) => { el.innerHTML = `<img alt="" src="${esc(u)}">`; }); }).catch(() => {});
+    return h`<span class="avatar ${size}" data-avatar="${(p && p.foto_arquivo_id) || ''}">${url ? h`<img alt="" src="${url}">` : ini}</span>`;
+  };
+
+  /** Anel de progresso SVG. */
+  ui.ring = (pct, o = {}) => {
+    const size = o.size || 76, sw = o.stroke || 8, r = (size - sw) / 2, c = 2 * Math.PI * r;
+    const p = P.clamp(+pct || 0, 0, 100), off = c * (1 - p / 100);
+    return h`<span class="ring" style="width:${size}px;height:${size}px">
+      <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><circle class="ring-track" cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke-width="${sw}"/>
+      <circle class="ring-val" cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="${o.color || 'var(--primary)'}" stroke-width="${sw}" stroke-linecap="round" stroke-dasharray="${c.toFixed(2)}" stroke-dashoffset="${off.toFixed(2)}"/></svg>
+      ${o.label !== undefined ? h`<span class="ring-label"><span><b style="${o.labelSize ? 'font-size:' + o.labelSize + 'px' : ''}">${o.label}</b>${o.sub ? h`<small>${o.sub}</small>` : ''}</span></span>` : (o.icon ? h`<span class="ring-label" style="color:${o.color || 'var(--primary)'}">${icon(o.icon)}</span>` : '')}</span>`;
+  };
+
+  /** Mini-barras arredondadas (barra atual em destaque e linha de meta). */
+  ui.bars = (values, o = {}) => {
+    const max = Math.max(o.goal || 0, ...values.map((v) => +v || 0), 1);
+    const height = o.height || 96;
+    return h`<div class="bars" style="height:${height}px">
+      ${o.goal ? h`<span class="goal" style="bottom:${(o.goal / max) * (height - 22) + 18}px"></span>` : ''}
+      ${values.map((v, i) => h`<div class="bar ${i === o.hi ? 'hi' : ''} ${!v ? 'zero' : ''}" title="${o.titles ? o.titles[i] : ''}"><i style="height:${Math.max(4, ((+v || 0) / max) * (height - 22))}px"></i>${o.labels ? h`<span>${o.labels[i]}</span>` : ''}</div>`)}</div>`;
+  };
+
+  ui.spark = (values, o = {}) => {
+    const w = o.w || 120, hh = o.h || 36, v = values.filter((x) => x !== null && x !== undefined);
+    if (v.length < 2) return '';
+    const min = Math.min(...v), max = Math.max(...v), rng = max - min || 1;
+    const pts = v.map((x, i) => `${(i / (v.length - 1)) * w},${hh - 3 - ((x - min) / rng) * (hh - 6)}`);
+    return h`<svg width="${w}" height="${hh}" viewBox="0 0 ${w} ${hh}" style="overflow:visible"><polyline points="${pts.join(' ')}" fill="none" stroke="${o.color || 'var(--primary)'}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="${pts[pts.length - 1].split(',')[0]}" cy="${pts[pts.length - 1].split(',')[1]}" r="3" fill="${o.color || 'var(--primary)'}"/></svg>`;
+  };
+
+  ui.progress = (pct, o = {}) => {
+    const p = +pct || 0;
+    const cls = o.cls || (o.alerts ? (p >= 100 ? 'over' : p >= 80 ? 'warn' : '') : '');
+    return h`<div class="progress ${cls} ${o.size || ''}" role="progressbar" aria-valuenow="${Math.round(p)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${P.clamp(p, 0, 100)}%;${o.color ? 'background:' + o.color : ''}"></i></div>`;
+  };
+
+  /** Medidor semicircular (limite do cartão). */
+  ui.gauge = (pct, o = {}) => {
+    const p = P.clamp(+pct || 0, 0, 100), r = 70, c = Math.PI * r, off = c * (1 - p / 100);
+    const color = p >= 90 ? 'var(--danger)' : p >= 75 ? 'var(--c4)' : 'var(--primary)';
+    return h`<svg class="gauge" viewBox="0 0 180 104" width="${o.w || 180}"><path d="M20 94a70 70 0 0 1 140 0" fill="none" stroke="var(--track)" stroke-width="14" stroke-linecap="round"/>
+      <path d="M20 94a70 70 0 0 1 140 0" fill="none" stroke="${color}" stroke-width="14" stroke-linecap="round" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" style="transition:stroke-dashoffset .6s var(--ease)"/>
+      <text x="90" y="80" text-anchor="middle" font-size="26" font-weight="800" fill="var(--text)">${Math.round(p)}%</text><text x="90" y="98" text-anchor="middle" font-size="11" fill="var(--text-3)">${o.label || 'usado'}</text></svg>`;
+  };
+
+  /** Heatmap de calendário (colunas = semanas). cells: [{date, v}] com v 0..4 */
+  ui.scrollHeat = (root = document) => P.$$('.heat', root).forEach((el) => { el.scrollLeft = el.scrollWidth; });
+  ui.heat = (cells, o = {}) => h`<div class="heat" aria-label="${o.label || 'Mapa de calor'}">${cells.map((c) => h`<i class="${c.v ? 'l' + c.v : ''}" title="${c.title || fmt.date(c.date)}"></i>`)}</div>`;
+
+  ui.delta = (cur, prev, o = {}) => {
+    if (!prev || !Number.isFinite(cur / prev)) return o.empty !== undefined ? o.empty : '';
+    const pct = ((cur - prev) / Math.abs(prev)) * 100;
+    if (Math.abs(pct) < 0.5) return h`<span class="chip">estável</span>`;
+    const up = pct > 0, good = o.invert ? !up : up;
+    return h`<span class="chip ${good ? 'up' : 'down'}">${icon(up ? 'up' : 'down')}${fmt.pct(Math.abs(pct))}</span>`;
+  };
+
+  ui.metric = (o) => h`<div class="metric"><div class="label">${o.icon ? icon(o.icon, 'sm') : ''}${o.label}</div>
+    <div class="value ${o.size || ''} num ${o.cls || ''}" ${o.count !== undefined ? raw(`data-count="${esc(o.count)}" data-fmt="${esc(o.fmt || 'num')}"`) : ''}>${o.value}${o.unit ? h`<span class="unit">${o.unit}</span>` : ''}</div>
+    ${o.sub ? h`<div class="sub">${o.sub}</div>` : ''}</div>`;
+
+  /** Controle segmentado em pill. */
+  ui.seg = (options, value, act, extra = {}) => h`<div class="seg ${extra.cls || ''}" role="tablist">${options.map(([v, l]) => h`<button type="button" role="tab" aria-selected="${v === value}" class="${v === value ? 'on' : ''}" data-act="${act}" data-v="${v}" ${raw(Object.entries(extra.data || {}).map(([k, x]) => `data-${esc(k)}="${esc(x)}"`).join(' '))}>${l}</button>`)}</div>`;
+
+  ui.chips = (options, value, act) => h`<div class="chips">${options.map(([v, l, ic]) => h`<button type="button" class="fchip ${v === value ? 'on' : ''}" data-act="${act}" data-v="${v}">${ic ? icon(ic, 'xs') : ''}${l}</button>`)}</div>`;
+
+  /** Faixa de 7 dias (semana do dia selecionado). */
+  ui.datestrip = (selected, act, o = {}) => {
+    const ws = +P.settings.get('geral.inicio_semana', P.me.inicio_semana || 0);
+    const start = D.weekStart(selected, ws), today = D.today();
+    const days = Array.from({ length: 7 }, (_, i) => D.add(start, i));
+    return h`<div class="row-sm" style="justify-content:space-between;margin-top:var(--s-2)">
+      <button class="btn-icon sm" data-act="${act}" data-v="${D.add(selected, -7)}" aria-label="Semana anterior">${icon('chev-l', 'sm')}</button>
+      <b style="font-size:14px">${fmt.monthCap(D.month(selected))}</b>
+      <button class="btn-icon sm" data-act="${act}" data-v="${D.add(selected, 7)}" aria-label="Próxima semana">${icon('chev-r', 'sm')}</button></div>
+      <div class="datestrip">${days.map((d) => { const dt = D.parse(d); return h`<button class="${d === selected ? 'on' : ''} ${d === today ? 'today' : ''}" data-act="${act}" data-v="${d}" aria-label="${fmt.dayLong(d)}"><span>${fmt.WD[dt.getDay()]}</span><b>${dt.getDate()}</b>${o.marks && o.marks.has(d) ? h`<span class="mk"></span>` : ''}</button>`; })}</div>`;
+  };
+
+  /** Calendário mensal. renderDay(date) → {dots:[cores], amt:string} */
+  ui.monthCal = (key, o = {}) => {
+    const ws = +P.settings.get('geral.inicio_semana', P.me.inicio_semana || 0);
+    const first = key + '-01', start = D.weekStart(first, ws), today = D.today();
+    const cells = Array.from({ length: 42 }, (_, i) => D.add(start, i));
+    const lastNeeded = cells.findIndex((c, i) => i % 7 === 0 && D.month(c) > key);
+    const use = lastNeeded > 0 ? cells.slice(0, lastNeeded) : cells;
+    const dows = Array.from({ length: 7 }, (_, i) => fmt.WD[(ws + i) % 7]);
+    return h`<div class="cal">${dows.map((w) => h`<div class="dow">${w}</div>`)}${use.map((c) => {
+      const info = o.renderDay ? o.renderDay(c) || {} : {};
+      return h`<button class="day ${D.month(c) !== key ? 'out' : ''} ${c === today ? 'today' : ''} ${c === o.selected ? 'sel' : ''}" data-act="${o.act || ''}" data-v="${c}">${D.parse(c).getDate()}
+        ${info.dots && info.dots.length ? h`<span class="dots">${info.dots.slice(0, 4).map((col) => h`<i style="background:${col}"></i>`)}</span>` : ''}${info.amt ? h`<span class="amt">${info.amt}</span>` : ''}</button>`;
+    })}</div>`;
+  };
+
+  /** Contagem animada curta nos números grandes ([data-count]). */
+  ui.countUp = (root) => {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    $$('[data-count]', root).forEach((el) => {
+      const target = +el.dataset.count, f = el.dataset.fmt, unit = el.querySelector('.unit');
+      if (!Number.isFinite(target) || el.dataset.done) return;
+      el.dataset.done = 1;
+      const unitHtml = unit ? unit.outerHTML : '';
+      const render = (v) => { el.innerHTML = esc(f === 'money' ? fmt.money(v) : f === 'dec1' ? fmt.num(v, 1) : fmt.num(v)) + unitHtml; };
+      const t0 = performance.now(), dur = 420;
+      const step = (t) => { const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3); render(target * e); if (k < 1) requestAnimationFrame(step); else render(target); };
+      requestAnimationFrame(step);
+    });
+  };
+
+  /** Swipe horizontal em itens de lista (mobile). handlers: {right:(el)=>, left:(el)=>} */
+  ui.bindSwipe = (root, sel, handlers) => {
+    $$(sel, root).forEach((wrap) => {
+      const body = wrap.querySelector('.swipe-body'); if (!body) return;
+      let x0 = null, y0 = 0, dx = 0, lock = null;
+      body.addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; dx = 0; lock = null; body.style.transition = 'none'; }, { passive: true });
+      body.addEventListener('touchmove', (e) => {
+        if (x0 === null) return;
+        const mx = e.touches[0].clientX - x0, my = e.touches[0].clientY - y0;
+        if (lock === null) lock = Math.abs(mx) > Math.abs(my) + 4 ? 'x' : (Math.abs(my) > 6 ? 'y' : null);
+        if (lock !== 'x') return;
+        dx = Math.max(-120, Math.min(120, mx));
+        if ((dx > 0 && !handlers.right) || (dx < 0 && !handlers.left)) dx = 0;
+        body.style.transform = `translateX(${dx}px)`;
+      }, { passive: true });
+      body.addEventListener('touchend', () => {
+        body.style.transition = ''; body.style.transform = '';
+        if (lock === 'x' && Math.abs(dx) > 80) { if (dx > 0 && handlers.right) handlers.right(wrap); else if (dx < 0 && handlers.left) handlers.left(wrap); if (navigator.vibrate) navigator.vibrate(12); }
+        x0 = null;
+      });
+    });
+  };
+
+  // ================= Formulários =================
+  /**
+   * Campos declarativos.
+   * f: {k, l, t, req, opts, ph, hint, half, min, max, step, unit, prefix, rows, show(values)}
+   * t: text | textarea | money | num | int | date | time | select | seg | toggle | color | email
+   */
+  P.form = {
+    html(fields, v = {}) {
+      return h`<div class="form-row">${fields.map((f) => {
+        if (f.show && !f.show(v)) return h`<div class="field full" data-k="${f.k}" hidden></div>`;
+        return this.field(f, v[f.k], v);
+      })}</div>`;
+    },
+    opts(f, values) { return typeof f.opts === 'function' ? f.opts(values) : (f.opts || []); },
+    field(f, val, all = {}) {
+      const id = 'f_' + f.k, cls = 'field' + (f.half ? '' : ' full');
+      const lbl = h`<label for="${id}">${f.l}${f.req || f.ro || f.t === 'toggle' || f.t === 'seg' ? '' : h` <span class="faint">(opcional)</span>`}</label>`;
+      const req = f.req ? raw('required') : '';
+      const common = raw(`id="${esc(id)}" name="${esc(f.k)}" data-k="${esc(f.k)}"`);
+      let input;
+      switch (f.t) {
+        case 'textarea': input = h`<textarea class="input" ${common} rows="${f.rows || 3}" placeholder="${f.ph || ''}" maxlength="${f.max || 4000}">${val ?? ''}</textarea>`; break;
+        case 'money': input = h`<div class="input-wrap"><span class="prefix">R$</span><input class="input num" ${common} inputmode="decimal" autocomplete="off" data-money placeholder="0,00" value="${val === null || val === undefined || val === '' ? '' : fmt.num(val, 2)}"></div>`; break;
+        case 'num': case 'int': input = h`<div class="input-wrap"><input class="input num" ${common} inputmode="${f.t === 'int' ? 'numeric' : 'decimal'}" autocomplete="off" placeholder="${f.ph || ''}" value="${val === null || val === undefined ? '' : (f.t === 'int' ? val : String(val).replace('.', ','))}">${f.unit ? h`<span class="suffix">${f.unit}</span>` : ''}</div>`; break;
+        case 'date': input = h`<input class="input" type="date" ${common} value="${val || ''}" ${req}>`; break;
+        case 'time': input = h`<input class="input" type="time" ${common} value="${val || ''}">`; break;
+        case 'select': {
+          const opts = this.opts(f, all);
+          const renderOpt = (o) => h`<option value="${o[0]}" ${String(o[0]) === String(val ?? '') ? raw('selected') : ''}>${o[1]}</option>`;
+          input = h`<select class="input" ${common}>${f.req ? '' : h`<option value="">${f.ph || 'Nenhum'}</option>`}${opts.map((o) => o.group ? h`<optgroup label="${o.group}">${o.items.map(renderOpt)}</optgroup>` : renderOpt(o))}</select>`;
+          break;
+        }
+        case 'seg': input = h`<div class="seg sm" data-seg="${f.k}">${this.opts(f, all).map(([v, l]) => h`<button type="button" class="${String(v) === String(val ?? f.def ?? '') ? 'on' : ''}" data-v="${v}">${l}</button>`)}</div><input type="hidden" ${common} value="${val ?? f.def ?? ''}">`; break;
+        case 'toggle': return h`<div class="${cls}" style="flex-direction:row;align-items:center;justify-content:space-between;gap:12px"><span><span class="label" style="font-size:14px;color:var(--text);font-weight:600">${f.l}</span>${f.hint ? h`<span class="hint" style="display:block">${f.hint}</span>` : ''}</span><label class="toggle"><input type="checkbox" ${common} ${val ? raw('checked') : ''}><span></span></label></div>`;
+        case 'color': input = h`<div class="swatches" data-swatches="${f.k}">${P.PALETTE.map((c) => h`<button type="button" class="swatch ${c === (val || f.def) ? 'on' : ''}" style="background:${c}" data-v="${c}" aria-label="Cor ${c}"></button>`)}</div><input type="hidden" ${common} value="${val || f.def || ''}">`; break;
+        case 'days': {
+          const sel = String(val ?? '').split(',').filter(Boolean);
+          input = h`<div class="row-sm wrap" data-days="${f.k}">${fmt.WD.map((w, i) => h`<button type="button" class="fchip ${sel.includes(String(i)) ? 'on' : ''}" data-v="${i}" style="min-width:48px;justify-content:center">${w}</button>`)}</div><input type="hidden" ${common} value="${sel.join(',')}">`;
+          break;
+        }
+        default: input = h`<input class="input" type="${f.t === 'email' ? 'email' : 'text'}" ${common} value="${val ?? ''}" placeholder="${f.ph || ''}" maxlength="${f.max || 200}" autocomplete="off" ${f.focus ? raw('autofocus') : ''} ${f.ro ? raw('readonly tabindex="-1" style="opacity:.7"') : ''}>`;
+      }
+      return h`<div class="${cls}" data-field="${f.k}">${lbl}${input}${f.hint ? h`<span class="hint">${f.hint}</span>` : ''}<span class="err"></span></div>`;
+    },
+    /** Liga máscaras e controles do formulário dentro de root. onChange(values) para campos condicionais. */
+    bind(root, fields, onChange) {
+      $$('[data-money]', root).forEach((inp) => inp.addEventListener('input', () => {
+        const digits = inp.value.replace(/\D/g, '').replace(/^0+/, '').slice(0, 12);
+        inp.value = digits ? fmt.num(+digits / 100, 2) : '';
+      }));
+      $$('[data-seg]', root).forEach((seg) => seg.addEventListener('click', (e) => {
+        const b = e.target.closest('button'); if (!b) return;
+        $$('button', seg).forEach((x) => x.classList.toggle('on', x === b));
+        const hid = seg.parentElement.querySelector('input[type=hidden]'); hid.value = b.dataset.v;
+        hid.dispatchEvent(new Event('change', { bubbles: true }));
+      }));
+      $$('[data-swatches]', root).forEach((sw) => sw.addEventListener('click', (e) => {
+        const b = e.target.closest('button'); if (!b) return;
+        $$('button', sw).forEach((x) => x.classList.toggle('on', x === b));
+        sw.parentElement.querySelector('input[type=hidden]').value = b.dataset.v;
+      }));
+      $$('[data-days]', root).forEach((box) => box.addEventListener('click', (e) => {
+        const b = e.target.closest('button'); if (!b) return;
+        b.classList.toggle('on');
+        box.parentElement.querySelector('input[type=hidden]').value = $$('button.on', box).map((x) => x.dataset.v).join(',');
+      }));
+      if (onChange && fields) root.addEventListener('change', () => onChange(this.read(root, fields, { silent: true }).values));
+    },
+    /** Lê e valida. @return {{ok:boolean, values:Object}} */
+    read(root, fields, o = {}) {
+      const values = {}; let firstBad = null;
+      fields.forEach((f) => {
+        const wrap = root.querySelector(`[data-field="${f.k}"]`);
+        const el = root.querySelector(`[data-k="${f.k}"]:not(div)`);
+        if (!el) { values[f.k] = undefined; return; }
+        let v = el.type === 'checkbox' ? el.checked : el.value;
+        if (f.t === 'money' || f.t === 'num') v = v === '' ? null : P.parseNum(v);
+        else if (f.t === 'int') v = v === '' ? null : Math.round(P.parseNum(v));
+        else if (typeof v === 'string') v = v.trim() === '' ? null : v.trim();
+        values[f.k] = v;
+        if (o.silent || !wrap) return;
+        let err = '';
+        if (f.req && (v === null || v === '' || (f.t === 'money' && !v))) err = f.reqMsg || (f.t === 'select' ? 'Escolha uma opção.' : 'Campo obrigatório.');
+        else if ((f.t === 'num' || f.t === 'int' || f.t === 'money') && v !== null && !Number.isFinite(v)) err = 'Número inválido.';
+        else if (f.min !== undefined && v !== null && v < f.min) err = `Mínimo ${fmt.numSmart(f.min)}.`;
+        else if (f.max !== undefined && v !== null && (f.t === 'num' || f.t === 'int' || f.t === 'money') && v > f.max) err = `Máximo ${fmt.numSmart(f.max)}.`;
+        else if (f.validate) err = f.validate(v, values) || '';
+        wrap.classList.toggle('invalid', !!err);
+        const e = wrap.querySelector('.err'); if (e) e.textContent = err;
+        if (err && !firstBad) firstBad = el;
+      });
+      if (firstBad && !o.silent) { firstBad.focus({ preventScroll: true }); firstBad.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+      return { ok: !firstBad, values };
+    },
+    /** Mostra erro de validação vindo do servidor no campo certo. */
+    serverError(root, err) {
+      if (err && err.field) {
+        const wrap = root.querySelector(`[data-field="${err.field}"]`);
+        if (wrap) { wrap.classList.add('invalid'); wrap.querySelector('.err').textContent = err.message; return true; }
+      }
+      return false;
+    }
+  };
+
+  /**
+   * Formulário CRUD genérico num sheet.
+   * @param {{table:string, row?:Object, title:string, fields:Object[], defaults?:Object, beforeSave?:Function, afterSave?:Function, onDelete?:Function, deleteLabel?:string, extra?:*}} o
+   */
+  ui.editSheet = (o) => {
+    const isNew = !o.row || !o.row.id;
+    const values = { ...(o.defaults || {}), ...(o.row || {}) };
+    const s = ui.sheet({
+      title: o.title, size: o.size,
+      body: h`<form class="form" novalidate>${P.form.html(o.fields, values)}${o.extra || ''}</form>`,
+      foot: h`${!isNew && o.deletable !== false ? h`<button class="btn btn-danger" data-del style="flex:0 0 auto">${icon('trash', 'sm')}</button>` : ''}<button class="btn btn-primary" data-save>${isNew ? (o.createLabel || 'Salvar') : 'Salvar alterações'}</button>`,
+      onMount(sh) {
+        const form = sh.$('form');
+        const rerender = (vals) => {
+          o.fields.forEach((f) => {
+            if (!f.show) return;
+            const slot = form.querySelector(`[data-field="${f.k}"], [data-k="${f.k}"][hidden]`);
+            const visible = f.show(vals);
+            if (!slot) return;
+            const isHidden = slot.hasAttribute('hidden');
+            if (visible && isHidden) { const tmp = document.createElement('div'); tmp.innerHTML = P.toHtml(P.form.field(f, vals[f.k], vals)); slot.replaceWith(tmp.firstElementChild); P.form.bind(form.querySelector(`[data-field="${f.k}"]`), null); }
+            else if (!visible && !isHidden) { const ph = document.createElement('div'); ph.className = 'field full'; ph.dataset.k = f.k; ph.hidden = true; slot.replaceWith(ph); }
+          });
+          if (o.onChange) o.onChange(vals, sh);
+        };
+        P.form.bind(form, o.fields, rerender);
+        form.addEventListener('submit', (e) => { e.preventDefault(); sh.$('[data-save]').click(); });
+        sh.$('[data-save]').addEventListener('click', async () => {
+          const r = P.form.read(form, o.fields);
+          if (!r.ok) return;
+          // Novos registros levam os valores-padrão que não viram campo (ex.: meta_id do check-in).
+          let row = { ...(isNew ? o.defaults || {} : {}), ...(o.row || {}), ...r.values };
+          const extras = {};
+          Object.keys(row).forEach((k) => { if (k.startsWith('_')) { extras[k] = row[k]; delete row[k]; } });
+          if (o.beforeSave) { row = await o.beforeSave(row, sh); if (!row) return; }
+          const btn = sh.$('[data-save]'); btn.classList.add('loading');
+          try {
+            const saved = o.save ? await o.save(row, sh) : await P.store.save(o.table, row, { silentError: true });
+            sh.close();
+            P.ui.toast(o.savedMsg || (isNew ? 'Salvo' : 'Alterações salvas'));
+            if (o.afterSave) o.afterSave(saved, extras);
+          } catch (e) {
+            btn.classList.remove('loading');
+            if (!P.form.serverError(form, e)) P.ui.toast(e.message, { error: true });
+          }
+        });
+        const del = sh.$('[data-del]');
+        if (del) del.addEventListener('click', async () => {
+          const ok = await ui.confirm({ title: o.deleteTitle || 'Excluir?', text: o.deleteText || 'Você pode desfazer logo em seguida.', ok: 'Excluir', danger: true });
+          if (!ok) return;
+          sh.close();
+          if (o.onDelete) o.onDelete(o.row); else P.store.remove(o.table, o.row.id, { label: o.deleteLabel || 'Excluído' });
+        });
+        if (o.mount) o.mount(sh);
+      }
+    });
+    return s;
+  };
+
+  /** Menu de ações (sheet curto). items: [{label, icon, act:fn, danger}] */
+  ui.menu = (title, items) => {
+    const s = ui.sheet({
+      title, body: h`<div class="list">${items.filter(Boolean).map((it, i) => h`<button class="li tap" data-i="${i}" style="width:100%;text-align:left;${it.danger ? 'color:var(--danger)' : ''}"><span class="tile sm">${icon(it.icon || 'chev-r', 'sm')}</span><span class="main"><span class="t">${it.label}</span>${it.sub ? h`<span class="s">${it.sub}</span>` : ''}</span></button>`)}</div>`,
+      onMount(sh) { sh.body.addEventListener('click', (e) => { const b = e.target.closest('[data-i]'); if (!b) return; const it = items.filter(Boolean)[+b.dataset.i]; sh.close(); setTimeout(() => it.act(), 50); }); }
+    });
+    return s;
+  };
+
+  // ================= Arquivos (upload com compressão, cache de imagens) =================
+  P.files = (function () {
+    const urls = new Map();
+    const F = {
+      cached: (id) => urls.get(id) || null,
+      async url(id, thumb) {
+        if (urls.has(id)) return urls.get(id);
+        const r = await P.api.call('files.data', { id, thumb: !!thumb }, { ttl: 3600e3 });
+        if (r.url) urls.set(id, r.url);
+        return r.url;
+      },
+      /** Abre o seletor de arquivo. */
+      pick(o = {}) {
+        return new Promise((resolve) => {
+          const inp = document.createElement('input');
+          inp.type = 'file'; inp.accept = o.accept || 'image/\u002A,application/pdf';
+          if (o.capture) inp.setAttribute('capture', 'environment');
+          if (o.multiple) inp.multiple = true;
+          inp.style.display = 'none';
+          inp.addEventListener('change', () => { resolve(o.multiple ? Array.from(inp.files) : inp.files[0] || null); inp.remove(); });
+          document.body.appendChild(inp); inp.click();
+        });
+      },
+      readDataUrl: (file) => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(new Error('Não foi possível ler o arquivo.')); fr.readAsDataURL(file); }),
+      readText: (file) => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(new Error('Não foi possível ler o arquivo.')); fr.readAsText(file, 'utf-8'); }),
+      /** Comprime imagem (máx. lado, JPEG ~0,82, corrige orientação EXIF). square: recorte central quadrado. ocr: escala de cinza + contraste. */
+      async compress(file, o = {}) {
+        if (!/^image\//.test(file.type) || /gif|svg/.test(file.type)) return { dataUrl: await F.readDataUrl(file), mime: file.type, name: file.name };
+        const max = o.max || 1600;
+        let bmp;
+        try { bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }); }
+        catch (e) { const img = new Image(); img.src = await F.readDataUrl(file); await img.decode(); bmp = img; }
+        let sw = bmp.width, sh = bmp.height, sx = 0, sy = 0;
+        if (o.square) { const m = Math.min(sw, sh); sx = (sw - m) / 2; sy = (sh - m) / 2; sw = sh = m; }
+        const k = Math.min(1, max / Math.max(sw, sh));
+        const c = document.createElement('canvas'); c.width = Math.round(sw * k); c.height = Math.round(sh * k);
+        const ctx = c.getContext('2d');
+        if (o.ocr) ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.05)';
+        ctx.drawImage(bmp, sx, sy, sw, sh, 0, 0, c.width, c.height);
+        const dataUrl = c.toDataURL('image/jpeg', o.quality || 0.82);
+        return { dataUrl, mime: 'image/jpeg', name: (file.name || 'foto').replace(/\.\w+$/, '') + '.jpg' };
+      },
+      /** Envia ao Drive. meta: {tipo, modulo, entidade, entidade_id}. @return arquivo */
+      async upload(file, meta = {}, o = {}) {
+        const c = o.prepared || await F.compress(file, o);
+        const base64 = c.dataUrl.split(',')[1];
+        if (base64.length * 0.75 > 10 * 1024 * 1024) throw new Error('Arquivo acima de 10 MB.');
+        const res = await P.store.route('files.upload', { nome: c.name, mime: c.mime, base64, ...meta });
+        if (res.arquivo) { P.store.put('arquivos', res.arquivo); if (/^image\//.test(c.mime)) urls.set(res.arquivo.id, c.dataUrl); }
+        return res.arquivo;
+      }
+    };
+    return F;
+  })();
+
+  // ================= Paleta de comandos (Ctrl+K) =================
+  ui.palette = () => {
+    const el = document.createElement('div');
+    el.className = 'layer';
+    el.innerHTML = P.toHtml(h`<div class="scrim" data-close></div><div class="palette" role="dialog" aria-label="Buscar">
+      <div class="search">${icon('search')}<input class="input" placeholder="Buscar lançamentos, tarefas, alimentos, metas…" autocomplete="off" aria-label="Buscar"></div>
+      <div class="results"></div></div>`);
+    document.getElementById('layers').appendChild(el);
+    const layer = { el };
+    pushLayer(layer);
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('open')));
+    const input = el.querySelector('input'), box = el.querySelector('.results');
+    let items = [], sel = 0;
+    const draw = () => {
+      box.innerHTML = P.toHtml(items.length ? items.map((it, i) => h`<div class="res ${i === sel ? 'on' : ''}" data-i="${i}"><span class="tile sm">${icon(it.icon || 'chev-r', 'sm')}</span><span class="grow ellipsis"><b>${it.title}</b>${it.sub ? h` <span class="faint">· ${it.sub}</span>` : ''}</span><small>${it.kind || ''}</small></div>`) : h`<div class="empty sm"><p>Nada encontrado para essa busca.</p></div>`);
+    };
+    const run = (it) => { popLayer(layer); setTimeout(() => it.run(), 60); };
+    const update = () => { items = P.search ? P.search.query(input.value) : []; sel = 0; draw(); };
+    input.addEventListener('input', P.debounce(update, 120));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown') { sel = Math.min(items.length - 1, sel + 1); draw(); e.preventDefault(); }
+      else if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); }
+      else if (e.key === 'Enter' && items[sel]) run(items[sel]);
+      else if (e.key === 'Escape') popLayer(layer);
+    });
+    box.addEventListener('click', (e) => { const r = e.target.closest('[data-i]'); if (r) run(items[+r.dataset.i]); });
+    el.addEventListener('click', (e) => { if (e.target.matches('[data-close]')) popLayer(layer); });
+    update();
+    setTimeout(() => input.focus(), 40);
+  };
+
+  // ================= Bloqueio por PIN =================
+  ui.lock = () => {
+    if (!P.me.tem_pin || document.querySelector('.lock')) return;
+    const el = document.createElement('div');
+    el.className = 'lock';
+    let pin = '';
+    const draw = () => {
+      el.innerHTML = P.toHtml(h`<span class="logo-tile" style="width:56px;height:56px">${P.logo({ tile: true })}</span>
+        <div style="text-align:center"><h2>Digite seu PIN</h2><p class="muted mt-2">O Prumo foi bloqueado por inatividade.</p></div>
+        <div class="pin-dots">${[0, 1, 2, 3, 4, 5].slice(0, Math.max(4, pin.length)).map((i) => h`<i class="${i < pin.length ? 'on' : ''}"></i>`)}</div>
+        <div class="pin-pad">${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => h`<button data-n="${n}">${n}</button>`)}<button data-back aria-label="Apagar">${icon('chev-l')}</button><button data-n="0">0</button><button data-ok aria-label="Entrar">${icon('check')}</button></div>`);
+    };
+    const submit = async () => {
+      if (pin.length < 4) return;
+      try {
+        const r = await P.api.call('auth.verifyPin', { pin });
+        if (r.ok) { el.remove(); P.lastActive = Date.now(); }
+        else { pin = ''; draw(); el.querySelector('.pin-dots').classList.add('shake'); }
+      } catch (e) { P.ui.toast(e.message, { error: true }); }
+    };
+    el.addEventListener('click', (e) => {
+      const n = e.target.closest('[data-n]');
+      if (n && pin.length < 6) { pin += n.dataset.n; draw(); if (pin.length === 6) submit(); }
+      if (e.target.closest('[data-back]')) { pin = pin.slice(0, -1); draw(); }
+      if (e.target.closest('[data-ok]')) submit();
+    });
+    document.addEventListener('keydown', function onKey(e) {
+      if (!document.body.contains(el)) { document.removeEventListener('keydown', onKey); return; }
+      if (/^\d$/.test(e.key) && pin.length < 6) { pin += e.key; draw(); }
+      else if (e.key === 'Backspace') { pin = pin.slice(0, -1); draw(); }
+      else if (e.key === 'Enter') submit();
+    });
+    draw();
+    document.body.appendChild(el);
+  };
+
+  // ================= Ações globais de UI =================
+  Object.assign(P.act, {
+    'ui.go': (el) => P.router.go(el.dataset.to || ''),
+    'ui.reload': () => location.reload(),
+    'ui.palette': () => ui.palette(),
+    'ui.toggleTheme': () => { const next = P.theme.resolved() === 'dark' ? 'light' : 'dark'; P.theme.apply(next); P.shell.renderTop(P.router.current() || {}); P.api.call('profile.save', { profile: { tema: next } }, { mutation: true }).then((r) => { P.me = r.profile; }).catch(() => {}); },
+    'ui.toggleSidebar': () => { const app = document.getElementById('app'); app.classList.toggle('collapsed'); P.ls.set('sidebar.collapsed', app.classList.contains('collapsed')); },
+    'ui.plus': () => { const m = P.modules[P.shell.mod]; if (m && m.plus) m.plus(); else P.quickAdd(); },
+    'ui.more': () => {
+      const m = P.modules[P.shell.mod]; if (!m) return;
+      ui.menu(m.name, m.more.map((it) => ({ label: it.label, icon: it.icon, sub: it.sub, act: () => P.router.go(it.route) })));
+    },
+    'ui.modules': () => {
+      const s = ui.sheet({
+        title: 'Módulos',
+        body: h`<div class="grid g2">${[{ id: 'home', name: 'Início', icon: 'home', home: '' }].concat(P.moduleOrder.map((id) => P.modules[id]).filter((m) => !m.hidden)).concat([{ id: 'cfg', name: 'Configurações', icon: 'settings', home: 'cfg' }]).map((m) => h`
+          <a class="card link" href="#/${m.home}" data-close style="display:flex;flex-direction:column;gap:10px;${P.shell.mod === m.id ? 'border-color:var(--primary)' : ''}"><span class="tile" style="background:var(--primary-tint);color:var(--primary-ink)">${icon(m.icon)}</span><b>${m.name}</b>${m.blurb ? h`<span class="muted" style="font-size:12.5px">${m.blurb()}</span>` : ''}</a>`)}</div>`
+      });
+      return s;
+    },
+    'ui.notifications': () => P.notify && P.notify.open()
+  });
+
+  /** "+" do Início: atalhos de criação em todos os módulos. */
+  P.quickAdd = () => {
+    ui.menu('Adicionar', P.moduleOrder.map((id) => P.modules[id]).filter((m) => m.plus && !m.hidden).map((m) => ({ label: m.plusLabel, icon: m.icon, act: m.plus })));
+  };
+
+  // ================= Atalhos de teclado (desktop) =================
+  let gPending = false;
+  document.addEventListener('keydown', (e) => {
+    const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement && document.activeElement.tagName);
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); ui.palette(); return; }
+    if (e.key === 'Escape' && layers.length) { popLayer(layers[layers.length - 1]); return; }
+    if (typing || e.ctrlKey || e.metaKey || e.altKey || layers.length) return;
+    if (gPending) {
+      gPending = false;
+      const map = { i: '', f: 'fin', t: 'tar', a: 'nut', e: 'fit', m: 'met', r: 'rot', c: 'cfg' };
+      if (e.key in map) { P.router.go(map[e.key]); e.preventDefault(); }
+      return;
+    }
+    if (e.key === 'g') { gPending = true; setTimeout(() => { gPending = false; }, 900); return; }
+    if (e.key === '/') { e.preventDefault(); ui.palette(); }
+    else if (e.key === 'n') { e.preventDefault(); P.act['ui.plus'](); }
+    else if (e.key === '?') {
+      ui.sheet({ title: 'Atalhos de teclado', body: h`<div class="stack-sm">${[['Ctrl K ou /', 'Buscar e executar'], ['N', 'Novo item no módulo atual'], ['G e I', 'Ir para Início'], ['G e F', 'Finanças'], ['G e E', 'Fitness'], ['G e A', 'Alimentação'], ['G e T', 'Tarefas'], ['G e M', 'Metas'], ['G e R', 'Rotinas'], ['G e C', 'Configurações'], ['Esc', 'Fechar painel']].map(([k, v]) => h`<div class="kv"><span>${v}</span><b><span class="kbd">${k}</span></b></div>`)}</div>` });
+    }
+  });
+
+  // inatividade → bloqueio por PIN
+  P.lastActive = Date.now();
+  ['pointerdown', 'keydown'].forEach((t) => document.addEventListener(t, () => { P.lastActive = Date.now(); }, { passive: true }));
+  setInterval(() => {
+    const min = +P.settings.get('seg.bloqueio_min', 10);
+    if (P.me.tem_pin && min > 0 && Date.now() - P.lastActive > min * 60000) ui.lock();
+  }, 20000);
+})();
+</script>

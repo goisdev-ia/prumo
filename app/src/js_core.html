@@ -1,0 +1,403 @@
+<script>
+/* Prumo · núcleo: HTML seguro, formatação, datas, API, store, preferências, roteador, ações e tema. */
+(function () {
+  'use strict';
+  const P = window.Prumo = window.Prumo || {};
+
+  // ---------- HTML seguro (todo valor interpolado é escapado, exceto raw()) ----------
+  const RAW = Symbol('raw');
+  const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ESC[c]);
+  const raw = (s) => ({ [RAW]: true, s: String(s ?? '') });
+  const toHtml = (v) => {
+    if (v === null || v === undefined || v === false) return '';
+    if (Array.isArray(v)) return v.map(toHtml).join('');
+    if (v[RAW]) return v.s;
+    return esc(v);
+  };
+  /** Template tag: h`<b>${texto}</b>` escapa interpolações. */
+  const h = (strings, ...vals) => {
+    let out = strings[0];
+    for (let i = 0; i < vals.length; i++) out += toHtml(vals[i]) + strings[i + 1];
+    return raw(out);
+  };
+  Object.assign(P, { h, raw, esc, toHtml });
+  P.icon = (name, cls = '') => raw(`<svg class="ic ${esc(cls)}" aria-hidden="true"><use href="#i-${esc(name)}"/></svg>`);
+  P.uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  }));
+  P.sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  P.debounce = (fn, ms = 250) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+  P.throttle = (fn, ms = 100) => { let last = 0; return (...a) => { const n = Date.now(); if (n - last >= ms) { last = n; fn(...a); } }; };
+  P.norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+  P.sum = (arr, fn) => arr.reduce((a, x) => a + (fn ? fn(x) : x), 0);
+  P.groupBy = (arr, fn) => arr.reduce((m, x) => { const k = fn(x); (m[k] = m[k] || []).push(x); return m; }, {});
+  P.clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  P.cents = (v) => Math.round((+v || 0) * 100);
+  P.round = (v, d = 2) => { const f = 10 ** d; return Math.round((+v || 0) * f) / f; };
+
+  // ---------- Armazenamento local (tolerante ao sandbox) ----------
+  const mem = {};
+  P.ls = {
+    get(k, def = null) { try { const v = localStorage.getItem('prumo.' + k); return v === null ? (k in mem ? mem[k] : def) : JSON.parse(v); } catch (e) { return k in mem ? mem[k] : def; } },
+    set(k, v) { mem[k] = v; try { localStorage.setItem('prumo.' + k, JSON.stringify(v)); } catch (e) { /* memória */ } },
+    del(k) { delete mem[k]; try { localStorage.removeItem('prumo.' + k); } catch (e) { /* noop */ } }
+  };
+
+  // ---------- Sessão (token do login) ----------
+  P.auth = {
+    token: () => P.ls.get('auth.token', ''),
+    email: () => P.ls.get('auth.email', ''),
+    set(token, email) { P.ls.set('auth.token', token); P.ls.set('auth.email', email); },
+    clear() { P.ls.del('auth.token'); },
+    /** Sessão caiu no meio do uso: limpa e volta para a tela de login. */
+    expired() { if (P.auth._expiring) return; P.auth._expiring = true; P.auth.clear(); if (P.login) P.login.show({ expired: true }); }
+  };
+
+  // ---------- Datas (strings yyyy-MM-dd no fuso local) ----------
+  const pad = (n) => String(n).padStart(2, '0');
+  const D = P.d = {
+    iso: (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    parse: (s) => { const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? new Date(+m[1], +m[2] - 1, +m[3], 12) : null; },
+    today: () => D.iso(new Date()),
+    now: () => new Date(),
+    time: (d = new Date()) => `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+    nowIso: () => { const d = new Date(), o = -d.getTimezoneOffset(); return `${D.iso(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${o >= 0 ? '+' : '-'}${pad(Math.floor(Math.abs(o) / 60))}:${pad(Math.abs(o) % 60)}`; },
+    add: (s, n) => { const d = D.parse(s); d.setDate(d.getDate() + n); return D.iso(d); },
+    addMonths: (s, n) => { const d = D.parse(s), day = d.getDate(); const t = new Date(d.getFullYear(), d.getMonth() + n, 1, 12); t.setDate(Math.min(day, new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate())); return D.iso(t); },
+    diff: (a, b) => Math.round((D.parse(b) - D.parse(a)) / 864e5),
+    month: (s) => String(s).slice(0, 7),
+    shiftMonth: (k, n) => { let y = +k.slice(0, 4), m = +k.slice(5, 7) - 1 + n; y += Math.floor(m / 12); m = ((m % 12) + 12) % 12; return `${y}-${pad(m + 1)}`; },
+    dim: (k) => new Date(+k.slice(0, 4), +k.slice(5, 7), 0).getDate(),
+    dow: (s) => D.parse(s).getDay(),
+    weekStart: (s, ws = 0) => { const d = D.parse(s); const diff = (d.getDay() - ws + 7) % 7; return D.add(s, -diff); },
+    range: (a, b) => { const out = []; let c = a; while (c <= b) { out.push(c); c = D.add(c, 1); } return out; },
+    fromIso: (iso) => iso ? new Date(iso) : null,
+    age: (birth) => { if (!birth) return null; const b = D.parse(birth), n = new Date(); let a = n.getFullYear() - b.getFullYear(); if (n.getMonth() < b.getMonth() || (n.getMonth() === b.getMonth() && n.getDate() < b.getDate())) a--; return a; }
+  };
+
+  // ---------- Formatação pt-BR ----------
+  const nfMoney = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
+  const nf = {};
+  const numFmt = (d) => nf[d] || (nf[d] = new Intl.NumberFormat('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d }));
+  const MONTHS = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
+  const WD = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+  const WDL = ['domingo', 'segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado'];
+  P.fmt = {
+    MONTHS, WD, WDL,
+    money: (v) => nfMoney.format(+v || 0).replace(/ /g, ' '),
+    moneyShort: (v) => {
+      const a = Math.abs(+v || 0), s = v < 0 ? '-' : '';
+      if (a >= 1e6) return `${s}R$ ${numFmt(1).format(a / 1e6)} mi`;
+      if (a >= 1e4) return `${s}R$ ${numFmt(1).format(a / 1e3)} mil`;
+      return P.fmt.money(v);
+    },
+    num: (v, d = 0) => numFmt(d).format(+v || 0),
+    numSmart: (v, max = 1) => { const n = +v || 0; return Number.isInteger(n) ? numFmt(0).format(n) : numFmt(max).format(n); },
+    pct: (v, d = 0) => `${numFmt(d).format(+v || 0)}%`,
+    date: (s) => s ? `${s.slice(8, 10)}/${s.slice(5, 7)}/${s.slice(0, 4)}` : '',
+    dm: (s) => s ? `${s.slice(8, 10)}/${s.slice(5, 7)}` : '',
+    day: (s) => {
+      if (!s) return '';
+      const t = D.today(), diff = D.diff(t, s);
+      if (diff === 0) return 'Hoje'; if (diff === 1) return 'Amanhã'; if (diff === -1) return 'Ontem';
+      const d = D.parse(s);
+      return `${WD[d.getDay()].toLowerCase()}, ${d.getDate()} de ${MONTHS[d.getMonth()].slice(0, 3)}${d.getFullYear() !== new Date().getFullYear() ? ' ' + d.getFullYear() : ''}`;
+    },
+    dayLong: (s) => { const d = D.parse(s); return `${WDL[d.getDay()]}, ${d.getDate()} de ${MONTHS[d.getMonth()]}`; },
+    month: (k) => `${MONTHS[+k.slice(5, 7) - 1]} de ${k.slice(0, 4)}`,
+    monthShort: (k) => MONTHS[+k.slice(5, 7) - 1].slice(0, 3),
+    monthCap: (k) => { const m = MONTHS[+k.slice(5, 7) - 1]; return m[0].toUpperCase() + m.slice(1) + (k.slice(0, 4) !== String(new Date().getFullYear()) ? ' ' + k.slice(0, 4) : ''); },
+    dur: (s) => { s = Math.round(+s || 0); const hh = Math.floor(s / 3600), mm = Math.round((s % 3600) / 60); return hh ? `${hh}h${mm ? ' ' + pad(mm) + 'min' : ''}` : `${mm} min`; },
+    clock: (s) => { s = Math.max(0, Math.round(+s || 0)); const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = s % 60; return hh ? `${hh}:${pad(mm)}:${pad(ss)}` : `${pad(mm)}:${pad(ss)}`; },
+    time: (iso) => iso ? String(iso).slice(11, 16) : '',
+    rel: (iso) => {
+      if (!iso) return ''; const s = (Date.now() - new Date(iso).getTime()) / 1000;
+      if (s < 60) return 'agora'; if (s < 3600) return `há ${Math.floor(s / 60)} min`; if (s < 86400) return `há ${Math.floor(s / 3600)} h`;
+      return P.fmt.day(String(iso).slice(0, 10));
+    },
+    kg: (v) => `${numFmt(1).format(+v || 0)} kg`,
+    plural: (n, one, many) => `${P.fmt.num(n)} ${n === 1 ? one : many}`
+  };
+  /** "1.234,56" → 1234.56 */
+  P.parseNum = (s) => {
+    if (typeof s === 'number') return s;
+    const t = String(s ?? '').trim().replace(/\s|R\$/g, '');
+    if (!t) return null;
+    const n = Number(t.includes(',') ? t.replace(/\./g, '').replace(',', '.') : t);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  // ---------- API (google.script.run com Promise, timeout, retry, dedupe, cache TTL) ----------
+  P.api = (function () {
+    const inflight = new Map(), cache = new Map(), busyFns = new Set();
+    let busy = 0;
+    const setBusy = (d) => { busy = Math.max(0, busy + d); busyFns.forEach((f) => f(busy)); };
+    const mkErr = (code, message) => { const e = new Error(message); e.code = code; return e; };
+    const device = () => `${/Mobi|Android/i.test(navigator.userAgent) ? 'mobile' : 'desktop'} · ${innerWidth}px · ${(navigator.userAgent.match(/(Chrome|Firefox|Safari|Edg)\/[\d.]+/) || [''])[0]}`;
+    function runRaw(fn, args, timeout) {
+      return new Promise((resolve, reject) => {
+        if (!(window.google && google.script && google.script.run)) { reject(mkErr('NETWORK', 'Abra o Prumo pela URL do Web App para conectar ao Google.')); return; }
+        let done = false;
+        const timer = setTimeout(() => { if (!done) { done = true; reject(mkErr('TIMEOUT', 'O Google demorou para responder. Tente de novo.')); } }, timeout);
+        google.script.run
+          .withSuccessHandler((r) => { if (done) return; done = true; clearTimeout(timer); resolve(r); })
+          .withFailureHandler((e) => { if (done) return; done = true; clearTimeout(timer); reject(mkErr('NETWORK', (e && e.message) || 'Falha de comunicação com o servidor.')); })[fn](...args);
+      });
+    }
+    /**
+     * Chama uma rota do servidor.
+     * @param {string} route @param {Object} payload
+     * @param {{ttl?:number, timeout?:number, retries?:number, mutation?:boolean}} opts
+     */
+    function call(route, payload = {}, opts = {}) {
+      const key = route + '|' + JSON.stringify(payload);
+      if (opts.ttl) { const c = cache.get(key); if (c && Date.now() - c.t < opts.ttl) return Promise.resolve(c.v); }
+      if (!opts.mutation && inflight.has(key)) return inflight.get(key);
+      const transient = opts.mutation ? ['LOCKED'] : ['LOCKED', 'QUOTA', 'NETWORK', 'TIMEOUT'];
+      const p = (async () => {
+        const max = opts.retries ?? 2;
+        for (let attempt = 0; ; attempt++) {
+          setBusy(1);
+          try {
+            const r = await runRaw('api', [route, payload, device(), P.auth.token()], opts.timeout || 60000);
+            if (!r || !r.ok) { const e = mkErr((r && r.error && r.error.code) || 'UNKNOWN', (r && r.error && r.error.message) || 'Erro inesperado.'); e.field = r && r.error && r.error.field; e.data = r && r.error && r.error.data; if (e.code === 'AUTH') P.auth.expired(); throw e; }
+            if (opts.ttl) cache.set(key, { t: Date.now(), v: r.data });
+            return r.data;
+          } catch (e) {
+            if (attempt >= max || !transient.includes(e.code)) throw e;
+            await P.sleep(700 * 2 ** attempt);
+          } finally { setBusy(-1); }
+        }
+      })();
+      if (!opts.mutation) { inflight.set(key, p); p.finally(() => inflight.delete(key)).catch(() => {}); }
+      return p;
+    }
+    async function batch(calls, opts = {}) {
+      setBusy(1);
+      try {
+        const r = await runRaw('apiBatch', [calls, device(), P.auth.token()], opts.timeout || 90000);
+        if (r && r.ok && (r.results || []).some((x) => x && x.error && x.error.code === 'AUTH')) P.auth.expired();
+        if (!r || !r.ok) throw mkErr('UNKNOWN', (r && r.error && r.error.message) || 'Falha no lote.');
+        return r.results;
+      } finally { setBusy(-1); }
+    }
+    return { call, batch, onBusy: (f) => busyFns.add(f), clearCache: () => cache.clear(), isBusy: () => busy > 0 };
+  })();
+
+  // ---------- Store local-first com escrita otimista ----------
+  P.store = (function () {
+    const T = {};
+    const listeners = new Set();
+    const dirty = new Set();
+    let timer = null, chain = Promise.resolve();
+    const changed = (n) => { dirty.add(n); clearTimeout(timer); timer = setTimeout(() => { const d = [...dirty]; dirty.clear(); listeners.forEach((f) => { try { f(d); } catch (e) { console.error(e); } }); }, 16); };
+    const map = (n) => (T[n] = T[n] || new Map());
+    const enqueue = (fn) => { const p = chain.then(fn, fn); chain = p.catch(() => {}); return p; };
+    const S = {
+      load(tables) { Object.entries(tables || {}).forEach(([n, rows]) => { const m = new Map(); (rows || []).forEach((r) => m.set(r.id, r)); T[n] = m; changed(n); }); },
+      all(n) { const out = []; map(n).forEach((r) => { if (!r.deleted_at) out.push(r); }); return out; },
+      where(n, fn) { const out = []; map(n).forEach((r) => { if (!r.deleted_at && fn(r)) out.push(r); }); return out; },
+      get(n, id) { const r = id ? map(n).get(id) : null; return r && !r.deleted_at ? r : null; },
+      getAny(n, id) { return id ? map(n).get(id) || null : null; },
+      put(n, row) { if (row && row.id) { map(n).set(row.id, row); changed(n); } },
+      drop(n, id) { map(n).delete(id); changed(n); },
+      apply(changes) { Object.entries(changes || {}).forEach(([n, rows]) => (rows || []).forEach((r) => r && S.put(n, r))); },
+      on(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+      /** Grava (insere/atualiza) com UI otimista e rollback. */
+      async save(n, row, opts = {}) {
+        const id = row.id || P.uuid();
+        const prev = map(n).get(id);
+        S.put(n, { ...(prev || {}), ...row, id, _pending: true });
+        try {
+          const res = await enqueue(() => P.api.call('db.save', { table: n, row: { ...row, id } }, { mutation: true }));
+          S.put(n, res.row);
+          if (opts.toast) P.ui.toast(opts.toast);
+          return res.row;
+        } catch (e) {
+          if (prev) S.put(n, prev); else S.drop(n, id);
+          if (!opts.silentError) P.ui.toast(e.message, { error: true });
+          throw e;
+        }
+      },
+      async saveMany(n, rows) {
+        const prevs = rows.map((r) => map(n).get(r.id));
+        const withIds = rows.map((r) => ({ ...r, id: r.id || P.uuid() }));
+        withIds.forEach((r, i) => S.put(n, { ...(prevs[i] || {}), ...r, _pending: true }));
+        try {
+          const res = await enqueue(() => P.api.call('db.saveMany', { table: n, rows: withIds }, { mutation: true }));
+          res.rows.forEach((r) => S.put(n, r));
+          return res.rows;
+        } catch (e) {
+          withIds.forEach((r, i) => prevs[i] ? S.put(n, prevs[i]) : S.drop(n, r.id));
+          P.ui.toast(e.message, { error: true });
+          throw e;
+        }
+      },
+      /** Exclusão lógica otimista com "Desfazer". */
+      async remove(n, id, opts = {}) {
+        const prev = map(n).get(id);
+        if (!prev) return;
+        S.put(n, { ...prev, deleted_at: D.nowIso() });
+        try {
+          const res = await enqueue(() => P.api.call('db.remove', { table: n, id }, { mutation: true }));
+          S.put(n, res.row);
+          if (opts.undo !== false) {
+            P.ui.toast(opts.label || 'Excluído', {
+              undo: async () => {
+                S.put(n, prev);
+                try { const r = await enqueue(() => P.api.call('db.restore', { table: n, id }, { mutation: true })); S.put(n, r.row); }
+                catch (e) { P.ui.toast(e.message, { error: true }); }
+              }
+            });
+          }
+        } catch (e) { S.put(n, prev); P.ui.toast(e.message, { error: true }); }
+      },
+      /** Rota de domínio que devolve {changes}. */
+      async route(route, payload, opts = {}) {
+        const res = await enqueue(() => P.api.call(route, payload, { mutation: true, timeout: opts.timeout }));
+        if (res && res.changes) S.apply(res.changes);
+        return res;
+      },
+      pendingWrites: () => P.api.isBusy()
+    };
+    return S;
+  })();
+
+  // ---------- Preferências e perfil ----------
+  P.settings = {
+    map: {},
+    get(k, def) { return k in this.map && this.map[k] !== null && this.map[k] !== undefined ? this.map[k] : def; },
+    async set(values) {
+      const prev = { ...this.map };
+      Object.assign(this.map, values);
+      // valor_json guarda JSON: texto vai entre aspas (senão "07:00" seria JSON inválido)
+      const wire = {}; Object.keys(values).forEach((k) => { wire[k] = typeof values[k] === 'string' ? JSON.stringify(values[k]) : values[k]; });
+      try { const r = await P.api.call('settings.save', { values: wire }, { mutation: true }); this.map = r.settings; return r.settings; }
+      catch (e) { this.map = prev; P.ui.toast(e.message, { error: true }); throw e; }
+    }
+  };
+  P.me = {};
+
+  // ---------- Tema (escuro/claro/automático) ----------
+  P.theme = {
+    mode: 'dark',
+    resolved() { return document.documentElement.getAttribute('data-theme') || 'dark'; },
+    apply(mode) {
+      this.mode = mode || 'dark';
+      const sys = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', this.mode === 'auto' ? sys : this.mode);
+      P.ls.set('theme', this.mode);
+      if (P.charts) P.charts.retheme();
+      if (P.pwa) P.pwa.theme(this.resolved() === 'dark');
+    },
+    init() {
+      this.mode = P.ls.get('theme', 'dark');
+      try { matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { if (this.mode === 'auto') this.apply('auto'); }); } catch (e) { /* noop */ }
+    }
+  };
+
+  // ---------- Ações delegadas (data-act) ----------
+  P.act = {};
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-act]');
+    if (!el || el.disabled) return;
+    const fn = P.act[el.dataset.act];
+    if (fn) { ev.preventDefault(); try { const r = fn(el, ev); if (r && r.catch) r.catch((e) => P.ui.toast(e.message, { error: true })); } catch (e) { console.error(e); P.ui.toast(e.message, { error: true }); } }
+  });
+  // Nenhum formulário do app envia de verdade: sem isto, um botão sem type="button" dentro de <form> recarregava a página
+  // (era o erro ao trocar para Receita/Transferência no lançamento).
+  document.addEventListener('submit', (ev) => ev.preventDefault(), true);
+  ['input', 'change'].forEach((type) => document.addEventListener(type, (ev) => {
+    const el = ev.target.closest(`[data-on-${type}]`);
+    if (!el) return;
+    const fn = P.act[el.getAttribute(`data-on-${type}`)];
+    if (fn) fn(el, ev);
+  }));
+
+  // ---------- Roteador por hash ----------
+  P.router = (function () {
+    const routes = [];
+    let current = null, currentPath = null;
+    const R = {
+      /** Registra uma tela. screen: {mod, tab, title, render(ctx)→h, mount?(root,ctx), deps?:string[]} */
+      add(pattern, screen) {
+        const keys = [];
+        const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (m, k) => { keys.push(k); return '([^/]+)'; }) + '$');
+        routes.push({ pattern, re, keys, screen });
+      },
+      parse() {
+        const hash = decodeURIComponent(location.hash.replace(/^#\/?/, ''));
+        const [path, qs] = hash.split('?');
+        return { path: path || '', q: Object.fromEntries(new URLSearchParams(qs || '')) };
+      },
+      match(path) {
+        for (const r of routes) { const m = r.re.exec(path); if (m) { const params = {}; r.keys.forEach((k, i) => { params[k] = m[i + 1]; }); return { screen: r.screen, params }; } }
+        return null;
+      },
+      go(path, opts = {}) {
+        const target = '#/' + String(path).replace(/^#?\/?/, '');
+        if (opts.replace) { try { history.replaceState(null, '', target); } catch (e) { /* sandbox */ } R.render(); }
+        else if (location.hash === target) R.render();
+        else location.hash = target;
+      },
+      current: () => current,
+      render(keepScroll) {
+        const { path, q } = R.parse();
+        let m = R.match(path);
+        if (!m && path) {
+          // Tela inexistente (link antigo ou um script que não carregou): avisa em vez de cair no Início sem explicação.
+          P.reportError && P.reportError(new Error('Tela não encontrada: #/' + path), 'rota');
+          const mod = path.split('/')[0];
+          m = { params: {}, screen: { mod: P.modules && P.modules[mod] ? mod : 'home', title: 'Tela não encontrada', render: () => P.h`<div class="page-head"><div><h1>Tela não encontrada</h1><p>#/${path}</p></div></div>${P.ui.empty({ ill: 'search', title: 'Esta tela não abriu', text: 'Pode ser um link antigo ou uma parte do app que não carregou. Recarregue a página; se continuar, veja Configurações › Logs.', action: { act: 'ui.reload', label: 'Recarregar', icon: 'refresh' } })}` } };
+        }
+        if (!m) m = R.match('');
+        const view = document.getElementById('view');
+        const samePath = path === currentPath;
+        if (current && current.unmount && !samePath) { try { current.unmount(); } catch (e) { /* noop */ } }
+        current = m.screen; currentPath = path;
+        const ctx = { params: m.params, q, path };
+        current._ctx = ctx;
+        P.charts && P.charts.destroyAll();
+        P.shell.update(current);
+        let html;
+        try { html = current.render(ctx); }
+        catch (e) { console.error(e); P.reportError(e, 'render ' + path); html = P.ui.errorState(e.message); }
+        const scroll = window.scrollY;
+        view.innerHTML = `<div class="page">${toHtml(html)}</div>`;
+        if (keepScroll && samePath) { view.firstElementChild.style.animation = 'none'; window.scrollTo(0, scroll); } else window.scrollTo(0, 0);
+        try { current.mount && current.mount(view, ctx); } catch (e) { console.error(e); P.reportError(e, 'mount ' + path); }
+        document.title = (current.title ? (typeof current.title === 'function' ? current.title(ctx) : current.title) + ' · ' : '') + 'Prumo';
+      },
+      /** Re-renderiza a tela atual se ela depende das tabelas alteradas. */
+      refresh(tables) {
+        if (!current) return;
+        if (current.deps && tables && !tables.some((t) => current.deps.includes(t))) return;
+        const a = document.activeElement;
+        if (a && a.closest('#view') && /INPUT|TEXTAREA|SELECT/.test(a.tagName)) { R.pendingRefresh = true; return; }
+        R.render(true);
+      },
+      start() {
+        window.addEventListener('hashchange', () => R.render());
+        R.render();
+      }
+    };
+    return R;
+  })();
+  P.screen = (pattern, def) => P.router.add(pattern, def);
+
+  // ---------- Erros do cliente → aba logs (em lote) ----------
+  const errQueue = [];
+  P.reportError = (err, acao) => {
+    errQueue.push({ acao: acao || 'erro_js', mensagem: String((err && (err.stack || err.message)) || err).slice(0, 1800), url: location.hash });
+    flushErrors();
+  };
+  const flushErrors = P.debounce(() => {
+    if (!errQueue.length || !P.auth.token()) return;
+    const items = errQueue.splice(0, 30);
+    P.api.call('logs.client', { items }, { retries: 0 }).catch(() => {});
+  }, 4000);
+  window.addEventListener('error', (e) => P.reportError(((e.error && e.error.stack) || e.message || 'erro') + ' @' + (e.lineno || '?') + ':' + (e.colno || '?'), 'window.onerror'));
+  window.addEventListener('unhandledrejection', (e) => { const r = e.reason; if (r && r.code && r.code !== 'UNKNOWN') return; P.reportError(r, 'promise'); });
+})();
+</script>

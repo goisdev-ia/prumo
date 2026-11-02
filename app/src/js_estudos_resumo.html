@@ -1,0 +1,186 @@
+<script>
+/* Prumo · Estudos: resumos de PDF com IA (modos Objetivo, Direcionado e Detalhado).
+   Antes de pedir à IA, garante o texto das páginas (camada do PDF ou OCR, guardado e reaproveitado). O servidor
+   divide em blocos de páginas (fila est_jobs ia_resumo); o app avança bloco a bloco com progresso e Cancelar, e
+   quem fechar a tela deixa o resto para a fila. O resultado vira um rascunho de anotação "resumo" (Gerado por IA),
+   com prévia, aprovação, edição com versões, excluir com desfazer, mover, duplicar, regenerar (nova versão) e
+   compartilhar (Telegram, copiar, compartilhar do aparelho, PDF). */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, ui } = P;
+  const S = P.store, E = P.est;
+  const MODOS = [['objetivo', 'Objetivo', 'Só o essencial, em tópicos curtos.'], ['direcionado', 'Direcionado', 'Só o que trata de um foco (ex.: prazos, competências).'], ['detalhado', 'Detalhado', 'Estruturado, com todos os conceitos, exemplos e exceções.']];
+  const parsePags = (s, max) => { const out = new Set(); String(s || '').split(',').forEach((p) => { const [a, b] = p.split('-').map((z) => +String(z).trim()); if (!a) return; for (let i = a; i <= (b || a); i++) if (i >= 1 && (!max || i <= max)) out.add(i); }); return [...out].sort((x, y) => x - y); };
+  const toRange = (arr) => { const a = [...arr].sort((x, y) => x - y), out = []; for (let i = 0; i < a.length; i++) { let j = i; while (j + 1 < a.length && a[j + 1] === a[j] + 1) j++; out.push(j > i ? `${a[i]}-${a[j]}` : `${a[i]}`); i = j; } return out.join(','); };
+
+  /**
+   * Garante o texto das páginas no servidor: lê a camada de texto do PDF e faz OCR nas digitalizadas.
+   * @return {Promise<number>} total de páginas do PDF
+   */
+  async function ensureText(m, pags, o = {}) {
+    const prog = o.onProgress || (() => {});
+    const tg = await P.api.call('est.textGet', { material_id: m.id }, { timeout: 60000 });
+    const feitas = new Set((tg.paginas_ocr || []).map(Number));
+    let lista = pags;
+    const lib = await P.estPdf.loadLib(); prog('Abrindo o PDF…', 0);
+    const bytes = await P.estPdf.fetchBytes(m.arquivo_id, (p) => prog('Baixando o PDF… ' + Math.round(p * 100) + '%', 0));
+    const doc = await lib.getDocument({ data: bytes.slice(0) }).promise;
+    if (!lista || !lista.length) lista = Array.from({ length: doc.numPages }, (_, i) => i + 1);
+    lista = lista.filter((n) => n <= doc.numPages);
+    const falta = lista.filter((n) => !(tg.paginas || {})[n] && !feitas.has(n));
+    if (!falta.length) { try { doc.destroy(); } catch (e) { /* ok */ } return { total: doc.numPages, lista }; }
+    const R = await P.estOcr.forDoc({ material: m, signal: o.signal });
+    let lote = {}, ocrN = 0;
+    const flush = async () => { if (!Object.keys(lote).length) return; await P.api.call('est.textSave', { material_id: m.id, arquivo_id: m.arquivo_id, paginas: lote, total: doc.numPages }, { mutation: true, timeout: 90000 }); lote = {}; };
+    for (let i = 0; i < falta.length; i++) {
+      if (o.signal && o.signal.parado) break;
+      const n = falta[i], pg = await doc.getPage(n), tc = await pg.getTextContent(), s = tc.items.map((x) => x.str).join(' ');
+      if (P.estOcr.needsOcr(s.replace(/\s/g, '').length)) {
+        prog(`OCR da página ${n} (${i + 1} de ${falta.length})…`, (i + 1) / falta.length);
+        await R.fn(pg, n); ocrN++;
+        if (ocrN % 3 === 0) await R.save(doc.numPages);
+      } else { lote[n] = s; prog(`Lendo o texto do PDF (${i + 1} de ${falta.length})…`, (i + 1) / falta.length); if (Object.keys(lote).length >= 20) await flush(); }
+    }
+    await flush(); await R.save(doc.numPages);
+    try { doc.destroy(); } catch (e) { /* ok */ }
+    if (o.signal && o.signal.parado) throw new Error('Cancelado.');
+    return { total: doc.numPages, lista };
+  }
+
+  /** Tela para gerar o resumo (ou regenerar, com nota = rascunho atual). */
+  function resumoIA(m, o = {}) {
+    if (!E.aiOn()) { ui.toast('O assistente de IA está desligado. O dono do app cadastra um provedor em Estudos › Preferências.', { error: true }); return null; }
+    if (!m || !m.arquivo_id || m.tipo !== 'pdf') { ui.toast('Escolha um PDF da biblioteca.', { error: true }); return null; }
+    const meta = (o.nota && o.nota.ia_meta) || {};
+    const st = { modo: o.modo || meta.modo || 'objetivo', foco: o.foco ?? meta.foco ?? '', paginas: o.paginas != null ? String(o.paginas) : meta.paginas || (m.paginas ? '1-' + m.paginas : ''), parado: false, job: null };
+    const ia = E.ia || {};
+    const s = ui.sheet({ title: (o.nota ? 'Regenerar resumo · ' : 'Resumir com IA · ') + m.codigo, wide: true, body: h`<div data-b></div>`, foot: h`<div class="row-sm grow" data-f></div>`, onClose: () => { st.parado = true; } });
+    const B = s.$('[data-b]'), F = s.$('[data-f]');
+    const form = () => {
+      B.innerHTML = P.toHtml(h`<div class="stack">
+        <p class="muted" style="font-size:13px">${m.titulo}${m.paginas ? ' · ' + m.paginas + ' páginas' : ''}. O resumo usa só o texto do PDF (páginas digitalizadas passam pelo OCR antes) e vira um <b>rascunho</b> em Resumos para você conferir e aprovar.</p>
+        <div class="field"><label>Modo</label><div class="res-modos" role="radiogroup">${MODOS.map(([k, l, d]) => h`<button type="button" role="radio" aria-checked="${k === st.modo}" class="res-modo ${k === st.modo ? 'on' : ''}" data-modo="${k}"><b>${l}</b><span>${d}</span></button>`)}</div></div>
+        <div class="field" data-foco ${raw(st.modo === 'direcionado' ? '' : 'hidden')}><label>Foco</label><input class="input" data-fo value="${st.foco}" maxlength="300" placeholder="Ex.: prazos e competências do Banco Central"></div>
+        <div class="grid g2"><div class="field"><label>Páginas</label><input class="input" data-pg value="${st.paginas}" placeholder="Todas (ou 1-40, 52)" inputmode="numeric"></div>
+          <div class="field"><label>Modelo</label>${E.aiPicker()}</div></div>
+        <p class="faint" style="font-size:12px">PDF grande é resumido em blocos de páginas (cada bloco é uma chamada da IA; com mais de um bloco, há mais uma para juntar). Hoje: ${ia.uso_hoje || 0} de ${ia.limite_dia || 40} usos. Você pode cancelar a qualquer momento; se fechar esta tela, o restante continua na fila do servidor.</p></div>`);
+      F.innerHTML = P.toHtml(h`<span class="grow"></span><button type="button" class="btn btn-primary" data-go>${icon('zap', 'sm')}${o.nota ? 'Regenerar' : 'Gerar resumo'}</button>`);
+      B.querySelectorAll('[data-modo]').forEach((b) => { b.onclick = () => { st.modo = b.dataset.modo; st.foco = (B.querySelector('[data-fo]') || {}).value || st.foco; st.paginas = B.querySelector('[data-pg]').value; form(); }; });
+      F.querySelector('[data-go]').onclick = go;
+    };
+    const progress = (t, frac) => {
+      B.innerHTML = P.toHtml(h`<div class="stack"><b data-step>${t}</b><div class="res-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round((frac || 0) * 100)}"><span style="width:${Math.max(3, Math.round((frac || 0) * 100))}%"></span></div>
+        <p class="faint" style="font-size:12px">Modo ${MODOS.find((x) => x[0] === st.modo)[1].toLowerCase()}${st.foco && st.modo === 'direcionado' ? ' · foco: ' + st.foco : ''}${st.paginas ? ' · páginas ' + st.paginas : ' · todas as páginas'}${st.job ? ' · pedido ' + st.job.codigo : ''}</p></div>`);
+      F.innerHTML = P.toHtml(h`<span class="grow"></span><button type="button" class="btn btn-ghost" data-cancel>Cancelar</button>`);
+      F.querySelector('[data-cancel]').onclick = cancel;
+    };
+    async function cancel() {
+      st.parado = true;
+      if (st.job) { try { await P.api.call('est.aiResumoCancel', { job_id: st.job.id }, { mutation: true }); } catch (e) { /* já terminou */ } }
+      ui.toast('Resumo cancelado. Nada foi gravado.'); s.close();
+    }
+    async function go() {
+      st.foco = (B.querySelector('[data-fo]') || {}).value || ''; st.paginas = B.querySelector('[data-pg]').value.trim();
+      if (st.modo === 'direcionado' && !st.foco.trim()) { ui.toast('Escreva o foco do resumo.', { error: true }); return; }
+      if (st.paginas && !/^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/.test(st.paginas)) { ui.toast('Use páginas como 1-40, 52.', { error: true }); return; }
+      const sel = E.aiSel();
+      try {
+        progress('Conferindo o texto das páginas…', 0.02);
+        const t = await ensureText(m, parsePags(st.paginas), { signal: st, onProgress: (txt, f) => { if (!st.parado) progress(txt, 0.05 + 0.25 * (f || 0)); } });
+        if (st.parado) return;
+        const range = st.paginas ? toRange(parsePags(st.paginas, t.total)) : '1-' + t.total;
+        if (!range) { ui.toast('Nenhuma página válida nesse intervalo.', { error: true }); form(); return; }
+        st.paginas = range;
+        const r = await P.api.call('est.aiResumoStart', { material_id: m.id, modo: st.modo, foco: st.foco, paginas: range, provedor: sel.provedor, modelo: sel.modelo, nota_id: o.nota ? o.nota.id : null }, { mutation: true, timeout: 60000 });
+        st.job = r.job; S.put('est_jobs', r.job);
+        let res = null;
+        while (!st.parado) {
+          const rj = st.job.resultado_json || {}, tot = (st.job.params_json.blocos || []).length;
+          progress(rj.feito < tot ? `Resumindo o bloco ${rj.feito + 1} de ${tot} (páginas ${String(st.job.params_json.blocos[rj.feito]).replace(/,/g, ', ')})…` : 'Juntando os blocos num resumo só…', 0.3 + 0.7 * (rj.feito / (tot + (tot > 1 ? 1 : 0))));
+          res = await P.api.call('est.aiResumoStep', { job_id: st.job.id }, { mutation: true, timeout: 330000 });
+          st.job = res.job; S.put('est_jobs', res.job); if (E.ia) E.ia.uso_hoje = (+E.ia.uso_hoje || 0) + 1;
+          if (res.job.status === 'pronto' || res.job.status === 'cancelado') break;
+        }
+        if (st.parado || !res || !res.nota) return;
+        S.put('est_anotacoes', res.nota); s.close(); view(res.nota);
+        ui.toast(o.nota ? 'Resumo regenerado: a versão anterior ficou no histórico.' : 'Rascunho do resumo salvo em Resumos.');
+      } catch (e) {
+        if (st.parado) return;
+        ui.toast(e.message || String(e), { error: true, duration: 8000 }); form();
+      }
+    }
+    form();
+    return s;
+  }
+
+  /** Exclui (lixeira) anotação ou discursiva pela rota própria, com Desfazer. */
+  async function removeEst(table, id, label) {
+    const prev = S.getAny(table, id); if (!prev) return;
+    S.put(table, { ...prev, deleted_at: new Date().toISOString() });
+    try {
+      const r = await P.api.call('est.entityDelete', { table, id }, { mutation: true }); S.put(table, r.row);
+      ui.toast(label || 'Excluído', { undo: async () => { S.put(table, prev); try { const r2 = await P.api.call('est.entityRestore', { table, id }, { mutation: true }); S.put(table, r2.row); } catch (e) { ui.toast(e.message, { error: true }); } } });
+    } catch (e) { S.put(table, prev); ui.toast(e.message, { error: true }); }
+  }
+
+  /** Prévia do resumo com as ações. */
+  function view(n) {
+    n = S.get('est_anotacoes', n.id) || n;
+    const meta = n.ia_meta || {}, mat = n.material_id ? E.mat(n.material_id) : null;
+    const chip = n.gerado_ia ? h`<span class="chip ${n.aprovado === false ? 'down' : 'info'}">Gerado por IA${meta.provedor ? ' · ' + meta.provedor : ''}${meta.modelo ? ' · ' + meta.modelo : ''} · ${n.aprovado === false ? 'rascunho: confira' : 'aprovado por você'}</span>` : '';
+    const s = ui.sheet({ title: n.titulo, size: 'full', wide: true,
+      body: h`<div class="stack"><div class="row-sm wrap">${chip}${mat ? h`<span class="chip">${mat.codigo}${meta.paginas ? ' · p. ' + meta.paginas : ''}</span>` : ''}${meta.modo ? h`<span class="chip">modo ${meta.modo}${meta.foco ? ': ' + meta.foco : ''}</span>` : ''}<span class="chip">v${n.versao || 1}</span></div>
+        <div class="note-preview card pad-lg" data-md>${raw(E.md(n.conteudo || ''))}</div></div>`,
+      foot: h`<button type="button" class="btn btn-ghost" data-more aria-label="Mais ações">${icon('dots', 'sm')}</button><span class="grow"></span><button type="button" class="btn btn-ghost" data-edit>${icon('edit', 'sm')}Editar</button>${n.gerado_ia && n.aprovado === false ? h`<button type="button" class="btn btn-primary" data-ok>${icon('check', 'sm')}Aprovar</button>` : ''}`,
+      onMount(sh) {
+        sh.$('[data-edit]').onclick = () => { sh.close(); E.noteEdit(S.get('est_anotacoes', n.id) || n); };
+        const ap = sh.$('[data-ok]'); if (ap) ap.onclick = async () => { ap.classList.add('loading'); try { const r = await P.api.call('est.noteSave', { id: n.id, aprovado: true }, { mutation: true }); S.put('est_anotacoes', r.nota); sh.close(); ui.toast('Resumo aprovado'); view(r.nota); } catch (e) { ap.classList.remove('loading'); ui.toast(e.message, { error: true }); } };
+        sh.$('[data-more]').onclick = () => acoes(n, sh);
+      } });
+    return s;
+  }
+
+  function acoes(n, sh) {
+    n = S.get('est_anotacoes', n.id) || n;
+    const mat = n.material_id ? E.mat(n.material_id) : null;
+    ui.menu('Resumo', [
+      mat && mat.tipo === 'pdf' && n.gerado_ia ? { label: 'Regenerar', sub: 'Gera de novo; a versão atual vai para o histórico', icon: 'refresh', act: () => { if (sh) sh.close(); resumoIA(mat, { nota: n }); } } : null,
+      { label: 'Duplicar', icon: 'copy', act: () => duplicar(n) },
+      { label: 'Mover', sub: 'Trocar material, disciplina ou assunto', icon: 'folder', act: () => mover(n, sh) },
+      { label: 'Copiar texto', icon: 'copy', act: () => copiar(n) },
+      navigator.share ? { label: 'Compartilhar…', sub: 'Apps do aparelho', icon: 'send', act: () => navigator.share({ title: n.titulo, text: n.conteudo }).catch(() => {}) } : null,
+      { label: 'Exportar PDF', icon: 'file', act: () => P.rep.run(() => notaSpec(n), 'pdf') },
+      { label: 'Imprimir', icon: 'file', act: () => P.rep.run(() => notaSpec(n), 'imprimir') },
+      E.tg() ? { label: 'Enviar para meu Telegram (texto)', icon: 'message', act: () => E.sendTg({ tipo: 'nota', id: n.id, formato: 'texto' }) } : null,
+      E.tg() ? { label: 'Enviar para meu Telegram (PDF)', icon: 'message', act: () => E.sendTg({ tipo: 'nota', id: n.id, formato: 'pdf' }) } : null,
+      { label: 'Versões anteriores', icon: 'history', act: () => E.noteVersions && E.noteVersions(n) },
+      { label: 'Excluir', icon: 'trash', danger: true, act: () => { if (sh) sh.close(); removeEst('est_anotacoes', n.id, 'Resumo excluído'); } }]);
+  }
+  const notaSpec = (n) => { const mat = n.material_id ? E.mat(n.material_id) : null, meta = n.ia_meta || {}; return { titulo: n.titulo, subtitulo: [mat ? mat.codigo + ' · ' + mat.titulo : '', n.gerado_ia ? 'Gerado por IA' + (meta.provedor ? ' · ' + meta.provedor : '') + (meta.modelo ? ' · ' + meta.modelo : '') + ' · ' + (n.aprovado === false ? 'rascunho, confira' : 'aprovado') : '', 'Versão ' + (n.versao || 1)].filter(Boolean).join(' · '), arquivo: 'resumo_' + (mat ? mat.codigo : '') + '_' + n.titulo, secoes: [{ tipo: 'texto', md: n.conteudo || '' }] }; };
+  async function copiar(n) { try { await navigator.clipboard.writeText(n.conteudo || ''); ui.toast('Texto copiado'); } catch (e) { ui.toast('Não foi possível copiar neste navegador.', { error: true }); } }
+  async function duplicar(n) {
+    const row = { titulo: (n.titulo + ' (cópia)').slice(0, 200), tipo: n.tipo, conteudo: n.conteudo, disciplina_id: n.disciplina_id || null, assunto_id: n.assunto_id || null, material_id: n.material_id || null, tags: n.tags || null, fonte: n.fonte || null, gerado_ia: !!n.gerado_ia, aprovado: n.aprovado, ia_meta: n.ia_meta || null };
+    try { const r = await P.api.call('est.noteSave', row, { mutation: true }); S.put('est_anotacoes', r.nota); ui.toast('Resumo duplicado', { action: { label: 'Abrir', fn: () => view(r.nota) } }); return r.nota; } catch (e) { ui.toast(e.message, { error: true }); return null; }
+  }
+  function mover(n, parent) {
+    const pdfs = S.all('est_materiais').filter((m) => m.situacao !== 'arquivado');
+    ui.sheet({ title: 'Mover resumo', body: h`<div class="form">
+        <div class="field full"><label>Material</label><select class="input" data-m><option value="">Nenhum</option>${pdfs.map((m) => h`<option value="${m.id}" ${raw(m.id === n.material_id ? 'selected' : '')}>${m.codigo} · ${m.titulo}</option>`)}</select></div>
+        <div class="field full"><label>Disciplina</label><select class="input" data-d><option value="">Nenhuma</option>${E.disciplinas().map((d) => h`<option value="${d.id}" ${raw(d.id === n.disciplina_id ? 'selected' : '')}>${d.nome}</option>`)}</select></div>
+        <div class="field full"><label>Assunto</label><select class="input" data-a><option value="">Nenhum</option>${S.all('est_assuntos').map((a) => h`<option value="${a.id}" ${raw(a.id === n.assunto_id ? 'selected' : '')}>${E.discNome(a.disciplina_id)} › ${a.titulo}</option>`)}</select></div></div>`,
+      foot: h`<button type="button" class="btn btn-primary" data-ok>Mover</button>`,
+      onMount(sh) { sh.$('[data-ok]').onclick = async () => {
+        const prev = { material_id: n.material_id || null, disciplina_id: n.disciplina_id || null, assunto_id: n.assunto_id || null };
+        const patch = { id: n.id, material_id: sh.$('[data-m]').value || null, disciplina_id: sh.$('[data-d]').value || null, assunto_id: sh.$('[data-a]').value || null };
+        try {
+          const r = await P.api.call('est.noteSave', patch, { mutation: true }); S.put('est_anotacoes', r.nota); sh.close(); if (parent) parent.close();
+          ui.toast('Resumo movido', { undo: async () => { try { const r2 = await P.api.call('est.noteSave', { id: n.id, ...prev }, { mutation: true }); S.put('est_anotacoes', r2.nota); } catch (e) { ui.toast(e.message, { error: true }); } } });
+          P.router.render(true);
+        } catch (e) { ui.toast(e.message, { error: true }); }
+      }; } });
+  }
+
+  Object.assign(E, { removeEst, ensureText, resumoIA, resumoView: view, resumoAcoes: acoes, resumoDuplicar: duplicar, notaSpec });
+})();
+</script>

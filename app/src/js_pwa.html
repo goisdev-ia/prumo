@@ -1,0 +1,49 @@
+<script>
+/* Prumo · ponte com o app instalado (casca PWA em pwa/): push no celular, tema da barra e navegação pelos avisos. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const st = { inShell: false, push: { supported: false, permission: 'default', subscribed: false, endpoint: '' }, standalone: false, waiters: new Map() };
+  const top = () => { try { return window.top; } catch (e) { return null; } };
+  const send = (msg) => { const t = top(); if (t && t !== window) try { t.postMessage(Object.assign({ app: 'prumo' }, msg), '*'); } catch (e) { /* noop */ } };
+  const wait = (type, ms) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { st.waiters.delete(type); reject(new Error('O app instalado não respondeu. Feche e abra o Prumo de novo.')); }, ms);
+    st.waiters.set(type, (d) => { clearTimeout(timer); st.waiters.delete(type); resolve(d); });
+  });
+
+  window.addEventListener('message', (e) => {
+    const d = e.data;
+    if (!d || d.shell !== 'prumo' || e.source !== top()) return;
+    if (d.type === 'prumo:shell') {
+      st.inShell = true; st.standalone = !!d.standalone;
+      Object.assign(st.push, d.push || {});
+      if (P.router && P.router.current() && P.router.current().tab === 'notificacoes') P.router.render(true);
+    }
+    if (d.type === 'prumo:go' && d.route) { if (P.ui && P.ui.closeAll) P.ui.closeAll(); P.router.go(String(d.route).replace(/^#?\/?/, '')); }
+    const w = st.waiters.get(d.type); if (w) w(d);
+  });
+
+  P.pwa = {
+    state: st,
+    url: () => (P.bootInfo && P.bootInfo.pwaUrl) || '',
+    hello() { send({ type: 'prumo:ready', dark: P.theme.resolved() === 'dark', execUrl: (P.bootInfo && P.bootInfo.execUrl) || '' }); },
+    theme(dark) { send({ type: 'prumo:theme', dark }); },
+    async enablePush() {
+      if (!st.inShell) throw new Error('Abra o Prumo pelo app instalado para ativar o push.');
+      const cfg = await P.api.call('push.config', {}, { ttl: 600000 });
+      send({ type: 'prumo:push:enable', publicKey: cfg.publicKey });
+      const r = await wait('prumo:push:sub', 120000);
+      if (r.error) throw new Error(r.error);
+      await P.api.call('push.subscribe', { sub: r.sub, dispositivo: r.device || '' }, { mutation: true });
+      Object.assign(st.push, { subscribed: true, permission: 'granted', endpoint: r.sub.endpoint });
+      return true;
+    },
+    async disablePush() {
+      send({ type: 'prumo:push:disable' });
+      const r = await wait('prumo:push:off', 20000);
+      if (r.endpoint) await P.api.call('push.unsubscribe', { endpoint: r.endpoint }, { mutation: true });
+      Object.assign(st.push, { subscribed: false, endpoint: '' });
+    }
+  };
+})();
+</script>

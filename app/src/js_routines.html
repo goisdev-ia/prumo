@@ -1,0 +1,259 @@
+<script>
+/* Prumo · Rotinas: hoje (linha do tempo + checklist), semana (time-blocking), mês, ano (heatmap), hábitos com sequência,
+   modelos prontos, estatísticas e cadastro com vínculos (treino, diário, tarefa, meta). */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, d: D, store: S, ui } = P;
+  const CATS = [['treino', 'Treino', 'dumbbell', '#C4684A'], ['estudo', 'Estudo', 'book', '#8FA3B8'], ['trabalho', 'Trabalho', 'briefcase', '#F2B705'], ['alimentacao', 'Alimentação', 'utensils', '#F6D365'], ['hobby', 'Hobby', 'star', '#B98900'], ['saude', 'Saúde', 'heart', '#5F9E8F'], ['lazer', 'Lazer', 'ticket', '#9A9A9A'], ['casa', 'Casa', 'home', '#5A5A5A'], ['outro', 'Outro', 'dots', '#9A9A9A']];
+  const CL = Object.fromEntries(CATS.map((c) => [c[0], c]));
+  const FREQ = { diaria: 'Todo dia', semanal: 'Semanal', mensal: 'Mensal', anual: 'Anual', intervalo: 'A cada N dias' };
+  const st = { day: D.today(), month: D.month(D.today()), year: new Date().getFullYear() };
+
+  const R = P.rot = {
+    all: () => S.all('rot_rotinas'),
+    active: () => S.where('rot_rotinas', (r) => r.ativa !== false),
+    color: (r) => r.cor || (CL[r.categoria] || CL.outro)[3],
+    icon: (r) => r.icone || (CL[r.categoria] || CL.outro)[2],
+    forDate: (date) => R.active().filter((r) => P.rotDue(r, date)).sort((a, b) => String(a.hora_inicio || '99').localeCompare(String(b.hora_inicio || '99'))),
+    exec: (rid, date) => S.where('rot_execucoes', (e) => e.rotina_id === rid && e.data === date)[0] || null,
+    items: (rid) => S.where('rot_itens', (i) => i.rotina_id === rid).sort((a, b) => (a.ordem || 0) - (b.ordem || 0)),
+    adherence(from, to, filter) {
+      let due = 0, done = 0;
+      const execs = S.where('rot_execucoes', (e) => e.data >= from && e.data <= to);
+      const idx = new Map(execs.map((e) => [e.rotina_id + e.data, e]));
+      R.all().filter((r) => !filter || filter(r)).forEach((r) => D.range(from, to).forEach((d) => { if (!P.rotDue({ ...r, ativa: true }, d) || d > D.today()) return; due++; const e = idx.get(r.id + d); if (e && (e.status === 'feito' || e.status === 'parcial')) done += e.status === 'feito' ? 1 : 0.5; }));
+      return { due, done, pct: due ? (done / due) * 100 : 0 };
+    },
+    /** Marca a execução do dia (upsert por rotina+data). */
+    async mark(rid, date, status, extra = {}) {
+      const ex = R.exec(rid, date);
+      if (navigator.vibrate) navigator.vibrate(12);
+      if (ex && ex.status === status && !extra.itens_json) return S.remove('rot_execucoes', ex.id, { undo: false });
+      return S.save('rot_execucoes', { ...(ex || {}), rotina_id: rid, data: date, status, hora_real: date === D.today() ? D.time() : null, ...extra }).catch(() => {});
+    },
+    useModel: async (id) => {
+      const m = S.get('rot_modelos', id); if (!m) return;
+      const rows = (m.rotinas_json || []).map((r) => ({ ...r, ativa: true, data_inicio: D.today(), cor: r.cor || (CL[r.categoria] || CL.outro)[3], icone: r.icone || (CL[r.categoria] || CL.outro)[2] }));
+      await S.saveMany('rot_rotinas', rows);
+      ui.toast(`${rows.length} rotina(s) criada(s) a partir de "${m.nome}"`, { action: { label: 'Ver', fn: () => P.router.go('rot') } });
+    }
+  };
+
+  const check = (r, date) => {
+    const e = R.exec(r.id, date), s = e ? e.status : null;
+    return h`<button class="check ${s === 'feito' ? 'on' : s === 'parcial' ? 'part' : s === 'pulado' ? 'skip' : ''}" data-act="rot.check" data-id="${r.id}" data-d="${date}" aria-label="Marcar ${r.titulo}">${icon(s === 'pulado' ? 'x' : s === 'parcial' ? 'minus' : 'check')}</button>`;
+  };
+  R.check = check;
+
+  function timelineItem(r, date) {
+    const e = R.exec(r.id, date), items = R.items(r.id), done = (e && e.itens_json) || {};
+    const link = r.vinculo_modulo === 'fit' && r.vinculo_id ? h`<button class="btn btn-ghost btn-xs" data-act="fit.start" data-id="${r.vinculo_id}">${icon('play', 'xs')}Treino</button>` : r.vinculo_modulo === 'fit' ? h`<a class="btn btn-ghost btn-xs" href="#/fit/treinos">${icon('dumbbell', 'xs')}Treinos</a>` : r.vinculo_modulo === 'nut' ? h`<a class="btn btn-ghost btn-xs" href="#/nut">${icon('utensils', 'xs')}Diário</a>` : r.vinculo_modulo === 'est' ? h`<button class="btn btn-ghost btn-xs" data-act="est.start" data-disc="${r.vinculo_id || ''}">${icon('book', 'xs')}Estudar</button>` : r.vinculo_modulo === 'tar' && r.vinculo_id ? h`<button class="btn btn-ghost btn-xs" data-act="tar.edit" data-id="${r.vinculo_id}">${icon('tasks', 'xs')}Tarefa</button>` : '';
+    return h`<div class="tl-r ${e && e.status === 'feito' ? 'done' : ''}" style="--rc:${R.color(r)}">
+      <span class="tl-time num">${r.hora_inicio || '—'}${r.hora_fim ? h`<small>${r.hora_fim}</small>` : ''}</span>
+      <div class="tl-card"><div class="row">${check(r, date)}<div class="grow"><b class="tap" data-act="rot.edit" data-id="${r.id}">${r.titulo}</b><div class="muted row-sm wrap" style="font-size:12px;gap:8px">${icon(R.icon(r), 'xs')}${CL[r.categoria] ? CL[r.categoria][1] : ''}${r.duracao_min ? ' · ' + fmt.dur(r.duracao_min * 60) : ''}${e && e.status === 'pulado' ? ' · pulado' : ''}${e && e.status === 'parcial' ? ' · parcial' : ''}</div>${link ? h`<div class="mt-2">${link}</div>` : ''}</div><button class="btn-icon sm" data-act="rot.statusMenu" data-id="${r.id}" data-d="${date}" aria-label="Mais opções">${icon('dots', 'sm')}</button></div>
+      ${items.length ? h`<div class="rot-items">${items.map((it) => h`<label class="row-sm"><input type="checkbox" data-on-change="rot.item" data-id="${r.id}" data-d="${date}" data-item="${it.id}" ${done[it.id] ? raw('checked') : ''}><span class="${done[it.id] ? 'faint' : ''}" style="${done[it.id] ? 'text-decoration:line-through' : ''}">${it.titulo}</span></label>`)}</div>` : ''}</div></div>`;
+  }
+
+  // ================= Telas =================
+  const deps = ['rot_rotinas', 'rot_execucoes', 'rot_itens', 'rot_modelos', 'fit_treinos'];
+
+  P.screen('rot', {
+    mod: 'rot', tab: 'hoje', title: 'Rotinas de hoje', deps,
+    render() {
+      const day = st.day, list = R.forDate(day);
+      const doneN = list.filter((r) => { const e = R.exec(r.id, day); return e && e.status === 'feito'; }).length;
+      const blocks = list.filter((r) => r.hora_inicio), loose = list.filter((r) => !r.hora_inicio);
+      const marks = new Set(S.all('rot_execucoes').filter((e) => e.status === 'feito').map((e) => e.data));
+      return h`<div class="page-head"><div><h1>Rotinas</h1><p>${fmt.dayLong(day)}</p></div>${list.length ? ui.ring((doneN / list.length) * 100, { size: 58, stroke: 6, label: `${doneN}/${list.length}`, labelSize: 14 }) : ''}</div>
+        ${ui.datestrip(day, 'rot.day', { marks })}
+        ${list.length ? h`<div class="tl-r-list">${blocks.map((r) => timelineItem(r, day))}</div>${loose.length ? h`<div class="group-h"><span>Sem horário</span></div><div class="tl-r-list">${loose.map((r) => timelineItem(r, day))}</div>` : ''}`
+          : ui.empty({ ill: 'calendar', title: R.all().length ? 'Nada programado neste dia' : 'Nenhuma rotina ainda', text: 'Monte blocos de horário, hábitos e checklists — ou comece com um modelo.', action: { label: R.all().length ? 'Nova rotina' : 'Ver modelos', act: R.all().length ? 'rot.edit' : 'ui.go', data: R.all().length ? {} : { to: 'rot/modelos' } } })}`;
+    }
+  });
+
+  P.screen('rot/semana', {
+    mod: 'rot', tab: 'semana', title: 'Semana', deps,
+    render() {
+      const ws = +P.settings.get('geral.inicio_semana', 0), a = D.weekStart(st.day, ws), days = Array.from({ length: 7 }, (_, i) => D.add(a, i));
+      const ad = R.adherence(a, D.add(a, 6));
+      return h`<div class="page-head"><div><h1>Semana</h1><p>${fmt.dm(a)} a ${fmt.dm(days[6])} · aderência ${fmt.pct(ad.pct)}</p></div><div class="row-sm"><button class="btn-icon sm filled" data-act="rot.day" data-v="${D.add(a, -7)}" aria-label="Semana anterior">${icon('chev-l', 'sm')}</button><button class="btn-icon sm filled" data-act="rot.day" data-v="${D.add(a, 7)}" aria-label="Próxima semana">${icon('chev-r', 'sm')}</button></div></div>
+        <div class="week-grid">${days.map((d) => h`<div class="card week-col ${d === D.today() ? 'today' : ''}"><b>${fmt.WD[D.dow(d)]} ${D.parse(d).getDate()}</b>
+          ${R.forDate(d).map((r) => { const e = R.exec(r.id, d); return h`<button class="wk-item ${e && e.status === 'feito' ? 'done' : ''} ${e && e.status === 'pulado' ? 'skipped' : ''}" style="--wc:${R.color(r)}" data-act="rot.check" data-id="${r.id}" data-d="${d}"><span class="num faint">${r.hora_inicio || ''}</span> ${r.titulo}${r.hora_fim ? h`<small class="faint"> até ${r.hora_fim}</small>` : ''}</button>`; })}</div>`)}</div>
+        <p class="faint mt-3" style="font-size:12.5px">Toque num bloco para marcar como feito.</p>`;
+    }
+  });
+
+  P.screen('rot/mes', {
+    mod: 'rot', tab: 'mes', title: 'Mês', deps,
+    render() {
+      const key = st.month, from = key + '-01', to = key + '-' + String(D.dim(key)).padStart(2, '0');
+      const execs = S.where('rot_execucoes', (e) => e.data >= from && e.data <= to && e.status === 'feito');
+      const byDay = P.groupBy(execs, (e) => e.data);
+      const ad = R.adherence(from, to < D.today() ? to : D.today());
+      return h`<div class="page-head"><div><h1>${fmt.monthCap(key)}</h1><p>Aderência ${fmt.pct(ad.pct)} · ${Math.round(ad.done)} de ${ad.due}</p></div><div class="row-sm"><button class="btn-icon sm filled" data-act="rot.month" data-v="-1" aria-label="Mês anterior">${icon('chev-l', 'sm')}</button><button class="btn-icon sm filled" data-act="rot.month" data-v="1" aria-label="Próximo mês">${icon('chev-r', 'sm')}</button></div></div>
+        <div class="dash"><div class="card span-7">${ui.monthCal(key, { selected: st.day, act: 'rot.day', renderDay: (d) => { const ex = byDay[d] || []; return ex.length ? { dots: ex.map((e) => { const r = S.getAny('rot_rotinas', e.rotina_id); return r ? R.color(r) : 'var(--c7)'; }) } : null; } })}
+          <div class="row-sm wrap mt-3">${CATS.filter((c) => R.all().some((r) => r.categoria === c[0])).map((c) => h`<span class="chip"><span class="dot" style="background:${c[3]}"></span>${c[1]}</span>`)}</div></div>
+        <div class="span-5"><div class="group-h" style="padding-top:0"><span>${fmt.day(st.day)}</span></div><div class="tl-r-list">${R.forDate(st.day).map((r) => timelineItem(r, st.day))}</div>${!R.forDate(st.day).length ? ui.empty({ ill: 'calendar', title: 'Nada neste dia', small: true }) : ''}</div></div>`;
+    }
+  });
+
+  P.screen('rot/ano', {
+    mod: 'rot', tab: 'ano', title: 'Ano', deps,
+    render() {
+      const y = st.year, from = `${y}-01-01`, to = `${y}-12-31`, ad = R.adherence(from, to < D.today() ? to : D.today());
+      return h`<div class="page-head"><div><h1>${y}</h1><p>Aderência no ano: ${fmt.pct(ad.pct)}</p></div><div class="row-sm"><button class="btn-icon sm filled" data-act="rot.year" data-v="-1" aria-label="Ano anterior">${icon('chev-l', 'sm')}</button><button class="btn-icon sm filled" data-act="rot.year" data-v="1" aria-label="Próximo ano">${icon('chev-r', 'sm')}</button></div></div>
+        <div class="card"><div class="card-head">${icon('calendar')}<h3>Dias com rotinas cumpridas</h3></div><div id="rot-year"></div>
+        <div class="row-sm mt-3 faint" style="font-size:12px">Menos <span class="heat" style="display:inline-grid;grid-template-rows:1fr"><i></i></span><span class="heat" style="display:inline-grid;grid-template-rows:1fr"><i class="l1"></i></span><span class="heat" style="display:inline-grid;grid-template-rows:1fr"><i class="l2"></i></span><span class="heat" style="display:inline-grid;grid-template-rows:1fr"><i class="l3"></i></span><span class="heat" style="display:inline-grid;grid-template-rows:1fr"><i class="l4"></i></span> Mais</div></div>
+        <div class="card mt-4"><div class="card-head">${icon('chart')}<h3>Aderência por mês</h3></div><div id="rot-months"></div></div>`;
+    },
+    mount() {
+      const y = st.year, ws = +P.settings.get('geral.inicio_semana', 0), first = D.weekStart(`${y}-01-01`, ws), last = `${y}-12-31`;
+      const execs = S.where('rot_execucoes', (e) => e.data.startsWith(String(y)));
+      const doneBy = {}; execs.forEach((e) => { if (e.status === 'feito') doneBy[e.data] = (doneBy[e.data] || 0) + 1; });
+      const cells = D.range(first, last).map((d) => {
+        if (!d.startsWith(String(y)) || d > D.today()) return { date: d, v: 0 };
+        const due = R.all().filter((r) => P.rotDue({ ...r, ativa: true }, d)).length, done = doneBy[d] || 0, p = due ? done / due : 0;
+        return { date: d, v: !done ? 0 : p < 0.34 ? 1 : p < 0.6 ? 2 : p < 0.9 ? 3 : 4, title: `${fmt.date(d)}: ${done}/${due}` };
+      });
+      document.getElementById('rot-year').innerHTML = P.toHtml(ui.heat(cells, { label: 'Aderência diária' })); ui.scrollHeat();
+      const months = Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`);
+      P.charts.mount('#rot-months', { type: 'bar', labels: months.map(fmt.monthShort), series: [{ label: 'Aderência', data: months.map((k) => { const f = k + '-01', t = k + '-' + D.dim(k); return f > D.today() ? 0 : Math.round(R.adherence(f, t < D.today() ? t : D.today()).pct); }) }], highlight: y === new Date().getFullYear() ? new Date().getMonth() : undefined, fmt: (v) => v + '%', max: 100, height: 200 });
+    }
+  });
+
+  P.screen('rot/habitos', {
+    mod: 'rot', tab: 'habitos', title: 'Hábitos', deps,
+    render() {
+      const rs = R.active(), execs = S.all('rot_execucoes'), days = Array.from({ length: 7 }, (_, i) => D.add(D.today(), i - 6));
+      return h`<div class="page-head"><div><h1>Hábitos</h1><p>Sequências e últimos 7 dias</p></div><button class="btn btn-primary btn-sm" data-act="rot.edit">${icon('plus', 'sm')}Nova rotina</button></div>
+        ${rs.length ? h`<div class="stack-sm">${rs.map((r) => { const s = P.rotStreak(r, execs); const ad = R.adherence(D.add(D.today(), -29), D.today(), (x) => x.id === r.id); return h`<div class="card habit" style="--rc:${R.color(r)}">
+          <div class="row">${P.tile(R.color(r), R.icon(r))}<div class="grow tap" data-act="rot.edit" data-id="${r.id}"><b>${r.titulo}</b><div class="muted" style="font-size:12.5px">${FREQ[r.frequencia]}${r.frequencia === 'semanal' ? ' · ' + String(r.dias_semana || '').split(',').filter(Boolean).map((d) => fmt.WD[+d]).join(', ') : ''}${r.hora_inicio ? ' · ' + r.hora_inicio : ''}</div></div>
+          <div class="streak-box"><b class="num">${icon('flame', 'xs')}${s.atual}</b><small>melhor ${s.melhor}</small></div></div>
+          <div class="habit-days">${days.map((d) => { const due = P.rotDue(r, d); const e = R.exec(r.id, d); return h`<button class="hd ${!due ? 'off' : ''} ${e ? e.status : ''}" data-act="rot.check" data-id="${r.id}" data-d="${d}" ${due ? '' : raw('disabled')} aria-label="${fmt.dayLong(d)}"><span>${fmt.WD[D.dow(d)][0]}</span><i>${e && e.status === 'feito' ? icon('check', 'xs') : ''}</i></button>`; })}<span class="muted num" style="font-size:12px;margin-left:auto">${fmt.pct(ad.pct)} em 30 dias</span></div></div>`; })}</div>`
+          : ui.empty({ ill: 'check', title: 'Nenhum hábito ativo', action: { label: 'Nova rotina', act: 'rot.edit' } })}`;
+    }
+  });
+
+  P.screen('rot/modelos', {
+    mod: 'rot', tab: 'modelos', title: 'Modelos', deps,
+    render() {
+      const ms = S.all('rot_modelos');
+      return h`<div class="page-head"><div><h1>Modelos de rotina</h1><p>Pontos de partida prontos para ajustar</p></div></div>
+        ${ms.length ? h`<div class="grid acc-grid">${ms.map((m, i) => { const color = P.PALETTE[i % 6]; return h`<div class="plan-card" style="--pc:${color}">${P.fit ? P.fit.pattern(m.nome, color) : ''}<div class="plan-body"><b>${m.nome}</b><span>${m.descricao || ''}</span><span class="faint" style="font-size:12px">${(m.rotinas_json || []).map((r) => r.titulo).join(' · ')}</span></div><button class="btn btn-primary btn-sm plan-cta" data-act="rot.useModel" data-id="${m.id}">Usar</button></div>`; })}</div>` : ui.empty({ ill: 'list', title: 'Sem modelos', text: 'Rode setup() para criar os modelos padrão.' })}`;
+    }
+  });
+
+  // Estatísticas: período e categoria escolhidos
+  const ROT_PF = { def: '30d', modes: ['7d', '30d', '90d', 'mes', 'ano', 'intervalo'], tables: ['rot_execucoes'] };
+  function rotStatsRange() {
+    const r = P.pf.range('rot.stats', ROT_PF), t = D.today(), cat = P.flt.get('rot.stats', 'cat', '');
+    const from = r.from || D.add(t, -29), to = r.to && r.to < t ? r.to : t;
+    return { from: from > to ? to : from, to, fn: cat ? (x) => x.categoria === cat : null };
+  }
+  P.screen('rot/stats', {
+    mod: 'rot', tab: 'stats', title: 'Estatísticas', deps,
+    render() {
+      const { from, to, fn } = rotStatsRange(), ad = R.adherence(from, to, fn);
+      const best = R.active().filter((r) => !fn || fn(r)).map((r) => ({ r, s: P.rotStreak(r, S.all('rot_execucoes')) })).sort((a, b) => b.s.melhor - a.s.melhor)[0];
+      return h`<div class="page-head"><div><h1>Estatísticas</h1><p>${P.pf.range('rot.stats', ROT_PF).label}</p></div>${P.rep.button('rot')}</div>
+        <div class="filters mb-3">${P.pf.bar('rot.stats', { ...ROT_PF, extra: P.flt.select('rot.stats', 'cat', CATS.filter((c) => R.all().some((r) => r.categoria === c[0])).map((c) => [c[0], c[1]]), 'Todas as categorias') })}</div>
+        <div class="grid g3"><div class="card">${ui.metric({ label: 'Aderência geral', value: fmt.pct(ad.pct), size: 'md', sub: `${Math.round(ad.done)} de ${ad.due}` })}</div><div class="card">${ui.metric({ label: 'Rotinas ativas', value: R.active().length, size: 'md' })}</div><div class="card">${ui.metric({ label: 'Melhor sequência', value: best ? best.s.melhor : 0, unit: 'dias', size: 'md', sub: best ? best.r.titulo : '' })}</div></div>
+        <div class="dash mt-4"><div class="card span-6"><div class="card-head">${icon('layers')}<h3>Por categoria</h3></div><div id="rot-cat"></div></div><div class="card span-6"><div class="card-head">${icon('calendar')}<h3>Por dia da semana</h3></div><div id="rot-dow"></div></div>
+        <div class="card span-12"><div class="card-head">${icon('trending')}<h3>Aderência diária</h3></div><div id="rot-trend"></div></div></div>`;
+    },
+    mount() {
+      const { from, to, fn } = rotStatsRange(), cats = CATS.filter((c) => R.all().some((r) => r.categoria === c[0]) && (!fn || fn({ categoria: c[0] })));
+      P.charts.mount('#rot-cat', { type: 'bar', horizontal: true, labels: cats.map((c) => c[1]), series: [{ label: 'Aderência', data: cats.map((c) => Math.round(R.adherence(from, to, (r) => r.categoria === c[0]).pct)), colors: cats.map((c) => c[3]) }], fmt: (v) => v + '%', yfmt: (v) => v + '%', height: Math.max(180, cats.length * 36) });
+      const dows = [0, 1, 2, 3, 4, 5, 6], days = D.range(from, to);
+      P.charts.mount('#rot-dow', { type: 'bar', labels: dows.map((d) => fmt.WD[d]), series: [{ label: 'Aderência', data: dows.map((w) => { const ds = days.filter((d) => D.dow(d) === w); let due = 0, done = 0; ds.forEach((d) => { const a = R.adherence(d, d, fn); due += a.due; done += a.done; }); return due ? Math.round((done / due) * 100) : 0; }) }], fmt: (v) => v + '%', height: 200 });
+      const tr = D.range(from, to);
+      P.charts.mount('#rot-trend', { type: 'line', labels: tr.map(fmt.dm), series: [{ label: 'Aderência', data: tr.map((d) => Math.round(R.adherence(d, d, fn).pct)), fill: true }], fmt: (v) => v + '%', max: 100, height: 200 });
+    }
+  });
+
+  P.screen('rot/lista', {
+    mod: 'rot', tab: 'lista', title: 'Todas as rotinas', deps,
+    render() {
+      const fk = 'rot.lista', stt = P.flt.get(fk, 'status', 'todas'), cat = P.flt.get(fk, 'cat', ''), fq = P.flt.get(fk, 'freq', '');
+      const rs = R.all().filter((r) => (stt === 'todas' || (stt === 'ativas' ? r.ativa !== false : r.ativa === false)) && (!cat || r.categoria === cat) && (!fq || r.frequencia === fq) && P.flt.match(fk, r.titulo, r.descricao))
+        .sort((a, b) => (a.ativa === false ? 1 : 0) - (b.ativa === false ? 1 : 0) || String(a.hora_inicio || '99').localeCompare(String(b.hora_inicio || '99')));
+      return h`<div class="page-head"><div><h1>Todas as rotinas</h1><p>${rs.length} de ${R.all().length}</p></div><button class="btn btn-primary btn-sm" data-act="rot.edit">${icon('plus', 'sm')}Nova</button></div>
+        <div class="filters mb-3">${R.all().length > 5 ? P.flt.search(fk, 'Buscar rotina') : ''}<div class="row-f">${P.flt.chips(fk, 'status', [['todas', 'Todas'], ['ativas', 'Ativas'], ['inativas', 'Pausadas']])}${P.flt.select(fk, 'cat', CATS.map((c) => [c[0], c[1]]), 'Todas as categorias')}${P.flt.select(fk, 'freq', Object.entries(FREQ), 'Qualquer frequência')}</div></div>
+        ${rs.length ? h`<div class="list cardlist">${rs.map((r) => h`<div class="li tap ${r.ativa === false ? 'done' : ''}" data-act="rot.edit" data-id="${r.id}">${P.tile(R.color(r), R.icon(r), true)}<span class="main"><span class="t">${r.titulo}</span><span class="s">${FREQ[r.frequencia]} · ${{ habito: 'Hábito', bloco: 'Bloco', checklist: 'Checklist' }[r.modo]}${r.hora_inicio ? ' · ' + r.hora_inicio + (r.hora_fim ? '–' + r.hora_fim : '') : ''}${r.ativa === false ? ' · pausada' : ''}</span></span>${icon('chev-r', 'sm faint')}</div>`)}</div>` : ui.empty({ ill: 'calendar', title: 'Nenhuma rotina', action: { label: 'Nova rotina', act: 'rot.edit' } })}`;
+    }
+  });
+
+  // ================= Edição =================
+  R.edit = (row) => {
+    const items = row ? R.items(row.id).map((i) => i.titulo) : [];
+    ui.editSheet({
+      table: 'rot_rotinas', row, title: row ? 'Editar rotina' : 'Nova rotina', size: 'full',
+      defaults: { categoria: 'saude', modo: 'habito', frequencia: 'diaria', ativa: true, data_inicio: D.today(), dias_semana: '1,2,3,4,5' },
+      fields: [{ k: 'titulo', l: 'Nome', t: 'text', req: true, focus: !row, ph: 'Ex.: Estudo focado' },
+        { k: 'modo', l: 'Tipo', t: 'seg', opts: [['habito', 'Hábito'], ['bloco', 'Bloco de horário'], ['checklist', 'Checklist']], def: 'habito' },
+        { k: 'categoria', l: 'Categoria', t: 'select', req: true, half: true, opts: CATS.map((c) => [c[0], c[1]]) }, { k: 'frequencia', l: 'Frequência', t: 'select', req: true, half: true, opts: Object.entries(FREQ) },
+        { k: 'dias_semana', l: 'Dias', t: 'days', show: (v) => v.frequencia === 'semanal' },
+        { k: 'dia_mes', l: 'Dia do mês', t: 'int', half: true, min: 1, max: 31, show: (v) => v.frequencia === 'mensal' || v.frequencia === 'anual' }, { k: 'mes', l: 'Mês', t: 'int', half: true, min: 1, max: 12, show: (v) => v.frequencia === 'anual' },
+        { k: 'intervalo_dias', l: 'A cada quantos dias', t: 'int', half: true, min: 1, show: (v) => v.frequencia === 'intervalo' },
+        { k: 'hora_inicio', l: 'Horário', t: 'time', half: true }, { k: 'hora_fim', l: 'Até', t: 'time', half: true, show: (v) => v.modo === 'bloco' },
+        { k: 'data_inicio', l: 'Começa em', t: 'date', half: true }, { k: 'data_fim', l: 'Termina em', t: 'date', half: true },
+        { k: 'vinculo_modulo', l: 'Vincular a', t: 'select', half: true, ph: 'Nada', opts: [['fit', 'Treino'], ['nut', 'Diário alimentar'], ['tar', 'Tarefa'], ['est', 'Sessão de estudo']] },
+        { k: 'vinculo_id', l: 'Disciplina', t: 'select', half: true, ph: 'Escolher na hora', opts: () => (P.est && P.est.loaded ? P.est.disciplinas().map((d) => [d.id, d.nome]) : []), show: (v) => v.vinculo_modulo === 'est' },
+        { k: 'vinculo_id', l: 'Qual treino', t: 'select', half: true, opts: () => S.all('fit_treinos').map((t) => [t.id, t.nome]), ph: 'Escolher na hora', show: (v) => v.vinculo_modulo === 'fit' },
+        { k: 'meta_id', l: 'Meta vinculada', t: 'select', opts: S.where('met_metas', (m) => m.status === 'ativa').map((m) => [m.id, m.titulo]) },
+        { k: 'cor', l: 'Cor', t: 'color' }, { k: 'ativa', l: 'Rotina ativa', t: 'toggle', show: () => !!row }],
+      extra: h`<div class="field"><span class="label">Itens do checklist <span class="faint">(um por linha)</span></span><textarea class="input" rows="3" data-items placeholder="Separar marmitas&#10;Lavar a louça">${items.join('\n')}</textarea></div>`,
+      mount(sh) { sh._items = () => sh.$('[data-items]').value.split('\n').map((x) => x.trim()).filter(Boolean); },
+      beforeSave: (r) => {
+        const out = { ...r };
+        if (out.hora_inicio && out.hora_fim) { const [a1, a2] = out.hora_inicio.split(':').map(Number), [b1, b2] = out.hora_fim.split(':').map(Number); const m = b1 * 60 + b2 - (a1 * 60 + a2); if (m > 0) out.duracao_min = m; }
+        if (out.frequencia === 'semanal' && !out.dias_semana) throw Object.assign(new Error('Escolha ao menos um dia.'), { field: 'dias_semana' });
+        if (!out.icone) out.icone = (CL[out.categoria] || CL.outro)[2];
+        if (!out.cor) out.cor = (CL[out.categoria] || CL.outro)[3];
+        return out;
+      },
+      save: async (r, sh) => {
+        const saved = await S.save('rot_rotinas', r, { silentError: true });
+        const want = sh._items(), cur = R.items(saved.id);
+        const same = want.length === cur.length && want.every((t, i) => cur[i].titulo === t);
+        if (!same) {
+          for (const c of cur) await S.remove('rot_itens', c.id, { undo: false });
+          if (want.length) await S.saveMany('rot_itens', want.map((t, i) => ({ rotina_id: saved.id, titulo: t, ordem: i })));
+        }
+        return saved;
+      },
+      deleteText: 'O histórico de execuções deixa de aparecer.', deleteLabel: 'Rotina excluída'
+    });
+  };
+
+  // ================= Ações =================
+  const reRender = () => P.router.render(true);
+  Object.assign(P.act, {
+    'rot.day': (el) => { st.day = el.dataset.v; st.month = D.month(st.day); reRender(); },
+    'rot.month': (el) => { st.month = D.shiftMonth(st.month, +el.dataset.v); reRender(); },
+    'rot.year': (el) => { st.year += +el.dataset.v; reRender(); },
+    'rot.edit': (el) => R.edit(el && el.dataset.id ? S.get('rot_rotinas', el.dataset.id) : null),
+    'rot.check': (el) => { if (el.dataset.d > D.today()) return ui.toast('Esse dia ainda não chegou.'); R.mark(el.dataset.id, el.dataset.d, 'feito'); },
+    'rot.statusMenu': (el) => {
+      const r = S.get('rot_rotinas', el.dataset.id), d = el.dataset.d, ex = R.exec(r.id, d);
+      ui.menu(r.titulo, [{ label: 'Feito', icon: 'check', act: () => R.mark(r.id, d, 'feito') }, { label: 'Parcial', icon: 'minus', act: () => R.mark(r.id, d, 'parcial') }, { label: 'Pulado hoje', icon: 'x', act: () => R.mark(r.id, d, 'pulado') },
+        ex ? { label: 'Limpar marcação', icon: 'undo', act: () => S.remove('rot_execucoes', ex.id, { undo: false }) } : null, { label: 'Editar rotina', icon: 'edit', act: () => R.edit(r) }]);
+    },
+    'rot.item': (el) => {
+      const rid = el.dataset.id, d = el.dataset.d, ex = R.exec(rid, d), items = R.items(rid);
+      const done = { ...((ex && ex.itens_json) || {}) }; done[el.dataset.item] = el.checked;
+      const n = items.filter((i) => done[i.id]).length;
+      R.mark(rid, d, n === items.length ? 'feito' : n ? 'parcial' : 'pendente', { itens_json: done });
+    },
+    'rot.useModel': (el) => R.useModel(el.dataset.id)
+  });
+
+  P.module({
+    id: 'rot', name: 'Rotinas', icon: 'repeat', home: 'rot', plusLabel: 'Nova rotina', plus: () => R.edit(null),
+    blurb: () => { const l = R.forDate(D.today()); const d = l.filter((r) => { const e = R.exec(r.id, D.today()); return e && e.status === 'feito'; }).length; return `${d}/${l.length} feitas hoje`; },
+    tabs: [{ id: 'hoje', label: 'Hoje', icon: 'clock', route: 'rot' }, { id: 'semana', label: 'Semana', icon: 'calendar', route: 'rot/semana' }, { id: 'habitos', label: 'Hábitos', icon: 'flame', route: 'rot/habitos' }, { id: 'mais', label: 'Mais', icon: 'grid', more: true }],
+    more: [{ id: 'mes', label: 'Mês', icon: 'calendar', route: 'rot/mes' }, { id: 'ano', label: 'Ano', icon: 'grid', route: 'rot/ano' }, { id: 'modelos', label: 'Modelos', icon: 'layers', route: 'rot/modelos' }, { id: 'stats', label: 'Estatísticas', icon: 'chart', route: 'rot/stats' }, { id: 'lista', label: 'Todas as rotinas', icon: 'list', route: 'rot/lista' }]
+  });
+})();
+</script>

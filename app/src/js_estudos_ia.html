@@ -1,0 +1,396 @@
+<script>
+/* Prumo · Estudos: assistente de IA.
+   - Provedores (só o dono): nome de exibição, URL base, chave (opcional), formato, modelos (id + nome) e cabeçalhos;
+     "Buscar modelos" e "Testar" funcionam antes de salvar. Modelos prontos de provedores com nível gratuito.
+   - A pessoa escolhe o modelo na hora (fica lembrado neste aparelho).
+   - Tela "Assistente de IA": conversar, resumo, questões e flashcards com fontes (biblioteca, Drive, anotações,
+     questões, edital e meus dados); salvar como anotação, incluir no banco, treinar e mandar para o Telegram. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, fmt, store: S, ui } = P;
+  const E = P.est;
+  const LS = 'prumo.est.ia.modelo';
+
+  // Provedores com nível gratuito (todos pedem uma chave criada pela própria pessoa; limites mudam com o tempo).
+  const PRESETS = [
+    { k: 'gemini', nome: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', formato: 'openai', link: 'https://aistudio.google.com/apikey',
+      modelos: [['gemini-flash-latest', 'Gemini Flash'], ['gemini-flash-lite-latest', 'Gemini Flash-Lite']], nota: 'Chave grátis no Google AI Studio, sem cartão. O nível gratuito tem limite por minuto e por dia.' },
+    { k: 'groq', nome: 'Groq', base: 'https://api.groq.com/openai/v1', formato: 'openai', link: 'https://console.groq.com/keys',
+      modelos: [['openai/gpt-oss-120b', 'GPT-OSS 120B'], ['llama-3.3-70b-versatile', 'Llama 3.3 70B'], ['llama-3.1-8b-instant', 'Llama 3.1 8B (rápido)']], nota: 'Chave grátis, sem cartão. Muito rápido; limite diário de pedidos por modelo.' },
+    { k: 'openrouter', nome: 'OpenRouter (grátis)', base: 'https://openrouter.ai/api/v1', formato: 'openai', link: 'https://openrouter.ai/keys',
+      modelos: [['openrouter/free', 'Modelo gratuito automático']], headers: [['HTTP-Referer', 'https://script.google.com'], ['X-Title', 'Prumo']], nota: 'Use modelos terminados em ":free" (Buscar modelos). Sem créditos: cerca de 50 pedidos por dia.' },
+    { k: 'cerebras', nome: 'Cerebras', base: 'https://api.cerebras.ai/v1', formato: 'openai', link: 'https://cloud.cerebras.ai', modelos: [['gpt-oss-120b', 'GPT-OSS 120B']], nota: 'Chave grátis; limite diário de tokens.' },
+    { k: 'mistral', nome: 'Mistral', base: 'https://api.mistral.ai/v1', formato: 'openai', link: 'https://console.mistral.ai/api-keys', modelos: [['mistral-small-latest', 'Mistral Small']], nota: 'Plano gratuito "Experiment" (pede verificação por telefone).' },
+    { k: 'pollinations', nome: 'Pollinations', base: 'https://gen.pollinations.ai/v1', formato: 'openai', link: 'https://enter.pollinations.ai', modelos: [['openai', 'OpenAI (Pollinations)']], nota: 'Precisa de chave (o acesso anônimo é limitado demais). Confira os modelos com "Buscar modelos".' },
+    { k: 'anthropic', nome: 'Anthropic (Claude)', base: 'https://api.anthropic.com/v1', formato: 'anthropic', link: 'https://console.anthropic.com/settings/keys', modelos: [['claude-haiku-5-5', 'Claude Haiku 5.5']], nota: 'Pago por uso (créditos).' }
+  ];
+
+  // ================= modelo escolhido =================
+  const provs = () => ((E.ia && E.ia.provedores) || []).filter((p) => (p.modelos || []).length);
+  const opts = () => provs().flatMap((p) => p.modelos.map((m) => [p.id + '|' + m.id, `${p.nome} · ${m.nome || m.id}`]));
+  function sel() {
+    let v = null;
+    try { v = localStorage.getItem(LS); } catch (e) { /* sem armazenamento */ }
+    if (!v || !opts().some((o) => o[0] === v)) { const pd = E.ia && E.ia.padrao; v = pd ? pd.provedor + '|' + pd.modelo : (opts()[0] || [''])[0]; }
+    const i = String(v || '').indexOf('|');
+    return { key: v, provedor: i > 0 ? v.slice(0, i) : null, modelo: i > 0 ? v.slice(i + 1) : null };
+  }
+  const picker = () => { const s = sel(); return h`<select class="input sm" data-on-change="est.iaPick" aria-label="Modelo de IA" style="max-width:300px">${opts().map(([v, l]) => h`<option value="${v}" ${raw(v === s.key ? 'selected' : '')}>${l}</option>`)}</select>`; };
+  /** Chamada ao assistente com o modelo escolhido. */
+  async function ai(payload, o = {}) {
+    const s = sel();
+    const r = await P.api.call('est.aiRun', { ...payload, provedor: s.provedor, modelo: s.modelo }, { mutation: true, timeout: o.timeout || 180000 });
+    if (E.ia) E.ia.uso_hoje = (+E.ia.uso_hoje || 0) + 1;
+    return r;
+  }
+  const iaChip = (r) => h`<span class="chip info">Gerado por IA${r && r.ia ? ' · ' + r.ia.provedor + ' · ' + r.ia.modelo : ''} · confira</span>`;
+  const on = () => !!(E.ia && E.ia.configurado);
+  async function refreshStatus() { try { E.ia = await P.api.call('est.aiStatus', {}); } catch (e) { /* mantém */ } }
+
+  // ================= provedores (dono) =================
+  function provList() {
+    if (!(E.ia && E.ia.dono)) { ui.toast('Só o dono do app configura os provedores de IA.', { error: true }); return null; }
+    const s = ui.sheet({ title: 'Provedores de IA', size: 'full', wide: true, body: h`<div data-pl></div>`,
+      onMount(sh) {
+        const box = sh.$('[data-pl]');
+        const draw = () => {
+          const ia = E.ia || {}, list = ia.provedores || [], pd = ia.padrao || {};
+          box.innerHTML = P.toHtml(h`<p class="muted" style="font-size:13px">Cadastre um ou mais provedores; cada pessoa escolhe o modelo na hora de usar. A chave fica só nas propriedades do script (o navegador vê os 4 últimos caracteres). Os provedores abaixo têm nível gratuito, mas todos pedem uma chave criada por você.</p>
+            <div class="section-title"><h2>Cadastrados</h2><button type="button" class="btn btn-primary btn-sm" data-new>${icon('plus', 'sm')}Adicionar provedor</button></div>
+            ${list.length ? h`<div class="list cardlist">${list.map((p) => h`<div class="li"><span class="tile sm">${icon('zap', 'sm')}</span><span class="main"><span class="t">${p.nome}${pd.provedor === p.id ? h` <span class="chip acc">padrão</span>` : ''}</span><span class="s">${p.base} · ${p.formato === 'anthropic' ? 'Anthropic' : 'OpenAI-compatível'} · ${p.modelos.length} modelo(s) · ${p.tem_chave ? 'chave ' + p.chave_mask : 'sem chave'}${p.headers.length ? ' · ' + p.headers.length + ' cabeçalho(s)' : ''}</span></span>
+              <button type="button" class="btn btn-ghost btn-sm" data-test="${p.id}">Testar</button><button type="button" class="btn-icon sm" data-edit="${p.id}" aria-label="Editar ${p.nome}">${icon('edit', 'sm')}</button><button type="button" class="btn-icon sm" data-del="${p.id}" aria-label="Excluir ${p.nome}">${icon('trash', 'sm')}</button></div>`)}</div>
+              <div class="grid g2 mt-3"><div class="field"><label>Modelo padrão</label><select class="input" data-pad>${opts().map(([v, l]) => h`<option value="${v}" ${raw(v === pd.provedor + '|' + pd.modelo ? 'selected' : '')}>${l}</option>`)}</select></div>
+                <div class="field"><label>Usos por pessoa por dia</label><div class="row-sm"><input class="input num" data-lim inputmode="numeric" value="${ia.limite_dia || 40}"><button type="button" class="btn btn-ghost btn-sm" data-limok>Salvar</button></div></div></div>`
+              : h`<p class="muted" style="font-size:13px">Nenhum provedor ainda. Use um dos modelos prontos abaixo ou adicione manualmente.</p>`}
+            <div class="section-title"><h2>Modelos prontos</h2></div>
+            <div class="grid acc-grid">${PRESETS.map((x) => h`<div class="card pad-lg"><b>${x.nome}</b><p class="faint mt-2" style="font-size:12px">${x.base}</p><p class="muted mt-2" style="font-size:12.5px">${x.nota}</p>
+              <div class="row-sm wrap mt-2"><button type="button" class="btn btn-ghost btn-sm" data-preset="${x.k}">${icon('plus', 'sm')}Usar</button><a class="btn btn-ghost btn-sm" href="${x.link}" target="_blank" rel="noopener">${icon('external', 'sm')}Criar chave</a></div></div>`)}</div>
+            ${list.length ? h`<button type="button" class="btn btn-ghost btn-sm mt-4" data-off style="color:var(--danger)">Desligar o assistente (apaga provedores e chaves)</button>` : ''}`);
+        };
+        const cfg = async (payload, btn) => { if (btn) btn.classList.add('loading'); try { const r = await P.api.call('est.aiConfig', payload, { mutation: true, timeout: 120000 }); return r; } catch (e) { ui.toast(e.message, { error: true }); return null; } finally { if (btn) btn.classList.remove('loading'); } };
+        sh.el.addEventListener('click', async (e) => {
+          const t = e.target.closest('button'); if (!t) return;
+          const list = (E.ia && E.ia.provedores) || [];
+          if (t.hasAttribute('data-new')) { provForm(null, null, draw); return; }
+          if (t.dataset.preset) { const pr = PRESETS.find((x) => x.k === t.dataset.preset); const ja = list.find((p) => p.base === pr.base); provForm(ja || null, ja ? null : pr, draw); return; }
+          if (t.dataset.edit) { provForm(list.find((p) => p.id === t.dataset.edit), null, draw); return; }
+          if (t.dataset.test) { const r = await cfg({ acao: 'testar', id: t.dataset.test }, t); if (r) ui.toast(`Funcionou em ${fmt.num(r.ms / 1000, 1)} s (${r.modelo}): "${r.resposta}"`, { icon: 'check', duration: 7000 }); return; }
+          if (t.dataset.del) { const p = list.find((x) => x.id === t.dataset.del); if (!(await ui.confirm({ title: 'Excluir ' + p.nome + '?', text: 'A chave guardada também é apagada.', ok: 'Excluir', danger: true }))) return; const r = await cfg({ acao: 'excluir', id: p.id }, t); if (r) { E.ia = r; draw(); P.router.render(true); } return; }
+          if (t.hasAttribute('data-limok')) { const v = Math.round(P.parseNum(sh.$('[data-lim]').value)); if (!(v >= 1 && v <= 1000)) { ui.toast('Use um número entre 1 e 1000.', { error: true }); return; } const r = await cfg({ acao: 'limite', limite: v }, t); if (r) { E.ia = r; ui.toast('Limite salvo'); } return; }
+          if (t.hasAttribute('data-off')) { if (!(await ui.confirm({ title: 'Desligar o assistente?', text: 'Todos os provedores e chaves são apagados. Estudos continua funcionando sem IA.', ok: 'Desligar', danger: true }))) return; const r = await cfg({ acao: 'desligar' }, t); if (r) { E.ia = r; draw(); P.router.render(true); ui.toast('Assistente desligado'); } }
+        });
+        sh.el.addEventListener('change', async (e) => {
+          if (!e.target.matches('[data-pad]')) return;
+          const v = e.target.value, i = v.indexOf('|');
+          const r = await cfg({ acao: 'padrao', provedor: v.slice(0, i), modelo: v.slice(i + 1) }); if (r) { E.ia = r; draw(); ui.toast('Modelo padrão salvo'); }
+        });
+        draw();
+      } });
+    return s;
+  }
+
+  /** Formulário do provedor: nome, URL, chave, formato, modelos e cabeçalhos (linhas com adicionar/remover). */
+  function provForm(pv, preset, done) {
+    const b = pv || preset || {};
+    const M = (b.modelos || []).map((m) => (Array.isArray(m) ? { id: m[0], nome: m[1] } : { id: m.id, nome: m.nome }));
+    const H = (b.headers || []).map((x) => (Array.isArray(x) ? { nome: x[0], valor: x[1] } : { nome: x.nome, valor: x.valor }));
+    if (!M.length) M.push({ id: '', nome: '' });
+    const mRow = (m) => h`<div class="ai-row" data-mrow><input class="input sm" data-mid placeholder="model-id" value="${m.id || ''}" aria-label="Id do modelo" spellcheck="false"><input class="input sm" data-mnome placeholder="Nome de exibição" value="${m.nome || ''}" aria-label="Nome do modelo"><button type="button" class="btn-icon sm" data-rm aria-label="Remover modelo">${icon('trash', 'sm')}</button></div>`;
+    const hRow = (x) => h`<div class="ai-row" data-hrow><input class="input sm" data-hn placeholder="Header-Name" value="${x.nome || ''}" aria-label="Nome do cabeçalho" spellcheck="false"><input class="input sm" data-hv placeholder="valor" value="${x.valor || ''}" aria-label="Valor do cabeçalho" spellcheck="false"><button type="button" class="btn-icon sm" data-rm aria-label="Remover cabeçalho">${icon('trash', 'sm')}</button></div>`;
+    const s = ui.sheet({ title: pv ? 'Editar provedor' : 'Adicionar provedor', size: 'full',
+      body: h`<form class="form" novalidate data-f>
+        <div class="field full"><label for="ai-nome">Nome de exibição</label><input class="input" id="ai-nome" name="nome" value="${b.nome || ''}" placeholder="Ex.: Groq"></div>
+        <div class="field full"><label for="ai-base">URL base</label><input class="input" id="ai-base" name="base" value="${b.base || ''}" placeholder="https://api.groq.com/openai/v1" inputmode="url" spellcheck="false"><span class="hint">Sem o final /chat/completions.</span></div>
+        <div class="field full"><label for="ai-fmt">Formato da API</label><select class="input" id="ai-fmt" name="formato"><option value="openai" ${raw(b.formato !== 'anthropic' ? 'selected' : '')}>Compatível com OpenAI (/chat/completions)</option><option value="anthropic" ${raw(b.formato === 'anthropic' ? 'selected' : '')}>Anthropic (/messages)</option></select></div>
+        <div class="field full"><label for="ai-key">Chave da API</label><input class="input" id="ai-key" name="chave" type="password" autocomplete="new-password" spellcheck="false" value="${pv && pv.tem_chave ? pv.chave_mask : ''}" placeholder="${pv && pv.tem_chave ? '' : 'cole a chave'}">
+          <span class="hint">Opcional. Deixe vazio se a autenticação for pelos cabeçalhos.${pv && pv.tem_chave ? ' Mantida enquanto aparecer mascarada.' : ''}</span>
+          ${preset && preset.link ? h`<a class="link-btn mt-2" href="${preset.link}" target="_blank" rel="noopener">${icon('external', 'xs')}Criar chave grátis em ${preset.nome}</a>` : ''}
+          ${pv && pv.tem_chave ? h`<label class="row-sm mt-2"><input type="checkbox" data-rmkey> Remover a chave guardada</label>` : ''}</div>
+        <div class="field full"><span class="label">Modelos</span><div data-ms>${M.map(mRow)}</div>
+          <div class="row-sm wrap mt-2"><button type="button" class="btn btn-ghost btn-sm" data-madd>${icon('plus', 'sm')}Adicionar modelo</button><button type="button" class="btn btn-ghost btn-sm" data-mfetch>${icon('search', 'sm')}Buscar modelos</button></div><div data-mlist></div></div>
+        <div class="field full"><span class="label">Cabeçalhos (opcional)</span><div data-hs>${H.map(hRow)}</div><button type="button" class="btn btn-ghost btn-sm mt-2" data-hadd>${icon('plus', 'sm')}Adicionar cabeçalho</button>
+          <span class="hint">Cabeçalhos com auth, key, token ou secret no nome são tratados como segredo.</span></div>
+        ${preset && preset.nota ? h`<p class="faint full" style="font-size:12px">${preset.nota}</p>` : ''}
+        <div class="full" data-res></div></form>`,
+      foot: h`<button type="button" class="btn btn-ghost" data-test>Testar</button><button type="button" class="btn btn-primary grow" data-save>Salvar</button>`,
+      onMount(sh) {
+        const f = sh.$('[data-f]');
+        const read = () => ({
+          id: pv ? pv.id : undefined, nome: f.nome.value.trim(), base: f.base.value.trim(), formato: f.formato.value, chave: f.chave.value.trim(),
+          modelos: P.$$('[data-mrow]', sh.el).map((r) => ({ id: r.querySelector('[data-mid]').value.trim(), nome: r.querySelector('[data-mnome]').value.trim() })).filter((m) => m.id),
+          headers: P.$$('[data-hrow]', sh.el).map((r) => ({ nome: r.querySelector('[data-hn]').value.trim(), valor: r.querySelector('[data-hv]').value })).filter((x) => x.nome)
+        });
+        const res = (html) => { sh.$('[data-res]').innerHTML = P.toHtml(html); };
+        const addM = (m) => { const box = sh.$('[data-ms]'); const empty = P.$$('[data-mrow]', box).find((r) => !r.querySelector('[data-mid]').value.trim()); if (empty && m.id) empty.remove(); box.insertAdjacentHTML('beforeend', P.toHtml(mRow(m))); };
+        sh.el.addEventListener('click', async (e) => {
+          const t = e.target.closest('button'); if (!t) return;
+          if (t.hasAttribute('data-rm')) { t.closest('.ai-row').remove(); return; }
+          if (t.hasAttribute('data-madd')) { addM({ id: '', nome: '' }); const ins = P.$$('[data-mid]', sh.el); ins[ins.length - 1].focus(); return; }
+          if (t.hasAttribute('data-hadd')) { sh.$('[data-hs]').insertAdjacentHTML('beforeend', P.toHtml(hRow({}))); const ins = P.$$('[data-hn]', sh.el); ins[ins.length - 1].focus(); return; }
+          if (t.hasAttribute('data-mfetch')) {
+            const v = read(); if (!v.base) { ui.toast('Informe a URL base.', { error: true }); return; }
+            t.classList.add('loading');
+            try {
+              const r = await P.api.call('est.aiConfig', { acao: 'modelos', ...v }, { mutation: true, timeout: 90000 });
+              const ja = new Set(v.modelos.map((m) => m.id));
+              const list = r.modelos.slice().sort((a, b) => (/:free$|free/i.test(b.id) ? 1 : 0) - (/:free$|free/i.test(a.id) ? 1 : 0) || a.id.localeCompare(b.id));
+              sh.$('[data-mlist]').innerHTML = P.toHtml(list.length ? h`<div class="card pad-lg mt-2"><div class="row between"><b>${list.length} modelo(s) no provedor</b><input class="input sm" data-mq placeholder="Filtrar" style="max-width:180px" aria-label="Filtrar modelos"></div>
+                <div class="list mt-2" style="max-height:280px;overflow:auto" data-mopts>${list.map((m) => h`<label class="li" data-mo="${P.norm(m.id + ' ' + m.nome)}"><input type="checkbox" value="${m.id}" data-n="${m.nome}" ${raw(ja.has(m.id) ? 'checked disabled' : '')}><span class="main"><span class="t">${m.id}</span>${m.nome !== m.id ? h`<span class="s">${m.nome}</span>` : ''}</span>${/free/i.test(m.id) ? h`<span class="chip up">grátis</span>` : ''}</label>`)}</div>
+                <button type="button" class="btn btn-ghost btn-sm mt-2" data-maddsel>Adicionar marcados</button></div>` : h`<p class="muted mt-2">O provedor não listou modelos.</p>`);
+              const q = sh.$('[data-mq]'); if (q) q.oninput = () => { const n = P.norm(q.value); P.$$('[data-mo]', sh.el).forEach((li) => { li.hidden = !!n && !li.dataset.mo.includes(n); }); };
+            } catch (er) { ui.toast(er.message, { error: true }); }
+            t.classList.remove('loading'); return;
+          }
+          if (t.hasAttribute('data-maddsel')) { const ck = P.$$('[data-mopts] input:checked:not(:disabled)', sh.el); ck.forEach((c) => { addM({ id: c.value, nome: c.dataset.n }); c.disabled = true; }); ui.toast(`${ck.length} modelo(s) adicionado(s)`); return; }
+          if (t.hasAttribute('data-test')) {
+            const v = read(); if (!v.base || !v.modelos.length) { ui.toast('Informe a URL base e ao menos um modelo.', { error: true }); return; }
+            t.classList.add('loading'); res(h`<p class="muted mt-2">Testando ${v.modelos[0].id}…</p>`);
+            try { const r = await P.api.call('est.aiConfig', { acao: 'testar', ...v, modelo: v.modelos[0].id }, { mutation: true, timeout: 90000 }); res(h`<div class="card pad-lg tint mt-2"><b>${icon('check', 'sm')} Funcionou</b><p class="muted mt-2" style="font-size:13px">${r.modelo} respondeu em ${fmt.num(r.ms / 1000, 1)} s: "${r.resposta}". O teste não conta no limite diário.</p></div>`); }
+            catch (er) { res(h`<div class="card pad-lg mt-2" style="border-color:var(--danger)"><b>Não funcionou</b><p class="muted mt-2" style="font-size:13px">${er.message}</p></div>`); }
+            t.classList.remove('loading'); return;
+          }
+          if (t.hasAttribute('data-save')) {
+            const v = read();
+            if (!v.nome) { ui.toast('Dê um nome ao provedor.', { error: true }); f.nome.focus(); return; }
+            if (!/^https:\/\/\S+\.\S+/.test(v.base)) { ui.toast('A URL base precisa começar com https://', { error: true }); f.base.focus(); return; }
+            if (!v.modelos.length) { ui.toast('Cadastre ao menos um modelo (o id exato do provedor).', { error: true }); return; }
+            const rmk = sh.$('[data-rmkey]');
+            const payload = { acao: 'salvar', ...v, remover_chave: !!(rmk && rmk.checked) };
+            if (!v.chave) delete payload.chave;
+            t.classList.add('loading');
+            try { E.ia = await P.api.call('est.aiConfig', payload, { mutation: true, timeout: 60000 }); sh.close(); ui.toast('Provedor salvo. Use "Testar" para conferir a chave.'); if (done) done(); P.router.render(true); }
+            catch (er) { ui.toast(er.message, { error: true }); t.classList.remove('loading'); }
+          }
+        });
+      } });
+    return s;
+  }
+
+  // ================= tela do assistente =================
+  const blank = () => ({ materiais: [], drive: [], notas: [], questoes: null, edital: null, desempenho: null });
+  const st = { modo: 'chat', chat: [], fontes: blank(), draft: { chat: '', tema: '', instr: '' }, cfg: { n: 5, formato: 'multipla', dif: 'media', banca: '', disc: '', ass: '', conc: '', area: '', nfc: 10 }, out: {}, busy: false };
+  const MODOS = [['chat', 'Conversar'], ['resumo', 'Resumo'], ['questoes', 'Questões'], ['flashcards', 'Flashcards']];
+
+  function fontesPayload() {
+    const f = st.fontes, o = {};
+    if (f.materiais.length) o.materiais = f.materiais.map((m) => ({ id: m.id, paginas: m.paginas || null }));
+    if (f.drive.length) o.drive = f.drive.map((d) => d.link);
+    if (f.notas.length) o.notas = f.notas.map((n) => n.id);
+    if (f.questoes) o.questoes = { concurso_id: f.questoes.concurso_id || null, disciplina_id: f.questoes.disciplina_id || null, erradas: !!f.questoes.erradas, limite: f.questoes.limite || 30 };
+    if (f.edital) o.edital = f.edital.id;
+    if (f.desempenho) o.desempenho = { dias: f.desempenho.dias };
+    return o;
+  }
+  function fontesList() {
+    const f = st.fontes, out = [];
+    f.materiais.forEach((m, i) => out.push(['materiais', i, m.label + (m.paginas ? ' · p. ' + m.paginas : ''), 'Biblioteca']));
+    f.drive.forEach((d, i) => out.push(['drive', i, d.label, 'Drive']));
+    f.notas.forEach((n, i) => out.push(['notas', i, n.label, 'Anotação']));
+    if (f.questoes) out.push(['questoes', 0, f.questoes.label, 'Questões do banco']);
+    if (f.edital) out.push(['edital', 0, f.edital.label, 'Edital']);
+    if (f.desempenho) out.push(['desempenho', 0, `Últimos ${f.desempenho.dias} dias`, 'Meus dados (horas, questões, revisões)']);
+    return out;
+  }
+
+  function screen(ctx) {
+    const g = E.gate(); if (g) return g;
+    const ia = E.ia || {};
+    const qm = ctx && ctx.q && ctx.q.modo;
+    if (qm && qm !== st._qm && MODOS.some((m) => m[0] === qm)) { st.modo = qm; st._qm = qm; }
+    const head = h`<div class="page-head"><div><h1>Assistente de IA</h1><p>${on() ? `${ia.uso_hoje || 0} de ${ia.limite_dia} usos hoje · o que a IA gera vem marcado para você conferir` : 'Opcional: Estudos funciona sem IA'}</p></div>
+      <div class="row-sm wrap">${on() ? picker() : ''}${ia.dono ? h`<button class="btn btn-ghost btn-sm" data-act="est.iaProv">${icon('sliders', 'sm')}Provedores</button>` : ''}</div></div>`;
+    if (!on()) return h`${head}${ui.empty({ ill: 'chart', title: 'Nenhuma IA configurada', text: ia.dono ? 'Cadastre um provedor (há modelos prontos com nível gratuito: Gemini, Groq, OpenRouter, Cerebras, Mistral). A chave fica só no servidor.' : 'O dono do app ainda não cadastrou um provedor de IA.', action: ia.dono ? { act: 'est.iaProv', label: 'Configurar provedores' } : null })}`;
+    const fl = fontesList();
+    return h`${head}${ui.seg(MODOS, st.modo, 'est.iaModo', { cls: 'sm' })}
+      <div class="dash mt-3"><div class="span-4"><div class="card pad-lg"><div class="card-head">${icon('layers')}<h3>Fontes</h3></div>
+        ${fl.length ? h`<div class="list">${fl.map(([k, i, l, t]) => h`<div class="li"><span class="main"><span class="t">${l}</span><span class="s">${t}</span></span><button type="button" class="btn-icon sm" data-act="est.iaSrcDel" data-k="${k}" data-i="${i}" aria-label="Remover fonte ${l}">${icon('x', 'sm')}</button></div>`)}</div>`
+          : h`<p class="muted" style="font-size:13px">Sem fontes: a IA usa o conhecimento dela e avisa quando não tiver certeza.</p>`}
+        <div class="row-sm wrap mt-2"><button type="button" class="btn btn-ghost btn-sm" data-act="est.iaSrcAdd">${icon('plus', 'sm')}Adicionar fonte</button>${fl.length ? h`<button type="button" class="btn btn-ghost btn-sm" data-act="est.iaSrcClear">Limpar</button>` : ''}</div>
+        <p class="faint mt-3" style="font-size:12px">PDFs, planilhas (XLSX/CSV), Docs e imagens são lidos pelo servidor (imagens e PDFs digitalizados passam pelo OCR do Drive). O conteúdo vai como dado: instruções escondidas no material são ignoradas.</p></div></div>
+        <div class="span-8">${modo()}</div></div>`;
+  }
+
+  const selDisc = (k, cur) => h`<select class="input sm" data-on-change="est.iaCfg" data-k="${k}" aria-label="Disciplina"><option value="">Qualquer disciplina</option>${E.disciplinas().map((d) => h`<option value="${d.id}" ${raw(d.id === cur ? 'selected' : '')}>${d.nome}</option>`)}</select>`;
+  const selAss = (disc, cur) => (disc ? h`<select class="input sm" data-on-change="est.iaCfg" data-k="ass" aria-label="Assunto"><option value="">Qualquer assunto</option>${E.assuntosDe(disc).map((a) => h`<option value="${a.id}" ${raw(a.id === cur ? 'selected' : '')}>${a.titulo}</option>`)}</select>` : '');
+  const busy = (t) => h`<div class="card pad-lg mt-3"><div class="row-sm">${icon('zap', 'sm')}<span class="muted">${t}</span></div><div class="skel mt-3" style="height:90px"></div></div>`;
+  const refsLine = (r) => h`${r && (r.refs || []).length ? h`<p class="faint mt-2" style="font-size:12px">Fontes: ${r.refs.join(' · ')}</p>` : ''}${r && (r.avisos || []).length ? h`<p class="faint mt-1" style="font-size:12px">${icon('info', 'xs')} ${r.avisos.join(' · ')}</p>` : ''}`;
+  const textActs = (i) => h`<div class="row-sm wrap mt-2"><button type="button" class="btn btn-ghost btn-sm" data-act="est.iaCopy" data-i="${i}">${icon('copy', 'sm')}Copiar</button><button type="button" class="btn btn-ghost btn-sm" data-act="est.iaNote" data-i="${i}">${icon('edit', 'sm')}Salvar como anotação</button><button type="button" class="btn btn-ghost btn-sm" data-act="est.iaTgText" data-i="${i}">${icon('message', 'sm')}Enviar ao Telegram</button></div>`;
+
+  function modo() {
+    const c = st.cfg;
+    if (st.modo === 'chat') {
+      return h`<div class="card pad-lg"><div class="ai-chat" data-chat>${st.chat.length ? st.chat.map((m, i) => (m.papel === 'user' ? h`<div class="ai-msg me">${m.texto}</div>`
+          : h`<div class="ai-msg bot"><div class="note-preview">${raw(E.md(m.texto))}</div><div class="row-sm wrap mt-2">${iaChip(m)}</div>${refsLine(m)}${textActs('c' + i)}</div>`)) : h`<p class="muted" style="font-size:13px">Pergunte sobre a matéria, peça uma explicação, um mapa do edital ou "o que devo revisar esta semana?" (com a fonte Meus dados).</p>`}
+        ${st.busy ? h`<div class="ai-msg bot"><div class="skel" style="height:56px"></div></div>` : ''}</div>
+        <div class="field mt-3"><textarea class="input" rows="3" data-on-input="est.iaDraft" data-k="chat" data-ia-in placeholder="Escreva sua pergunta (Ctrl+Enter envia)" aria-label="Pergunta">${st.draft.chat}</textarea></div>
+        <div class="row-sm mt-2"><button type="button" class="btn btn-primary" data-act="est.iaSend" ${raw(st.busy ? 'disabled' : '')}>${icon('send', 'sm')}Enviar</button>${st.chat.length ? h`<button type="button" class="btn btn-ghost btn-sm" data-act="est.iaChatClear">Nova conversa</button>` : ''}</div></div>`;
+    }
+    const temaF = h`<div class="field"><label>Tema</label><input class="input" data-on-input="est.iaDraft" data-k="tema" value="${st.draft.tema}" placeholder="Ex.: garantias bancárias, crase, licitações"></div>
+      <div class="row-sm wrap">${selDisc('disc', c.disc)}${selAss(c.disc, c.ass)}</div>`;
+    const instrF = h`<div class="field"><label>Instruções (opcional)</label><textarea class="input" rows="2" data-on-input="est.iaDraft" data-k="instr" placeholder="Ex.: foque em prazos e exceções">${st.draft.instr}</textarea></div>`;
+    if (st.modo === 'resumo') {
+      const r = st.out.resumo;
+      return h`<div class="card pad-lg stack">${temaF}${instrF}<div><button type="button" class="btn btn-primary" data-act="est.iaGen" data-t="resumo" ${raw(st.busy ? 'disabled' : '')}>${icon('zap', 'sm')}Gerar resumo</button></div></div>
+        ${st.busy ? busy('Gerando o resumo…') : r ? h`<div class="card pad-lg mt-3"><div class="row-sm wrap">${iaChip(r)}</div><div class="note-preview mt-2">${raw(E.md(r.texto))}</div>${refsLine(r)}${textActs('resumo')}</div>` : ''}`;
+    }
+    if (st.modo === 'questoes') {
+      const r = st.out.questoes, areas = E.areas();
+      return h`<div class="card pad-lg stack">${temaF}
+        <div class="grid g3"><div class="field"><label>Quantidade</label><input class="input num" inputmode="numeric" data-on-change="est.iaCfg" data-k="n" value="${c.n}"></div>
+          <div class="field"><label>Formato</label><select class="input" data-on-change="est.iaCfg" data-k="formato"><option value="multipla" ${raw(c.formato === 'multipla' ? 'selected' : '')}>Múltipla escolha (A–E)</option><option value="certo_errado" ${raw(c.formato === 'certo_errado' ? 'selected' : '')}>Certo ou errado</option></select></div>
+          <div class="field"><label>Dificuldade</label><select class="input" data-on-change="est.iaCfg" data-k="dif">${[['facil', 'Fácil'], ['media', 'Média'], ['dificil', 'Difícil']].map(([v, l]) => h`<option value="${v}" ${raw(c.dif === v ? 'selected' : '')}>${l}</option>`)}</select></div>
+          <div class="field"><label>Estilo da banca</label><input class="input" data-on-change="est.iaCfg" data-k="banca" value="${c.banca}" placeholder="FCC, CEBRASPE…"></div>
+          <div class="field"><label>Concurso (ao incluir)</label><select class="input" data-on-change="est.iaCfg" data-k="conc"><option value="">Nenhum</option>${E.concursos().map((x) => h`<option value="${x.id}" ${raw(x.id === c.conc ? 'selected' : '')}>${x.nome}</option>`)}</select></div>
+          <div class="field"><label>Tipo de concurso (área)</label><input class="input" list="ia-areas" data-on-change="est.iaCfg" data-k="area" value="${c.area}" placeholder="Bancária, Tribunais…"><datalist id="ia-areas">${areas.map((a) => h`<option value="${a}">`)}</datalist></div></div>
+        ${instrF}<div><button type="button" class="btn btn-primary" data-act="est.iaGen" data-t="questoes" ${raw(st.busy ? 'disabled' : '')}>${icon('zap', 'sm')}Gerar questões</button></div>
+        <p class="faint" style="font-size:12px">O gabarito sugerido pela IA entra como preliminar e a questão fica marcada "a revisar". Confira antes de confiar.</p></div>
+        ${st.busy ? busy('Gerando questões…') : r ? qDrafts(r) : ''}`;
+    }
+    const r = st.out.flashcards;
+    return h`<div class="card pad-lg stack">${temaF}<div class="field"><label>Quantidade</label><input class="input num" inputmode="numeric" data-on-change="est.iaCfg" data-k="nfc" value="${c.nfc}" style="max-width:120px"></div>${instrF}
+        <div><button type="button" class="btn btn-primary" data-act="est.iaGen" data-t="flashcards" ${raw(st.busy ? 'disabled' : '')}>${icon('zap', 'sm')}Gerar flashcards</button></div></div>
+      ${st.busy ? busy('Gerando flashcards…') : r ? h`<div class="card pad-lg mt-3"><div class="row-sm wrap">${iaChip(r)}</div>${refsLine(r)}<div class="stack mt-3">${r.rascunhos.map((x, i) => h`<div class="card pad-lg" data-fc="${i}"><label class="row-sm"><input type="checkbox" checked> Usar</label><textarea class="input mt-2" rows="2" data-f aria-label="Frente">${x.frente}</textarea><textarea class="input mt-2" rows="2" data-v aria-label="Verso">${x.verso}</textarea></div>`)}</div>
+        <button type="button" class="btn btn-primary mt-3" data-act="est.iaCards">Criar cartões no baralho IA</button></div>` : ''}`;
+  }
+
+  function qDrafts(r) {
+    if (r.salvas) {
+      return h`<div class="card pad-lg tint mt-3"><b>${r.salvas.length} questão(ões) incluída(s) no banco</b><p class="muted mt-2" style="font-size:13px">Marcadas como geradas por IA, a revisar, com gabarito preliminar.</p>
+        <div class="row-sm wrap mt-3"><button type="button" class="btn btn-primary btn-sm" data-act="est.iaTrain">${icon('play', 'sm')}Treinar agora</button><button type="button" class="btn btn-ghost btn-sm" data-act="est.iaTgQuiz">${icon('message', 'sm')}Treinar no Telegram</button><a class="btn btn-ghost btn-sm" href="#/est/questoes">Ver no banco</a><button type="button" class="btn btn-ghost btn-sm" data-act="est.iaGenMore">Gerar outras</button></div></div>`;
+    }
+    return h`<div class="card pad-lg mt-3"><div class="row-sm wrap">${iaChip(r)}<span class="faint" style="font-size:12px">Edite à vontade antes de incluir.</span></div>${refsLine(r)}
+      <div class="stack mt-3">${r.questoes.map((q, i) => h`<div class="card pad-lg" data-qd="${i}"><div class="row between"><label class="row-sm"><input type="checkbox" data-use checked> Incluir</label><span class="chip">${q.tipo === 'certo_errado' ? 'Certo ou errado' : 'Múltipla escolha'}</span></div>
+        <textarea class="input mt-2" rows="3" data-en aria-label="Enunciado">${q.enunciado}</textarea>
+        ${q.tipo === 'multipla' ? h`<div class="stack-sm mt-2">${(q.alternativas_json || []).map((a) => h`<div class="row-sm"><b style="width:18px">${a.letra}</b><input class="input sm grow" data-alt="${a.letra}" value="${a.texto}" aria-label="Alternativa ${a.letra}"></div>`)}</div>` : ''}
+        <div class="row-sm wrap mt-2"><label class="faint" style="font-size:12.5px">Gabarito sugerido</label><select class="input sm" data-gab style="max-width:120px"><option value="">Sem gabarito</option>${(q.tipo === 'certo_errado' ? [['C', 'Certo'], ['E', 'Errado']] : (q.alternativas_json || []).map((a) => [a.letra, a.letra])).map(([v, l]) => h`<option value="${v}" ${raw(v === q.gabarito ? 'selected' : '')}>${l}</option>`)}</select></div>
+        <textarea class="input mt-2" rows="2" data-ex aria-label="Explicação" placeholder="Explicação">${q.explicacao || ''}</textarea></div>`)}</div>
+      <div class="row-sm wrap mt-3"><button type="button" class="btn btn-primary" data-act="est.iaQAdd">${icon('plus', 'sm')}Incluir no banco</button></div></div>`;
+  }
+
+  // ---------- fontes ----------
+  function srcAdd() {
+    const ia = E.ia || {};
+    ui.menu('Adicionar fonte', [
+      { label: 'Material da biblioteca (PDF, planilha, imagem)', icon: 'book', act: srcMaterial },
+      { label: 'Enviar arquivo do computador', icon: 'upload', act: srcUpload },
+      ia.dono ? { label: 'Arquivo do Google Drive (link)', icon: 'link', act: srcDrive } : null,
+      { label: 'Anotação ou resumo', icon: 'edit', act: srcNota },
+      { label: 'Questões do banco', icon: 'list', act: srcQuestoes },
+      { label: 'Edital verticalizado', icon: 'layers', act: srcEdital },
+      { label: 'Meus dados de estudo (horas, questões, revisões)', icon: 'chart', act: srcDados }
+    ]);
+  }
+  const pickSheet = (title, body, onOk) => ui.sheet({ title, body, foot: h`<button class="btn btn-primary grow" data-ok>Adicionar</button>`, onMount(sh) { sh.$('[data-ok]').onclick = () => { if (onOk(sh) !== false) { sh.close(); P.router.render(true); } }; } });
+  function srcMaterial() {
+    const ms = S.all('est_materiais').filter((m) => m.situacao !== 'arquivado' && (m.arquivo_id || m.tipo === 'link')).sort((a, b) => String(a.titulo).localeCompare(String(b.titulo)));
+    if (!ms.length) { ui.toast('A biblioteca está vazia. Envie o arquivo do computador.'); return; }
+    pickSheet('Material da biblioteca', h`<div class="field"><label>Material</label><select class="input" data-m>${ms.map((m) => h`<option value="${m.id}">${m.codigo} · ${m.titulo}</option>`)}</select></div>
+      <div class="field mt-3"><label>Páginas (PDF, opcional)</label><input class="input" data-p placeholder="Ex.: 10-15 ou 3,7"><span class="hint">Sem páginas, vai o texto todo (até o limite). O texto por página fica disponível depois de abrir o PDF no leitor.</span></div>`,
+    (sh) => { const m = E.mat(sh.$('[data-m]').value), p = sh.$('[data-p]').value.trim(); if (p && !/^[\d\s,-]+$/.test(p)) { ui.toast('Páginas: use números, vírgulas e hífens.', { error: true }); return false; } st.fontes.materiais.push({ id: m.id, paginas: p || null, label: m.codigo + ' · ' + m.titulo }); return true; });
+  }
+  async function srcUpload() {
+    const files = await P.files.pick({ accept: 'application/pdf,image/*,.xlsx,.xls,.csv,.txt,.docx', multiple: true }); if (!files || !files.length) return;
+    const mats = await E.uploadToLibrary(files, { tags: 'ia' });
+    mats.forEach((m) => st.fontes.materiais.push({ id: m.id, paginas: null, label: m.codigo + ' · ' + m.titulo }));
+    P.router.render(true);
+  }
+  function srcDrive() {
+    pickSheet('Arquivo do Google Drive', h`<div class="field"><label>Link ou id do arquivo</label><input class="input" data-l placeholder="https://drive.google.com/file/d/…" spellcheck="false"><span class="hint">PDF, XLSX/CSV, Google Docs/Planilhas ou imagem do seu Drive. Só o dono pode usar links (o app roda com a conta dele).</span></div>`,
+      (sh) => { const v = sh.$('[data-l]').value.trim(); if (!/\/d\/[-\w]{10,}|[?&]id=[-\w]{10,}|^[-\w]{10,}$/.test(v)) { ui.toast('Link do Drive inválido.', { error: true }); return false; } st.fontes.drive.push({ link: v, label: v.length > 60 ? v.slice(0, 57) + '…' : v }); return true; });
+  }
+  function srcNota() {
+    const ns = S.all('est_anotacoes').sort((a, b) => ((a.updated_at || '') < (b.updated_at || '') ? 1 : -1));
+    if (!ns.length) { ui.toast('Nenhuma anotação ainda.'); return; }
+    pickSheet('Anotação', h`<div class="field"><label>Anotação</label><select class="input" data-n>${ns.map((n) => h`<option value="${n.id}">${n.titulo}</option>`)}</select></div>`,
+      (sh) => { const n = S.get('est_anotacoes', sh.$('[data-n]').value); if (!st.fontes.notas.some((x) => x.id === n.id)) st.fontes.notas.push({ id: n.id, label: n.titulo }); return true; });
+  }
+  function srcQuestoes() {
+    pickSheet('Questões do banco', h`<div class="field"><label>Concurso</label><select class="input" data-c><option value="">Todos</option>${E.concursos().map((c) => h`<option value="${c.id}">${c.nome}</option>`)}</select></div>
+      <div class="field mt-3"><label>Disciplina</label><select class="input" data-d><option value="">Todas</option>${E.disciplinas().map((d) => h`<option value="${d.id}">${d.nome}</option>`)}</select></div>
+      <label class="row-sm mt-3"><input type="checkbox" data-e checked> Só as que errei (última resposta)</label>
+      <div class="field mt-3"><label>Até quantas</label><input class="input num" data-n value="30" inputmode="numeric"></div>`,
+    (sh) => { const c = sh.$('[data-c]').value, d = sh.$('[data-d]').value, e = sh.$('[data-e]').checked, n = Math.min(80, Math.max(1, +sh.$('[data-n]').value || 30)); st.fontes.questoes = { concurso_id: c, disciplina_id: d, erradas: e, limite: n, label: `${e ? 'Erradas' : 'Questões'}${d ? ' · ' + E.discNome(d) : ''}${c ? ' · ' + E.conc(c).nome : ''} (até ${n})` }; return true; });
+  }
+  function srcEdital() {
+    const cs = E.concursos(); if (!cs.length) { ui.toast('Cadastre um concurso primeiro.'); return; }
+    pickSheet('Edital verticalizado', h`<div class="field"><label>Concurso</label><select class="input" data-c>${cs.map((c) => h`<option value="${c.id}" ${raw(c.id === E.ctx() ? 'selected' : '')}>${c.nome}</option>`)}</select></div>`,
+      (sh) => { const c = E.conc(sh.$('[data-c]').value); st.fontes.edital = { id: c.id, label: c.nome }; return true; });
+  }
+  function srcDados() {
+    pickSheet('Meus dados de estudo', h`<p class="muted" style="font-size:13px">Horas por disciplina, precisão nas questões, erros recorrentes, revisões e cobertura do edital, lidos da sua planilha.</p><div class="field mt-3"><label>Período</label><select class="input" data-p><option value="7">7 dias</option><option value="30" selected>30 dias</option><option value="90">90 dias</option></select></div>`,
+      (sh) => { st.fontes.desempenho = { dias: +sh.$('[data-p]').value }; return true; });
+  }
+
+  // ---------- ações ----------
+  const textOf = (i) => (String(i).startsWith('c') ? st.chat[+String(i).slice(1)] : st.out[i]) || {};
+  async function gen(tipo, btn) {
+    const c = st.cfg, tema = st.draft.tema.trim();
+    if (!tema && !c.disc && !fontesList().length && !st.draft.instr.trim()) { ui.toast('Informe um tema, uma disciplina ou adicione fontes.', { error: true }); return; }
+    st.busy = true; P.router.render(true);
+    try {
+      const payload = { acao: 'gerar', tipo, tema, disciplina_id: c.disc || null, assunto_id: c.ass || null, instrucoes: st.draft.instr.trim(), fontes: fontesPayload() };
+      if (tipo === 'questoes') Object.assign(payload, { n: Math.min(20, Math.max(1, +c.n || 5)), formato_questao: c.formato, dificuldade: { facil: 'fácil', media: 'média', dificil: 'difícil' }[c.dif], banca: c.banca });
+      if (tipo === 'flashcards') payload.n = Math.min(30, Math.max(1, +c.nfc || 10));
+      st.out[tipo] = await ai(payload);
+      st.out[tipo]._titulo = tema || (c.ass ? E.assNome(c.ass) : c.disc ? E.discNome(c.disc) : 'IA');
+    } catch (e) { ui.toast(e.message, { error: true, duration: 9000 }); }
+    st.busy = false; P.router.render(true);
+    return btn;
+  }
+  async function send() {
+    const t = st.draft.chat.trim(); if (!t || st.busy) return;
+    st.chat.push({ papel: 'user', texto: t }); st.draft.chat = ''; st.busy = true; P.router.render(true);
+    try {
+      const r = await ai({ acao: 'chat', mensagens: st.chat.map((m) => ({ papel: m.papel, texto: m.texto })), fontes: fontesPayload() });
+      st.chat.push({ papel: 'assistant', texto: r.texto, refs: r.refs, avisos: r.avisos, ia: r.ia });
+    } catch (e) { st.chat.pop(); st.draft.chat = t; ui.toast(e.message, { error: true, duration: 9000 }); }
+    st.busy = false; P.router.render(true);
+    const box = document.querySelector('[data-chat]'); if (box) box.lastElementChild && box.lastElementChild.scrollIntoView({ block: 'nearest' });
+  }
+
+  P.screen('est/ia', { mod: 'est', tab: 'ia', title: 'Assistente de IA', deps: [], render: screen,
+    mount(root) {
+      const ta = root.querySelector('[data-ia-in]');
+      if (ta) ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
+    } });
+
+  Object.assign(P.act, {
+    'est.iaProv': () => { E.ensure().then(() => provList()); },
+    'est.iaPick': (el) => { try { localStorage.setItem(LS, el.value); } catch (e) { /* sem armazenamento */ } ui.toast('Modelo escolhido: ' + el.options[el.selectedIndex].text); },
+    'est.iaModo': (el) => { st.modo = el.dataset.v; P.router.render(true); },
+    'est.iaDraft': (el) => { st.draft[el.dataset.k] = el.value; },
+    'est.iaCfg': (el) => { st.cfg[el.dataset.k] = el.value; if (el.dataset.k === 'disc') { st.cfg.ass = ''; P.router.render(true); } },
+    'est.iaSrcAdd': () => srcAdd(),
+    'est.iaSrcDel': (el) => { const k = el.dataset.k; if (Array.isArray(st.fontes[k])) st.fontes[k].splice(+el.dataset.i, 1); else st.fontes[k] = null; P.router.render(true); },
+    'est.iaSrcClear': () => { st.fontes = blank(); P.router.render(true); },
+    'est.iaSend': () => send(),
+    'est.iaChatClear': () => { st.chat = []; P.router.render(true); },
+    'est.iaGen': (el) => gen(el.dataset.t, el),
+    'est.iaGenMore': () => { st.out.questoes = null; P.router.render(true); },
+    'est.iaCopy': (el) => { const t = textOf(el.dataset.i).texto || ''; try { navigator.clipboard.writeText(t).then(() => ui.toast('Copiado'), () => ui.toast('Não foi possível copiar.', { error: true })); } catch (e) { ui.toast('Não foi possível copiar.', { error: true }); } },
+    'est.iaNote': (el) => { const m = textOf(el.dataset.i); E.noteEdit(null, { tipo: 'resumo', titulo: 'IA · ' + (m._titulo || st.draft.tema || 'Conversa') + ' · ' + fmt.date(P.d.today()), conteudo: m.texto, disciplina_id: st.cfg.disc || null, assunto_id: st.cfg.ass || null, gerado_ia: true, aprovado: false, fonte: (m.refs || []).join('; ') || (m.ia ? 'IA ' + m.ia.provedor + ' · ' + m.ia.modelo : 'IA') }); },
+    'est.iaTgText': (el) => { if (!E.tg()) { ui.toast('Conecte o Telegram em Configurações › Telegram.', { error: true }); return; } const m = textOf(el.dataset.i); E.sendTg({ tipo: 'texto', titulo: 'Assistente de IA (confira)', texto: m.texto }, el); },
+    'est.iaQAdd': async (el) => {
+      const r = st.out.questoes; if (!r) return;
+      const qs = P.$$('[data-qd]').filter((c) => c.querySelector('[data-use]').checked).map((c) => { const q = r.questoes[+c.dataset.qd]; return { ...q, enunciado: c.querySelector('[data-en]').value.trim(), alternativas_json: q.tipo === 'multipla' ? P.$$('[data-alt]', c).map((i) => ({ letra: i.dataset.alt, texto: i.value.trim() })).filter((a) => a.texto) : [], gabarito: c.querySelector('[data-gab]').value, explicacao: c.querySelector('[data-ex]').value.trim() }; }).filter((q) => q.enunciado);
+      if (!qs.length) { ui.toast('Marque ao menos uma questão.', { error: true }); return; }
+      const c = st.cfg; el.classList.add('loading');
+      try {
+        const out = await P.api.call('est.questionsAdd', { questoes: qs, concurso_id: c.conc || null, disciplina_id: c.disc || null, assunto_id: c.ass || null, area: c.area || null, banca: c.banca || null, fonte: 'IA' + (r.ia ? ' · ' + r.ia.provedor + ' · ' + r.ia.modelo : '') + (r._titulo ? ' · ' + r._titulo : '') }, { mutation: true, timeout: 60000 });
+        out.questoes.forEach((q) => S.put('est_questoes', q)); r.salvas = out.questoes.map((q) => q.id); P.router.render(true); ui.toast(`${out.questoes.length} questão(ões) no banco`);
+      } catch (e) { ui.toast(e.message, { error: true }); el.classList.remove('loading'); }
+    },
+    'est.iaTrain': () => { const r = st.out.questoes; if (r && r.salvas) P.estQ.run(r.salvas, 'treino', 'Questões geradas por IA'); },
+    'est.iaTgQuiz': (el) => { const r = st.out.questoes; if (!E.tg()) { ui.toast('Conecte o Telegram em Configurações › Telegram.', { error: true }); return; } if (r && r.salvas) E.sendTg({ tipo: 'quiz', ids: r.salvas }, el); },
+    'est.iaCards': async (el) => {
+      const r = st.out.flashcards; if (!r) return;
+      const rows = P.$$('[data-fc]').filter((c) => c.querySelector('input').checked).map((c) => ({ baralho: 'IA', frente: c.querySelector('[data-f]').value.trim(), verso: c.querySelector('[data-v]').value.trim(), disciplina_id: st.cfg.disc || null, assunto_id: st.cfg.ass || null, origem_ref: 'IA · ' + (r.fonte || ''), tags: 'gerado-ia' })).filter((x) => x.frente);
+      if (!rows.length) { ui.toast('Marque ao menos um cartão.', { error: true }); return; }
+      el.classList.add('loading'); await S.saveMany('est_flashcards', rows).catch(() => {}); st.out.flashcards = null; P.router.render(true); ui.toast(`${rows.length} cartão(ões) no baralho IA`);
+    }
+  });
+
+  Object.assign(E, { ai, aiOn: on, aiSel: sel, aiPicker: picker, aiChip: iaChip, aiProviders: provList, aiRefresh: refreshStatus, AI_PRESETS: PRESETS });
+})();
+</script>

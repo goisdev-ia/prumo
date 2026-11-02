@@ -1,0 +1,177 @@
+<script>
+/* Prumo · cálculos puros (espelho do Calc.gs) + medições que cruzam módulos (metas automáticas, rotinas, sequências). */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const D = P.d;
+  const ACTIVITY = { sedentario: 1.2, leve: 1.375, moderado: 1.55, intenso: 1.725, muito_intenso: 1.9 };
+  const ACTIVITY_LABEL = { sedentario: 'Sedentário', leve: 'Leve (1–3x/sem)', moderado: 'Moderado (3–5x/sem)', intenso: 'Intenso (6–7x/sem)', muito_intenso: 'Muito intenso (2x/dia)' };
+
+  const C = P.calc = {
+    ACTIVITY, ACTIVITY_LABEL,
+    bmr(p) {
+      if (p.formula === 'katch' && p.gordura_pct) return Math.round(370 + 21.6 * (p.peso * (1 - p.gordura_pct / 100)));
+      return Math.round(10 * p.peso + 6.25 * p.altura - 5 * p.idade + (p.sexo === 'feminino' ? -161 : 5));
+    },
+    tdee: (bmr, nivel) => Math.round(bmr * (ACTIVITY[nivel] || 1.55)),
+    calorieTarget(p) {
+      const ajuste = Math.round((p.ritmo || 0) * 7700 / 7);
+      let kcal = p.tdee + ajuste; const avisos = [];
+      const min = p.sexo === 'feminino' ? 1200 : 1500;
+      if (p.ritmo < 0 && Math.abs(p.ritmo) > p.peso * 0.01) avisos.push('Ritmo acima de 1% do peso por semana: tende a perder massa magra.');
+      if (p.ritmo > 0.5) avisos.push('Ganho acima de 0,5 kg por semana costuma vir mais de gordura.');
+      if (kcal < min) { avisos.push(`Meta abaixo de ${min} kcal. Ajustamos para o mínimo.`); kcal = min; }
+      return { kcal, ajuste, avisos };
+    },
+    macros(p) {
+      const prot = Math.round((p.proteina_gkg || 1.8) * p.peso);
+      const gord = Math.max(Math.round(p.kcal * (p.gordura_pct || 25) / 100 / 9), Math.round(0.8 * p.peso));
+      const carb = Math.max(0, Math.round((p.kcal - prot * 4 - gord * 9) / 4));
+      return { proteina_g: prot, gordura_g: gord, carbo_g: carb };
+    },
+    water: (peso, treinoMin = 0) => Math.round(peso * 35 + treinoMin * 12),
+    bmi(peso, alturaCm) {
+      const v = peso / Math.pow(alturaCm / 100, 2);
+      const classe = v < 18.5 ? 'Abaixo do peso' : v < 25 ? 'Peso normal' : v < 30 ? 'Sobrepeso' : v < 35 ? 'Obesidade grau I' : v < 40 ? 'Obesidade grau II' : 'Obesidade grau III';
+      return { imc: Math.round(v * 10) / 10, classe };
+    },
+    healthyRange: (alturaCm) => { const m2 = Math.pow(alturaCm / 100, 2); return { min: Math.round(18.5 * m2 * 10) / 10, max: Math.round(24.9 * m2 * 10) / 10 }; },
+    navy(p) {
+      const v = p.sexo === 'feminino'
+        ? 495 / (1.29579 - 0.35004 * Math.log10(p.cintura + p.quadril - p.pescoco) + 0.221 * Math.log10(p.altura)) - 450
+        : 495 / (1.0324 - 0.19077 * Math.log10(p.cintura - p.pescoco) + 0.15456 * Math.log10(p.altura)) - 450;
+      return Math.round(v * 10) / 10;
+    },
+    oneRm(carga, reps) {
+      if (!carga || !reps) return { epley: 0, brzycki: 0 };
+      if (reps === 1) return { epley: carga, brzycki: carga };
+      return { epley: Math.round(carga * (1 + reps / 30) * 10) / 10, brzycki: reps < 37 ? Math.round(carga * 36 / (37 - reps) * 10) / 10 : 0 };
+    },
+    kcalMet: (met, peso, horas) => Math.round(met * peso * horas),
+    hrMax: (idade) => Math.round(208 - 0.7 * idade),
+    hrZones(idade) {
+      const max = C.hrMax(idade);
+      return [[50, 60, 'Recuperação'], [60, 70, 'Base aeróbica'], [70, 80, 'Aeróbico'], [80, 90, 'Limiar'], [90, 100, 'Máximo']].map((z, i) => ({ zona: i + 1, nome: z[2], de: Math.round(max * z[0] / 100), ate: Math.round(max * z[1] / 100) }));
+    },
+    ema(values, alpha = 0.25) { let prev = null; return values.map((v) => { if (v === null || v === undefined) return prev; prev = prev === null ? v : alpha * v + (1 - alpha) * prev; return Math.round(prev * 100) / 100; }); },
+    linreg(xs, ys) {
+      const n = xs.length; if (n < 2) return null;
+      let sx = 0, sy = 0, sxy = 0, sxx = 0;
+      for (let i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; sxy += xs[i] * ys[i]; sxx += xs[i] * xs[i]; }
+      const den = n * sxx - sx * sx; if (!den) return null;
+      const slope = (n * sxy - sx * sy) / den;
+      return { slope, intercept: (sy - slope * sx) / n };
+    },
+    invoiceFor(data, diaFech, diaVenc) {
+      const day = D.parse(data).getDate();
+      let close = D.month(data);
+      if (day >= diaFech) close = D.shiftMonth(close, 1);
+      const due = diaVenc > diaFech ? close : D.shiftMonth(close, 1);
+      const at = (k, d) => `${k}-${String(Math.min(d, D.dim(k))).padStart(2, '0')}`;
+      return { competencia: due, data_fechamento: at(close, diaFech), data_vencimento: at(due, diaVenc) };
+    },
+    goalProgress(m, atual) {
+      const ini = +(m.valor_inicial || 0), a = +(atual ?? m.valor_atual ?? 0), alvo = +m.valor_alvo;
+      if (!Number.isFinite(alvo) || alvo === ini) return a === alvo ? 100 : 0;
+      return P.clamp(Math.round(((a - ini) / (alvo - ini)) * 1000) / 10, 0, 100);
+    },
+    /** Projeção de data por regressão linear (pontos: [{date, v}]) até atingir alvo. */
+    projectDate(points, alvo) {
+      if (points.length < 3) return null;
+      const t0 = D.parse(points[0].date).getTime();
+      const xs = points.map((p) => (D.parse(p.date).getTime() - t0) / 864e5), ys = points.map((p) => p.v);
+      const r = C.linreg(xs, ys); if (!r || !r.slope) return null;
+      const x = (alvo - r.intercept) / r.slope;
+      if (!Number.isFinite(x) || x < xs[xs.length - 1]) return null;
+      if (x - xs[xs.length - 1] > 3 * 365) return null;
+      return D.add(points[0].date, Math.round(x));
+    }
+  };
+
+  // ---------- Rotinas: a rotina acontece nesta data? ----------
+  P.rotDue = (r, date) => {
+    if (!r || r.ativa === false) return false;
+    if (r.data_inicio && date < r.data_inicio) return false;
+    if (r.data_fim && date > r.data_fim) return false;
+    const d = D.parse(date);
+    switch (r.frequencia) {
+      case 'diaria': return true;
+      case 'semanal': return String(r.dias_semana || '').split(',').includes(String(d.getDay()));
+      case 'mensal': return d.getDate() === +(r.dia_mes || 1);
+      case 'anual': return d.getDate() === +(r.dia_mes || 1) && d.getMonth() + 1 === +(r.mes || 1);
+      case 'intervalo': return D.diff(r.data_inicio || date, date) % Math.max(1, +r.intervalo_dias || 1) === 0;
+      default: return false;
+    }
+  };
+
+  /** Sequência atual e melhor sequência de uma rotina (dias em que estava prevista). */
+  P.rotStreak = (r, execs) => {
+    const done = new Set(execs.filter((e) => e.rotina_id === r.id && (e.status === 'feito' || e.status === 'parcial')).map((e) => e.data));
+    const today = D.today();
+    let cur = 0, best = 0, run = 0, counting = true;
+    let d = today;
+    const start = r.data_inicio || D.add(today, -400);
+    for (let i = 0; i < 400 && d >= start; i++, d = D.add(d, -1)) {
+      if (!P.rotDue(r, d)) continue;
+      if (done.has(d)) { run++; if (counting) cur++; }
+      else { if (d === today) continue; counting = false; best = Math.max(best, run); run = 0; }
+    }
+    best = Math.max(best, run, cur);
+    return { atual: cur, melhor: best };
+  };
+
+  // ---------- Metas: medição automática ----------
+  P.goalValue = (m) => {
+    const S = P.store;
+    if (m.medicao === 'marcos') {
+      const ms = S.where('met_marcos', (x) => x.meta_id === m.id);
+      if (ms.length && m.unidade === 'marcos') return ms.filter((x) => x.concluido).length;
+      return +(m.valor_atual || 0);
+    }
+    if (m.medicao !== 'automatica') {
+      const last = S.where('met_checkins', (c) => c.meta_id === m.id && c.valor !== null).sort((a, b) => (a.data < b.data ? 1 : -1))[0];
+      return last && (!m.updated_at || last.created_at > m.updated_at) ? +last.valor : +(m.valor_atual || 0);
+    }
+    switch (m.origem_metrica) {
+      case 'fin_reserva': {
+        const r = S.get('fin_reservas', m.origem_id) || S.where('fin_reservas', (x) => x.meta_id === m.id)[0];
+        return r ? +(r.saldo_atual || 0) : +(m.valor_atual || 0);
+      }
+      case 'fit_peso': case 'nut_peso': {
+        const w = S.where('fit_medidas', (x) => x.peso_kg).sort((a, b) => (a.data < b.data ? 1 : -1))[0];
+        return w ? +w.peso_kg : +(m.valor_atual || 0);
+      }
+      case 'tarefas': return S.where('tar_tarefas', (t) => t.meta_id === m.id && t.status === 'feito').length;
+      case 'rotina': return S.where('rot_execucoes', (e) => (!m.origem_id || e.rotina_id === m.origem_id) && e.status === 'feito' && (!m.data_inicio || e.data >= m.data_inicio)).length;
+      case 'nut_agua': {
+        const t = D.today();
+        return P.sum(S.where('nut_agua', (a) => a.data === t), (a) => +a.ml);
+      }
+      case 'est_horas': case 'est_questoes': case 'est_precisao': case 'est_revisoes': case 'est_redacoes': case 'est_cobertura': {
+        if (!P.est || !P.est.loaded) return +(m.valor_atual || 0);
+        const since = m.data_inicio || '0000', day = (x) => String(x || '').slice(0, 10);
+        if (m.origem_metrica === 'est_horas') return Math.round(P.sum(S.where('est_sessoes', (s) => s.status === 'encerrada' && day(s.inicio) >= since), (s) => +s.liquido_s || 0) / 360) / 10;
+        if (m.origem_metrica === 'est_questoes') return S.where('est_tentativas', (t) => day(t.created_at) >= since).length;
+        if (m.origem_metrica === 'est_precisao') { const v = S.where('est_tentativas', (t) => day(t.created_at) >= since && ['certa', 'errada'].includes(t.resultado_atual || t.resultado)); return v.length ? Math.round((v.filter((t) => (t.resultado_atual || t.resultado) === 'certa').length / v.length) * 1000) / 10 : 0; }
+        if (m.origem_metrica === 'est_revisoes') return S.where('est_revisoes', (r) => r.status === 'feita' && day(r.feita_em) >= since).length;
+        if (m.origem_metrica === 'est_redacoes') return S.where('est_discursivas', (d) => d.status !== 'rascunho' && day(d.created_at) >= since).length;
+        return P.est.coverage(m.origem_id || P.est.ctx() || null).pct || 0;
+      }
+      default: return +(m.valor_atual || 0);
+    }
+  };
+
+  /** Ritmo: no_ritmo | atencao | atrasada | concluida | sem_prazo */
+  P.goalPace = (m, atual) => {
+    const pct = C.goalProgress(m, atual);
+    if (pct >= 100) return { key: 'concluida', label: 'Concluída', cls: 'up', pct };
+    if (!m.prazo || !m.data_inicio) return { key: 'sem_prazo', label: 'Sem prazo', cls: '', pct };
+    const total = D.diff(m.data_inicio, m.prazo), passado = D.diff(m.data_inicio, D.today());
+    if (total <= 0 || passado > total) return { key: 'atrasada', label: 'Prazo vencido', cls: 'down', pct, esperado: 100 };
+    const esperado = P.clamp((passado / total) * 100, 0, 100);
+    if (pct + 5 >= esperado) return { key: 'no_ritmo', label: 'No ritmo', cls: 'up', pct, esperado };
+    if (pct + 20 >= esperado) return { key: 'atencao', label: 'Atenção', cls: 'acc', pct, esperado };
+    return { key: 'atrasada', label: 'Atrasada', cls: 'down', pct, esperado };
+  };
+})();
+</script>

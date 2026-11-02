@@ -1,0 +1,455 @@
+<script>
+/* Prumo · Estudos: leitura de PDF de questões (cadernos de questões, provas, listas).
+   Lê o texto com as posições (PDF.js), separa colunas, junta linhas e hifenização, e reconhece: número da questão,
+   banca/ano/órgão/cargo (entre parênteses ou "Banca: … Ano: …"), enunciado completo, alternativas A–E ou A–D
+   (inclusive várias na mesma linha), certo/errado (C/E, V/F), textos de apoio ("Leia o texto…", "Texto I"), assunto
+   (títulos), disciplina (sumário, cabeçalho das páginas), gabarito (tabelas "GABARITO" por disciplina ou "Gabarito: B"
+   depois da questão), comentários e imagens dentro da questão (posição na página para recortar).
+   O resultado sai nas mesmas colunas do modelo XLSX de questões, com avisos do que precisa ser conferido.
+   Funciona no navegador e no Node (testes). */
+(function (root) {
+  'use strict';
+  const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const MIN = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'em', 'a', 'o', 'as', 'os', 'na', 'no', 'nas', 'nos', 'para', 'com', 'por', 'ao', 'aos', 'à', 'às']);
+  const SIGLAS = new Set(['ti', 'sfn', 'lgpd', 'cmn', 'bb', 'pix', 'sql', 'ia', 'cf', 'clt', 'stf', 'stj', 'ii', 'iii', 'iv']);
+  function titleCase(s) {
+    return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim().split(' ').map((w, i) => {
+      if (SIGLAS.has(w.replace(/[^a-z]/g, ''))) return w.toUpperCase();
+      if (i && MIN.has(w)) return w;
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    }).join(' ');
+  }
+  const isUpper = (s) => /[A-ZÀ-Ý]/.test(s) && !/[a-zß-ÿ]/.test(s);
+
+  // ================= 1. linhas de uma página =================
+  /**
+   * @param {{str,x,y,w,size,rot}[]} items  texto da página (coordenadas do PDF: y cresce para cima)
+   * @param {{n,width,height}} page
+   * @param {{x0,y0,x1,y1}[]} imgs  imagens desenhadas na página
+   */
+  function pageLines(items, page, imgs) {
+    const out = { n: page.n, width: page.width, height: page.height, header: [], nums: [], lines: [] };
+    let txt = [];
+    items.forEach((it) => { const s = String(it.str || ''); if (!s) return; if (it.rot) { if (s.trim()) out.header.push(s.trim()); return; } txt.push({ ...it, str: s, sp: !s.trim() }); });
+    txt.forEach((it) => { if ((it.y < 45 || it.y > page.height - 40) && /^\d{1,4}$/.test(it.str.trim())) out.nums.push(+it.str.trim()); });
+    // número de página na margem lateral (fora da mancha do texto): não entra nas linhas
+    txt = txt.filter((it) => !((it.y < 45 || it.y > page.height - 40) && /^\d{1,4}$/.test(it.str.trim()) && (it.x < 50 || it.x + it.w > page.width - 45)));
+    if (!txt.length && !(imgs || []).length) return out;
+    const mid = page.width / 2, tot = txt.reduce((a, it) => a + (it.w || 1), 0) || 1;
+    const cross = txt.filter((it) => it.x < mid - 6 && it.x + it.w > mid + 6).reduce((a, it) => a + it.w, 0);
+    const two = cross / tot < 0.06 && txt.length > 3 && txt.some((it) => it.x >= mid) && txt.some((it) => it.x + it.w <= mid);
+    const cols = two ? [txt.filter((it) => it.x + it.w / 2 < mid), txt.filter((it) => it.x + it.w / 2 >= mid)] : [txt];
+    cols.forEach((col, ci) => {
+      const sorted = col.slice().sort((a, b) => b.y - a.y || a.x - b.x), lines = [];
+      sorted.forEach((it) => {
+        if (it.sp) { const L0 = lines[lines.length - 1]; if (L0 && Math.abs(L0.y - it.y) <= Math.max(1.6, (it.size || 9) * 0.35)) L0.items.push(it); return; }
+        const sz = it.size || 9, L = lines[lines.length - 1];
+        if (L && Math.abs(L.y - it.y) <= Math.max(1.6, sz * 0.35)) L.items.push(it); else lines.push({ y: it.y, items: [it] });
+      });
+      lines.forEach((L) => { L.items = L.items.filter((i) => !i.sp || L.items.some((j) => !j.sp)); });
+      for (let k = lines.length - 1; k >= 0; k--) if (!lines[k].items.some((i) => !i.sp)) lines.splice(k, 1);
+      const starts = lines.map((L) => Math.min(...L.items.filter((i) => !i.sp).map((i) => i.x))).sort((a, b) => a - b);
+      const colLeft = starts.length ? starts[Math.floor(starts.length * 0.1)] : 0;
+      const colRight = Math.max(0, ...col.map((i) => i.x + i.w));
+      const built = lines.map((L) => {
+        const all = L.items.sort((a, b) => a.x - b.x), its = all.filter((i) => !i.sp); let s = '', prev = null;
+        const spAt = all.filter((i) => i.sp).map((i) => i.x);
+        its.forEach((it) => {
+          if (prev && spAt.some((x) => x >= prev.x + prev.w - 0.5 && x <= it.x + 0.5) && !/\s$/.test(s)) s += ' ';
+          if (prev) { const gap = it.x - (prev.x + prev.w), sz = it.size || 9; if (gap > sz * 4) s += ' | '; else if (gap > sz * 0.12 && !/\s$/.test(s) && !/^\s/.test(it.str)) s += ' '; }
+          s += it.str; prev = it;
+        });
+        const last = its[its.length - 1];
+        return { text: s.replace(/\s+/g, ' ').trim(), x: its[0].x, xr: last.x + last.w, y: L.y, size: Math.max(...its.map((i) => i.size || 9)), page: page.n, col: ci, colLeft, colRight,
+          soft: /^[-‐­]$/.test(last.str.trim()) && its.length > 1 };
+      });
+      (imgs || []).forEach((b) => {
+        const cx = (b.x0 + b.x1) / 2;
+        if (two && (ci === 0) !== (cx < mid)) return;
+        built.push({ img: true, bbox: b, y: b.y1, x: b.x0, page: page.n, col: ci, colLeft, colRight, size: 9, text: '' });
+      });
+      built.sort((a, b) => b.y - a.y || a.x - b.x);
+      built.forEach((l, i) => { const p = built[i - 1]; l.gap = p ? (p.img ? 0 : p.y - l.y) : 999; });
+      out.lines.push(...built);
+    });
+    return out;
+  }
+
+  // ================= 2. leitura das questões =================
+  const QSTART = /^(?:quest[ãa]o\s*)?(\d{1,4})\s*(?:[.)]\s*(?=\()|\s(?=\([A-Za-zÀ-ú])|[.)\-–—]\s+|º\s*[.)\-–]?\s*)(?:\(([^)]{2,200})\)?)?\s*(.*)$/i;
+  const QWORD = /^quest[ãa]o\s+(\d{1,4})\b[\s.:\-–]*(.*)$/i;
+  const ALT = /^\(?([a-eA-E])(?:\s*[)\]]\s*|\s*\.\s+|\s+[-–]\s+)(.*)$/;
+  const ALT2 = /^\(([a-eA-E])\)\s*(.*)$/;
+  const HEAD = /^[ÆĀ►▶■•➤➢❯→⮚➔➜➔➢➜]\s*(.+)$/;
+  const GABH = /^(gabaritos?|gabarito oficial|respostas|answer key)\b[\s:.\-–]*(.*)$/i;
+  const GABPAIR = /(\d{1,4})[\s|]*[-–.:)]?[\s|]*(ANULADA|NULA|CERTO|ERRADO|[A-E]|[VF]|\*|X)(?=\s|$|[,;|])/gi;
+  const GABLINE = /^(?:gabarito|resposta|resp\.|alternativa correta|letra correta)\s*[:\-–]?\s*(?:letra\s*)?\(?\s*(ANULADA|CERTO|ERRADO|[A-E]|[VF])\s*\)?\.?\s*$/i;
+  const EXPL = /^(coment[áa]rios?|resolu[çc][ãa]o|justificativa|explica[çc][ãa]o|gabarito comentado)\s*[:\-–]?\s*(.*)$/i;
+  const CUE = /^(?:\(?[a-z]\)\s*)?(leia|considere|observe|analise|veja|text[o]? para|read|look at)\s+(?:atentamente\s+)?(?:o|a|os|as|the|this)?\s*(?:seguinte\s+)?(texto|textos|trecho|fragmento|tirinha|charge|poema|quadrinho|cartum|reportagem|text|passage|article)|^(texto|text)\s+([ivx]+|\d+)\b|^(?:textos?|text)\s+(?:para|de apoio|base|associado|for)\b/i;
+  const CUENEW = /^(?:(texto|text)\s+([ivx]+|\d+)\b|(leia|read)\s+(?:atentamente\s+)?(?:o|the)\s+(?:seguinte\s+)?(texto|text)\b)/i;
+  const REFTXT = /\b(texto|trecho|fragmento|fragment|excerpt|sentence|ora[çc][ãa]o|per[íi]odo|express[ãa]o|par[áa]grafo|linhas?\s+\d|verso|estrofe|autora?\b|narrador|tirinha|charge|text|passage|paragraph|author|writer)\b/i;
+  const NOISE = /^(anota[çc][õo]es|sum[áa]rio|apresenta[çc][ãa]o)$/i;
+
+  function metaFromParens(raw) {
+    const o = { raw: String(raw || '').trim() };
+    if (!o.raw) return o;
+    // "CESPE/CEBRASPE", "FUNDATEC/RS": sigla/sigla é um nome só
+    const toks = o.raw.replace(/\b([A-ZÀ-Ý]{2,})\/([A-ZÀ-Ý]{2,})\b/g, '$1\u2215$2').split(/\s*(?:[–—|;,/]|\s-\s)\s*/).map((t) => t.trim().replace(/\u2215/g, '/')).filter(Boolean);
+    const rest = [];
+    toks.forEach((t) => { const y = t.match(/^(?:ano\s*:?\s*)?((?:19|20)\d{2})$/i); if (y && !o.ano) o.ano = +y[1]; else rest.push(t); });
+    if (!o.ano) { const y = o.raw.match(/\b((?:19|20)\d{2})\b/); if (y) o.ano = +y[1]; }
+    const r2 = rest.filter((t) => !/^\d+$/.test(t) && !(o.ano && t.includes(String(o.ano))));
+    if (r2[0]) o.banca = r2[0];
+    if (r2[1]) o.orgao = r2[1];
+    if (r2.length > 2) o.cargo = r2.slice(2).join(' – ');
+    return o;
+  }
+  function metaLabeled(line) {
+    const o = {}; const re = /(ano|banca|[óo]rg[ãa]o|prova|cargo|disciplina|assunto|n[íi]vel)\s*:\s*(.*?)(?=\s+(?:ano|banca|[óo]rg[ãa]o|prova|cargo|disciplina|assunto|n[íi]vel)\s*:|$)/gi;
+    let m, n = 0;
+    while ((m = re.exec(line))) { n++; const k = norm(m[1]), v = m[2].trim(); if (k === 'ano') o.ano = +((v.match(/(?:19|20)\d{2}/) || [])[0] || 0) || undefined; else if (k === 'banca') o.banca = v; else if (k === 'orgao') o.orgao = v; else if (k === 'cargo' || k === 'prova') o[k === 'prova' ? 'prova' : 'cargo'] = v; else if (k === 'disciplina') o.disciplina = v; else if (k === 'assunto') o.assunto = v; }
+    return n >= 2 ? o : null;
+  }
+  /** Junta linhas num texto: hifenização, parágrafos e itens. */
+  function joinLines(ls) {
+    let s = '', prev = null;
+    ls.forEach((l) => {
+      if (l.img) return;
+      let t = l.text; if (!t) return;
+      if (!prev) { s = t; prev = l; return; }
+      const sz = l.size || 9, sameCol = prev.page === l.page && prev.col === l.col;
+      const para = (sameCol && l.gap > sz * 1.75) || Math.abs((prev.size || 9) - sz) > 0.6 || /^(?:[IVX]{1,5}\s*[-–.)]|\(\s*\)|[•▪✓➢\-–]\s|y\s(?=\S)|\d+[.)]\s|[a-e]\)\s)/.test(t) || (sameCol && /[.:?!”"]$/.test(prev.text) && prev.xr < prev.colRight - sz * 3.5) || (sameCol && l.x > prev.x + sz * 0.9 && /[.:?!”"]$/.test(prev.text));
+      if (prev.soft) { s = s.replace(/[-‐­]\s*$/, ''); s += t; }
+      else if (/[a-zà-ú]-$/.test(s) && /^[a-zà-ú]/.test(t) && sameCol && prev.xr > prev.colRight - sz * 2) s = s.slice(0, -1) + t;
+      else s += (para ? '\n' : ' ') + t;
+      prev = l;
+    });
+    return s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+  const sigla = (d) => { const w = norm(d).split(' ').filter((x) => x && !MIN.has(x)); return (w.length > 1 ? w.map((x) => x[0]).join('') : (w[0] || 'q').slice(0, 3)).toUpperCase(); };
+
+  /**
+   * @param {ReturnType<pageLines>[]} pages
+   * @param {{prefixo?, banca?, orgao?, cargo?, area?, concurso?, fonte?}} o
+   */
+  function parse(pages, o = {}) {
+    o = o || {};
+    const avisos = [];
+    // cabeçalhos/rodapés repetidos (texto igual na mesma altura em várias páginas)
+    const freq = {};
+    pages.forEach((p) => { const seen = new Set(); p.lines.forEach((l) => { if (l.img || !(l.y > p.height - 70 || l.y < 60)) return; const k = norm(l.text) + '@' + Math.round(l.y / 4); if (!seen.has(k)) { seen.add(k); freq[k] = (freq[k] || 0) + 1; } }); });
+    const lim = Math.max(3, pages.length * 0.2);
+    // sumário → disciplina por página impressa
+    const sum = [];
+    pages.slice(0, 12).forEach((p) => p.lines.forEach((l) => { const m = !l.img && l.text.replace(/\s*\|\s*/g, ' ').match(/^(.{3,90}?)\s*[.·…]{4,}\s*(\d{1,4})$/); if (m && /[A-Za-zÀ-ú]{3}/.test(m[1])) sum.push({ nome: m[1].trim(), pg: +m[2] }); }));
+    sum.sort((a, b) => a.pg - b.pg);
+    // número impresso da página: a diferença (impresso − índice) que mais se repete entre os números nas margens
+    const offs = {}; pages.forEach((p) => { (p.nums || []).forEach((v) => { const d = v - p.n; offs[d] = (offs[d] || 0) + 1; }); });
+    const best = Object.entries(offs).sort((a, b) => b[1] - a[1])[0];
+    const off = best && best[1] >= Math.max(3, pages.length * 0.3) ? +best[0] : null;
+    pages.forEach((p) => { p.pageNo = off === null ? null : p.n + off; });
+    let lastHeader = null;
+    const discOf = (p) => {
+      if (p.header.length) { const h = p.header.filter((x) => x.length > 3 && isUpper(x)).sort((a, b) => b.length - a.length)[0]; if (h) lastHeader = h; }
+      if (sum.length && p.pageNo != null) { const pg = p.pageNo; let d = null; sum.forEach((s) => { if (s.pg <= pg) d = s.nome; }); if (d) return d; }
+      return lastHeader;
+    };
+    const nomes = new Set(sum.map((x) => norm(x.nome)));
+    pages.forEach((p) => p.header.forEach((h) => { if (h.length > 3) nomes.add(norm(h)); }));
+    const L = [];
+    pages.forEach((p) => { const disc = discOf(p); p.lines.forEach((l) => { if (!l.img && p.pageNo != null && l.text === String(p.pageNo) && (l.y < 45 || l.y > p.height - 40)) return; if (!l.img && freq[norm(l.text) + '@' + Math.round(l.y / 4)] >= lim && (l.y > p.height - 70 || l.y < 60)) return; l.disc = disc; L.push(l); }); });
+    const strict = L.filter((l) => !l.img && /^\d{1,4}\s*[.)\-–]\s*\(/.test(l.text)).length >= 10;
+
+    const qs = [], textos = [], gabs = [];
+    let cur = null, state = 'pre', group = 0, assunto = null, assuntoDisc = null, pend = [], texto = null, head = null, gab = null, expl = null, lastNum = 0, firstSeen = false;
+    const closeHead = () => { if (head) { assunto = head.join(' ').replace(/\s+/g, ' ').trim(); assuntoDisc = head.disc; head = null; } };
+    const flushPend = (forQ) => {
+      // subtítulo curto logo antes da questão ("Substantivo", "Medidas de dispersão…"): vira o assunto
+      const tx0 = pend.filter((l) => !l.img && l.text);
+      if (forQ && tx0.length && tx0.length <= 2 && !pend.some((l) => l.img) && tx0.every((l) => l.text.length < 90 && !/[.,;:?!]$/.test(l.text) && /^[A-ZÀ-Ú]/.test(l.text) && !/[{}[\]=<>|]|\(\d| , /.test(l.text) && l.text.split(' ').length <= 12) && tx0.map((l) => l.text).join(' ').length < 120) {
+        const sub = tx0.map((l) => l.text).join(' ').trim();
+        tx0.forEach((l) => { l.used = 1; });
+        if (!NOISE.test(sub)) { assunto = assunto && assuntoDisc === tx0[0].disc ? assunto.replace(/\s›.*$/, '') + ' › ' + sub : sub; assuntoDisc = tx0[0].disc; }
+        pend = []; return forQ;
+      }
+      const real = pend.filter((l) => l.img || (l.text && !NOISE.test(l.text) && !(isUpper(l.text) && l.text.length < 60)));
+      if (real.length) {
+        const txt = joinLines(real), imgs = real.filter((l) => l.img).map((l) => ({ page: l.page, col: l.col, bbox: l.bbox, cx0: l.colLeft, cx1: l.colRight }));
+        if (txt.length > 60 || imgs.length) { real.forEach((l) => { l.used = 1; }); texto = { texto: txt, imgs, group, range: rangeOf(txt), pagina: real[0].page, usado: 0, assunto: assuntoDisc === real[0].disc ? assunto : null }; textos.push(texto); if (!CUE.test(txt) && !REFTXT.test(txt.slice(0, 300))) avisos.push({ pagina: real[0].page, msg: 'Texto fora de questão associado à questão seguinte: confira.', trecho: txt.slice(0, 120) }); }
+        else if (txt.trim() && firstSeen) avisos.push({ pagina: real[0].page, msg: 'Trecho solto entre questões (não importado): "' + txt.slice(0, 100) + '"' });
+      }
+      pend = []; return forQ;
+    };
+    const rangeOf = (t) => { const m = norm(t.slice(0, 400)).match(/(?:quest(?:ao|oes)|itens?|items?)\s*(?:de\s*|from\s*)?(\d{1,4})\s*(?:a|ate|e|-|–)\s*(\d{1,4})/); return m ? [+m[1], +m[2]] : null; };
+    const newQ = (num, meta, rest, l) => {
+      closeHead(); flushPend(true);
+      if (cur) qs.push(cur);
+      cur = { num, group, disc: l.disc, assunto: assuntoDisc === l.disc ? assunto : null, meta: meta || {}, enun: [], alts: [], imgs: [], expl: [], gab: null, page: l.page, pages: new Set([l.page]), firstLine: l };
+      l.used = 1;
+      const lm0 = rest && metaLabeled(rest);
+      if (lm0) Object.keys(lm0).forEach((k) => { if (lm0[k] && !cur.meta[k]) cur.meta[k] = lm0[k]; });
+      else if (rest) cur.enun.push({ ...l, text: rest });
+      state = 'enun'; lastNum = num; firstSeen = true;
+    };
+    const altStart = (m, l) => {
+      const letter = m[1], rest = m[2] || '';
+      cur.altCase = cur.altCase || (letter === letter.toUpperCase() ? 'U' : 'l');
+      const pieces = [[letter.toUpperCase(), rest]];
+      // várias alternativas na mesma linha: "a) 7 b) 10 c) 12"
+      let nx = String.fromCharCode(letter.toUpperCase().charCodeAt(0) + 1);
+      for (;;) {
+        const lastP = pieces[pieces.length - 1], re = new RegExp('(?:^|\\s)\\(?(' + (cur.altCase === 'U' ? nx : nx.toLowerCase()) + ')\\s*[)\\]]\\s+'), mm = lastP[1].match(re);
+        if (!mm || nx > 'E') break;
+        pieces.push([nx, lastP[1].slice(mm.index + mm[0].length)]); lastP[1] = lastP[1].slice(0, mm.index);
+        nx = String.fromCharCode(nx.charCodeAt(0) + 1);
+      }
+      l.used = 1; pieces.forEach(([L2, t], k) => cur.alts.push({ L: L2, lines: t.trim() ? [{ ...l, text: t.trim() }] : [], x: l.x, raw: k === 0 && pieces.length === 1 ? l : null }));
+      state = 'alts';
+    };
+    const expectAlt = () => String.fromCharCode(65 + cur.alts.length);
+
+    for (let i = 0; i < L.length; i++) {
+      const l = L[i];
+      if (firstSeen) l.seen = 1;
+      if (l.img) {
+        if (state === 'gab' || state === 'pre') continue;
+        if (state === 'after') pend.push(l);
+        else if (cur) { l.used = 1; cur.imgs.push({ page: l.page, col: l.col, bbox: l.bbox, cx0: l.colLeft, cx1: l.colRight }); cur.pages.add(l.page); }
+        continue;
+      }
+      const t = l.text;
+      if (t && (nomes.has(norm(t)) || (isUpper(t) && t.length >= 4 && (l.gap > (l.size || 9) * 2.5 || l.size >= 14) && [...nomes].some((n) => (' ' + n + ' ').includes(' ' + norm(t) + ' '))))) { l.used = 1; continue; } // título da disciplina / cabeçalho
+      // ---- gabarito
+      const gh = t.match(GABH);
+      if (gh && t.length < 60 && (!gh[2].trim() || /\d/.test(gh[2])) && (!cur || state !== 'enun' || cur.enun.length > 0)) {
+        closeHead(); if (cur) { qs.push(cur); cur = null; } flushPend(); l.used = 1;
+        gab = { group, pares: [], pagina: l.page, disc: l.disc }; gabs.push(gab); state = 'gab';
+        if (gh[2]) { let m; GABPAIR.lastIndex = 0; while ((m = GABPAIR.exec(gh[2]))) gab.pares.push([+m[1], m[2].toUpperCase()]); }
+        continue;
+      }
+      if (state === 'gab') {
+        const pairs = []; let m; GABPAIR.lastIndex = 0; let cov = 0;
+        while ((m = GABPAIR.exec(t))) { pairs.push([+m[1], m[2].toUpperCase()]); cov += m[0].length; }
+        if (pairs.length && cov >= t.replace(/[\s|]/g, '').length * 0.6) { l.used = 1; gab.pares.push(...pairs); continue; }
+        if (/^(quest[ãa]o|n[ºo°]|resposta|gab|alternativa)s?\b/i.test(t) && t.length < 40) { l.used = 1; continue; }
+        if (!t.trim() || NOISE.test(t) || (isUpper(t) && t.length < 60 && !QSTART.test(t) && !HEAD.test(t))) { l.used = 1; continue; }
+        group++; state = 'after'; texto = null; assunto = null;
+      }
+      // ---- início de questão
+      let m = t.match(QSTART), wq = !m && t.match(QWORD);
+      if (m || wq) {
+        const num = +(m ? m[1] : wq[1]);
+        const parens = m ? m[2] : null, rest = m ? (m[3] || '') : wq[2];
+        let meta = parens ? metaFromParens(parens.replace(/\)$/, '')) : {};
+        const margem = l.x <= l.colLeft + (l.size || 9) * 1.5;
+        const ok = margem && (!lastNum || num <= lastNum + 40 || num === 1) && (wq || (parens && (meta.ano || /[A-Za-z]{3}/.test(parens))) || (!strict && (num === lastNum + 1 || (num === 1 && state !== 'enun')) && rest.length > 2 && !(state === 'enun' && cur && cur.enun.length < 1)));
+        const insideList = state === 'enun' && cur && !parens && !wq && num !== lastNum + 1;
+        if (ok && !insideList && !(state === 'alts' && cur && !parens && !wq && cur.alts.length < 2)) {
+          if (num <= lastNum && cur && num !== 1 && !parens && !wq) { /* numeração voltou: lista dentro do texto */ }
+          else { newQ(num, meta, rest.replace(/^\)\s*/, ''), l); continue; }
+        }
+      }
+      // ---- títulos (assunto)
+      const hm = t.match(HEAD);
+      if (hm && t.length < 200) { l.used = 1; if (cur && state !== 'pre') { qs.push(cur); cur = null; } flushPend(); head = [hm[1]]; head.disc = l.disc; head.x = l.x; if (firstSeen) state = 'after'; texto = null; continue; }
+      if (head && isUpper(t) && l.gap < l.size * 2.2) { l.used = 1; head.push(t); continue; }
+      closeHead();
+      if (state === 'pre') { if (CUE.test(t) || CUENEW.test(t)) { state = 'after'; firstSeen = true; l.seen = 1; pend.push(l); } continue; }
+      if (!cur) {
+        // alternativas que continuam depois de um título/quebra: volta para a última questão
+        const lq = qs[qs.length - 1], am0 = t.match(ALT2) || t.match(ALT);
+        if (am0 && lq && !pend.length && state === 'after' && lq.alts.length >= 2 && lq.alts.length < 5 && am0[1].toUpperCase() === String.fromCharCode(65 + lq.alts.length) && (lq.altCase === 'U') === (am0[1] === am0[1].toUpperCase())) { cur = qs.pop(); altStart(am0, l); continue; }
+        if (state === 'after' && !NOISE.test(t)) pend.push(l); continue;
+      }
+      cur.pages.add(l.page);
+      // ---- gabarito / comentário na própria questão
+      const gl = t.match(GABLINE);
+      if (gl && state !== 'enun') { l.used = 1; cur.gab = gl[1].toUpperCase(); state = 'after'; continue; }
+      const em = t.match(EXPL);
+      if (em && (state === 'alts' || state === 'after' || state === 'expl')) { state = 'expl'; l.used = 1; if (em[2]) cur.expl.push({ ...l, text: em[2] }); continue; }
+      if (state === 'expl') { if (CUE.test(t)) { state = 'after'; pend.push(l); continue; } l.used = 1; cur.expl.push(l); continue; }
+      // ---- alternativas
+      let am = t.match(ALT2) || t.match(ALT);
+      if (!am && state === 'alts' && cur.alts.length) { const m3 = t.match(/^([a-eA-E])\s+(.+)$/); if (m3 && m3[1].toUpperCase() === expectAlt() && Math.abs(l.x - cur.alts[cur.alts.length - 1].x) < 2) am = m3; } // "e proposta…" (sem o parêntese)
+      if (am && (state === 'enun' || state === 'alts') && am[1].toUpperCase() === expectAlt() && (cur.enun.length || cur.alts.length) && (!cur.altCase || (cur.altCase === 'U') === (am[1] === am[1].toUpperCase()))) { altStart(am, l); continue; }
+      if (state === 'alts') {
+        const a = cur.alts[cur.alts.length - 1], sz = l.size || 9, newCol = !a.lines.length || a.lines[a.lines.length - 1].col !== l.col || a.lines[a.lines.length - 1].page !== l.page;
+        const indent = l.x > l.colLeft + sz * 0.6, gap = newCol ? 0 : l.gap;
+        const lastTxt = a.lines.length ? a.lines[a.lines.length - 1].text : '';
+        const cont = (indent && gap < sz * 2.3) || (!indent && gap < sz * 1.6 && /^[a-zà-ú0-9(“"'\-–%,.;:]/.test(t) && !/[.?!]$/.test(lastTxt)) || (!indent && gap < sz * 1.4 && !/[.?!;]$/.test(lastTxt) && !newCol)
+          || (!indent && gap < sz * 1.75 && (/[,(\-–]$/.test(lastTxt) || (a.lines.map((x) => x.text).join(' ').split('(').length > a.lines.map((x) => x.text).join(' ').split(')').length)));
+        // a próxima alternativa aparece logo adiante (sem outra questão no meio): esta linha ainda é da alternativa atual
+        const ahead = !cont && cur.alts.length < 5 && (() => { const nx = expectAlt(); for (let j = i + 1; j < Math.min(L.length, i + 9); j++) { const x = L[j]; if (x.img) continue; if (QSTART.test(x.text) || HEAD.test(x.text) || GABH.test(x.text)) return false; const mm = x.text.match(ALT2) || x.text.match(ALT); if (mm && mm[1].toUpperCase() === nx && Math.abs(x.x - a.x) < 3) return true; } return false; })();
+        if ((cont || ahead) && !CUE.test(t)) { l.used = 1; a.lines.push(l); continue; }
+        if (cur.alts.length < 2) { cur.enun.push(...cur.alts.flatMap((x) => [x.raw || { ...(x.lines[0] || l), text: x.L.toLowerCase() + ') ' + (x.lines[0] ? x.lines[0].text : '') }].concat(x.lines.slice(1)))); cur.alts = []; cur.altCase = null; state = 'enun'; l.used = 1; cur.enun.push(l); continue; }
+        qs.push(cur); cur = null; state = 'after'; pend.push(l); continue;
+      }
+      if (state === 'enun') {
+        // certo/errado sem alternativas: um "Texto…" novo com espaço antes encerra a questão
+        if (CUENEW.test(t) && cur.enun.length > 2 && l.gap > (l.size || 9) * 2.2 && !CUE.test(cur.enun[0].text) && !cur.alts.length) { qs.push(cur); cur = null; state = 'after'; pend.push(l); continue; }
+        const lm = metaLabeled(t);
+        if (lm && cur.enun.length < 3) { l.used = 1; Object.keys(lm).forEach((k) => { if (lm[k] && !cur.meta[k]) cur.meta[k] = lm[k]; }); continue; }
+        l.used = 1; cur.enun.push(l); continue;
+      }
+      if (state === 'after') pend.push(l);
+    }
+    closeHead(); if (cur) qs.push(cur); flushPend();
+
+    // ---- número impresso errado (ex.: 3 entre 32 e 34): corrige pela sequência
+    { const gs = {}; qs.forEach((q) => { (gs[q.group] = gs[q.group] || []).push(q); });
+      Object.values(gs).forEach((list) => { for (let i = 1; i < list.length - 1; i++) { const a = list[i - 1].num, b = list[i].num, c = list[i + 1].num; if (b !== a + 1 && c === a + 2) { avisos.push({ pagina: list[i].page, msg: `Questão impressa como ${b} entre ${a} e ${c}: lida como ${a + 1}.` }); list[i].num = a + 1; } } }); }
+    // ---- gabaritos → questões do mesmo grupo (repetição de número = próxima sequência)
+    const byGroup = {};
+    qs.forEach((q) => { (byGroup[q.group] = byGroup[q.group] || []).push(q); });
+    gabs.forEach((g) => {
+      const list = byGroup[g.group] || [], runs = []; let run = null, prev = Infinity;
+      list.forEach((q) => { if (q.num <= prev) { run = {}; runs.push(run); } run[q.num] = run[q.num] || q; prev = q.num; });
+      const occ = {}, sem = [];
+      g.pares.forEach(([n, a]) => { const k = occ[n] = (occ[n] || 0) + 1; const r = runs[k - 1]; const q = r && r[n]; if (q) { if (!q.gab) q.gab = a; } else sem.push(n); });
+      if (sem.length) avisos.push({ pagina: g.pagina, msg: `Gabarito${g.disc ? ' de ' + titleCase(g.disc) : ''}: ${sem.length} número(s) sem questão encontrada (${sem.slice(0, 12).join(', ')}${sem.length > 12 ? '…' : ''}).` });
+    });
+
+    const multiDoc = qs.filter((q) => q.alts.length >= 2).length >= qs.length * 0.8;
+    // ---- monta as linhas do modelo
+    const prefixo = String(o.prefixo || 'PDF').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'PDF';
+    const rows = [], codes = {};
+    let txtIdx = 0;
+    qs.forEach((q) => {
+      let enun = joinLines(q.enun), textoBase = '';
+      // "Leia o texto… Texto II … (texto) … pergunta": separa o texto de apoio da pergunta
+      const SRC = /(dispon[íi]vel em|available (?:in|at|on)|acesso em|retrieved|adaptado|fragmento|adapted from|fonte\s*:|https?:)/i;
+      if ((CUE.test(enun.slice(0, 200)) && enun.length > 350) || (enun.length > 900 && enun.split('\n').length >= 3)) {
+        const paras = enun.split('\n'); let k = paras.length - 1;
+        const fonteIdx = paras.map((x) => SRC.test(x) && x.length < 400).lastIndexOf(true);
+        if (fonteIdx >= 0 && fonteIdx < paras.length - 1) { k = fonteIdx + 1; while (k < paras.length - 1 && /^\(?(adaptad[oa]|adapted|fragmento|excerpt|grifos? nossos?|texto adaptado)\b/i.test(paras[k].trim()) && paras[k].length < 60) k++; }
+        else while (k > 0 && paras.slice(k).join(' ').length < 60) k--;
+        if (k > 0) { textoBase = paras.slice(0, k).join('\n').trim(); enun = paras.slice(k).join('\n').trim(); }
+        const ad = enun.match(/^\(?(adaptad[oa]|adapted|fragmento|excerpt)\)?\.?\s+(?=\S)/i);
+        if (textoBase && ad) { textoBase += '\n' + ad[0].trim(); enun = enun.slice(ad[0].length).trim(); }
+        const tb = { texto: textoBase, imgs: q.imgs.slice(), group: q.group, range: rangeOf(textoBase), pagina: q.page, usado: 1, dono: q, disc: q.disc, assunto: q.assunto };
+        textos.push(tb); q.textoObj = tb;
+      }
+      if (!q.textoObj) {
+        // texto anterior: pelo intervalo citado ou pela referência ao texto
+        const cands = textos.filter((tx) => tx.group === q.group && tx !== q.textoObj && (tx.dono ? tx.dono.num < q.num : tx.pagina <= q.page) && (!tx.disc || tx.disc === q.disc));
+        const tx = cands[cands.length - 1];
+        if (tx && ((tx.range && q.num >= tx.range[0] && q.num <= tx.range[1]) || (!tx.range && (tx.usado === 0 || REFTXT.test(enun) || /[“"][^”"]{8,}[”"]/.test(enun) || (tx.assunto && q.assunto === tx.assunto)) && !tx.fechado))) { textoBase = tx.texto; q.textoObj = tx; tx.usado++; }
+      }
+      const alts = q.alts.map((a) => ({ L: a.L, t: joinLines(a.lines).replace(/\n/g, ' ') }));
+      // alternativa impressa no meio da linha anterior ("… bancos d) elevado …")
+      for (let k = 0; k < alts.length && alts.length < 5; k++) {
+        const nx = String.fromCharCode(alts[k].L.charCodeAt(0) + 1);
+        if (alts.some((a) => a.L === nx)) continue;
+        const mm = alts[k].t.match(new RegExp('\\s\\(?(' + nx + '|' + nx.toLowerCase() + ')\\)\\s+'));
+        if (mm) { alts.splice(k + 1, 0, { L: nx, t: alts[k].t.slice(mm.index + mm[0].length).trim() }); alts[k].t = alts[k].t.slice(0, mm.index).trim(); }
+      }
+      // alternativas sem letra no PDF (só quando a prova é de múltipla escolha e o gabarito é uma letra)
+      if (!alts.length && /^[A-E]$/.test(q.gab || '') && multiDoc) {
+        const ls = q.enun.filter((x) => !x.img), k0 = ls.map((x) => /[:?]\s*$/.test(x.text)).lastIndexOf(true);
+        if (k0 >= 0 && k0 < ls.length - 3) {
+          const items = []; ls.slice(k0 + 1).forEach((x, j, arr) => { const pv = arr[j - 1]; const novo = !pv || /[.;]$/.test(pv.text) || pv.xr < pv.colRight - (pv.size || 9) * 3; if (novo) items.push([x]); else items[items.length - 1].push(x); });
+          if (items.length === 5 || items.length === 4) { items.forEach((it, j) => alts.push({ L: 'ABCDE'[j], t: joinLines(it).replace(/\n/g, ' ') })); enun = joinLines(ls.slice(0, k0 + 1)); q.semLetra = true; }
+        }
+      }
+      if (!alts.length && /^[A-E]$/.test(q.gab || '') && multiDoc) { 'ABCDE'.split('').forEach((L2) => alts.push({ L: L2, t: '' })); q.altFalha = true; }
+      const altImg = q.imgs.length > 0 || q.altFalha;
+      alts.forEach((a) => { if (!a.t && altImg) a.t = '(alternativa ' + a.L + ' na imagem da questão)'; });
+      let gabv = q.gab || '', status = '', tipo;
+      if (/^(ANULADA|NULA|\*|X)$/.test(gabv)) { status = 'anulada'; gabv = ''; }
+      if (alts.length >= 2) tipo = 'multipla';
+      else if (/^(C|E|CERTO|ERRADO|V|F)$/.test(gabv) || /julgue|certo ou errado|verdadeiro ou falso|\(\s*\)\s*(certo|errado)/i.test(enun)) tipo = 'certo_errado';
+      else tipo = gabv ? 'curta' : 'discursiva';
+      if (tipo === 'certo_errado') gabv = { CERTO: 'C', V: 'C', ERRADO: 'E', F: 'E' }[gabv] || gabv;
+      const disc = q.meta.disciplina || (q.disc ? titleCase(q.disc) : '');
+      const ass = q.meta.assunto || (q.assunto ? titleCase(q.assunto).slice(0, 200) : '');
+      let code = `${prefixo}-${disc ? sigla(disc) : 'G' + (q.group + 1)}-${String(q.num).padStart(3, '0')}`;
+      if (codes[code]) { codes[code]++; code += '-' + codes[code]; } else codes[code] = 1;
+      const r = { codigo: code, tipo: tipo === 'multipla' ? 'multipla' : tipo === 'certo_errado' ? 'C/E' : tipo, enunciado: enun, a: '', b: '', c: '', d: '', e: '', gabarito: gabv, gabarito_status: status || (gabv ? (o.gabaritoStatus || 'definitivo') : ''),
+        explicacao: joinLines(q.expl), banca: q.meta.banca || o.banca || '', orgao: q.meta.orgao || o.orgao || '', cargo: q.meta.cargo || q.meta.prova || o.cargo || '', ano: q.meta.ano || '', disciplina: disc, assunto: ass, dificuldade: '',
+        fonte: [o.fonte, 'p. ' + q.page].filter(Boolean).join(', '), tags: o.tags || '', concurso: o.concurso || '', area: o.area || '', texto_base: textoBase, pagina: q.page,
+        _num: q.num, _imgs: q.imgs.length ? q.imgs : (q.textoObj && q.textoObj.imgs.length && !q.textoObj.dono ? q.textoObj.imgs : []), _alts: alts.length, _avisos: [] };
+      if (tipo === 'multipla') alts.forEach((a) => { r[a.L.toLowerCase()] = a.t; });
+      if (!gabv && status !== 'anulada') r._avisos.push('sem gabarito');
+      if (tipo === 'multipla' && gabv && !alts.some((a) => a.L === gabv)) r._avisos.push(`gabarito ${gabv} não está entre as alternativas`);
+      if (tipo === 'multipla' && alts.length < 4) r._avisos.push(`só ${alts.length} alternativa(s)`);
+      if (alts.some((a) => !a.t)) r._avisos.push('alternativa vazia');
+      if (!enun) r._avisos.push('enunciado vazio');
+      if (q.semLetra) r._avisos.push('alternativas sem letra no PDF: separadas por linha, confira');
+      // recorte da questão (imagem, fórmula, tabela ou alternativa que não virou texto): guarda a área de cada página/coluna
+      const segLines = q.enun.concat(...q.alts.map((a) => a.lines)).filter((x) => x && !x.img);
+      const bodyLines = q.enun.concat(...q.alts.map((a) => a.lines.slice(1))).filter((x) => x && !x.img);
+      const formula = bodyLines.filter((x) => x.text.length <= 3 && !/^[a-eA-E][).]?$/.test(x.text)).length >= 2 || bodyLines.some((x) => / \| /.test(x.text));
+      const motivo = q.imgs.length ? 'imagem' : q.altFalha || q.semLetra ? 'alternativas' : formula ? 'fórmula ou tabela' : (tipo === 'multipla' && alts.length < 4) || (multiDoc && alts.length < 2) ? 'alternativas' : '';
+      if (motivo) {
+        const segs = {};
+        segLines.concat(q.imgs.map((m) => ({ page: m.page, col: m.col, y: m.bbox.y1, yb: m.bbox.y0, colLeft: m.cx0, colRight: m.cx1, size: 0 }))).forEach((x) => {
+          const k = x.page + ':' + x.col, top = x.y + (x.size || 0), bot = x.yb != null ? x.yb : x.y - (x.size || 9) * 0.35;
+          const g = segs[k] || (segs[k] = { page: x.page, x0: x.colLeft - 4, x1: x.colRight + 4, y0: bot, y1: top });
+          g.y0 = Math.min(g.y0, bot); g.y1 = Math.max(g.y1, top); g.x0 = Math.min(g.x0, x.colLeft - 4); g.x1 = Math.max(g.x1, x.colRight + 4);
+        });
+        r._crop = { motivo, partes: Object.values(segs).sort((a, b) => a.page - b.page || b.y1 - a.y1) };
+        if (motivo !== 'imagem') r._avisos.push(motivo === 'alternativas' ? 'alternativas incompletas no PDF: a imagem da questão vai junto' : 'tem fórmula ou tabela: a imagem da questão vai junto');
+      }
+      if (tipo === 'discursiva') r._avisos.push('sem alternativas e sem gabarito: entra como discursiva');
+      rows.push(r); txtIdx++;
+    });
+    // sequência quebrada (questão pulada) por grupo
+    Object.values(byGroup).forEach((list) => { for (let i = 1; i < list.length; i++) { const a = list[i - 1].num, b = list[i].num; if (b > a + 1 && b - a < 20) avisos.push({ pagina: list[i].page, msg: `Numeração pulou de ${a} para ${b}${list[i].disc ? ' em ' + titleCase(list[i].disc) : ''}: confira se falta questão.` }); } });
+    const resumo = { questoes: rows.length, multipla: rows.filter((r) => r.tipo === 'multipla').length, certo_errado: rows.filter((r) => r.tipo === 'C/E').length, outras: rows.filter((r) => r.tipo !== 'multipla' && r.tipo !== 'C/E').length,
+      com_recorte: rows.filter((r) => r._crop).length,
+      com_gabarito: rows.filter((r) => r.gabarito || r.gabarito_status === 'anulada').length, com_texto: rows.filter((r) => r.texto_base).length, com_imagem: rows.filter((r) => r._imgs.length).length,
+      disciplinas: [...new Set(rows.map((r) => r.disciplina).filter(Boolean))], gabaritos: gabs.length, paginas: pages.length };
+    // conferência: linhas do PDF (depois da 1ª questão) que não foram para nenhum campo
+    const vistas = L.filter((l) => !l.img && l.text && l.seen), soltas = vistas.filter((l) => !l.used);
+    const cobertura = { linhas: vistas.length, aproveitadas: vistas.length - soltas.length, faltando: soltas.slice(0, 80).map((l) => ({ pagina: l.page, texto: l.text })) , total_faltando: soltas.length };
+    return { rows, avisos, resumo, cobertura };
+  }
+
+  // ================= 3. PDF → páginas (PDF.js) =================
+  function imagesFrom(ops, OPS) {
+    const out = [], st = []; let m = [1, 0, 0, 1, 0, 0];
+    const mul = (a, b) => [a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1], a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3], a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]];
+    for (let i = 0; i < ops.fnArray.length; i++) {
+      const fn = ops.fnArray[i], args = ops.argsArray[i];
+      if (fn === OPS.save) st.push(m);
+      else if (fn === OPS.restore) m = st.pop() || [1, 0, 0, 1, 0, 0];
+      else if (fn === OPS.transform) m = mul(m, args);
+      else if (fn === OPS.paintFormXObjectBegin) { st.push(m); if (args && Array.isArray(args[0]) && args[0].length === 6) m = mul(m, args[0]); }
+      else if (fn === OPS.paintFormXObjectEnd) m = st.pop() || [1, 0, 0, 1, 0, 0];
+      else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject || fn === OPS.paintJpegXObject) {
+        const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map(([x, y]) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]);
+        const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+        out.push({ x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) });
+      }
+    }
+    return out;
+  }
+  /** Lê o PDF (documento do PDF.js) e devolve as páginas em linhas. onProgress(i, total); ocr(página, n) para página sem texto. */
+  async function readPdf(pdf, OPS, o = {}) {
+    const pages = [];
+    for (let n = 1; n <= pdf.numPages; n++) {
+      const pg = await pdf.getPage(n), vp = pg.getViewport({ scale: 1 }), tc = await pg.getTextContent();
+      let items = tc.items.map((it) => { const t = it.transform; return { str: it.str, x: t[4] - (vp.viewBox ? vp.viewBox[0] : 0), y: t[5] - (vp.viewBox ? vp.viewBox[1] : 0), w: it.width, size: Math.hypot(t[2], t[3]) || Math.abs(t[3]) || 9, rot: Math.abs(t[1]) > 0.01 || Math.abs(t[2]) > 0.01 }; });
+      if (o.ocr && items.map((x) => x.str).join('').replace(/\s/g, '').length < 40) {
+        const r = await o.ocr(pg, n), ws = (r.palavras || []).map((a) => ({ t: a[0], x: a[1], y: a[2], w: a[3], h: a[4] }));
+        items = ws.filter((w) => String(w.t).trim()).map((w) => ({ str: w.t, x: w.x, y: vp.height - (w.y + w.h * 0.8), w: w.w, size: Math.max(4, w.h), rot: false }));
+      }
+      let imgs = [];
+      if (OPS && o.imagens !== false) {
+        try {
+          imgs = imagesFrom(await pg.getOperatorList(), OPS).map((b) => ({ x0: b.x0 - (vp.viewBox ? vp.viewBox[0] : 0), x1: b.x1 - (vp.viewBox ? vp.viewBox[0] : 0), y0: b.y0 - (vp.viewBox ? vp.viewBox[1] : 0), y1: b.y1 - (vp.viewBox ? vp.viewBox[1] : 0) }))
+            .filter((b) => b.x1 - b.x0 > 24 && b.y1 - b.y0 > 14 && b.x1 - b.x0 < vp.width * 0.92 && b.y1 - b.y0 < vp.height * 0.85);
+        } catch (e) { imgs = []; }
+      }
+      pages.push(pageLines(items, { n, width: vp.width, height: vp.height }, imgs));
+      if (o.onProgress) o.onProgress(n, pdf.numPages);
+      if (pg.cleanup) pg.cleanup();
+    }
+    return pages;
+  }
+
+  const api = { pageLines, parse, readPdf, imagesFrom, metaFromParens, joinLines, titleCase, _norm: norm };
+  if (root) { root.Prumo = root.Prumo || {}; root.Prumo.estQPdf = api; }
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof window !== 'undefined' ? window : null);
+</script>

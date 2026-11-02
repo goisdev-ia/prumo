@@ -1,0 +1,131 @@
+<script>
+/* Prumo · Configurações › Telegram: bot (dono), conectar o Telegram de cada pessoa, avisos automáticos,
+   resumo do dia e histórico. O token do bot nunca chega ao navegador. */
+(function () {
+  'use strict';
+  const P = window.Prumo;
+  const { h, raw, icon, ui } = P;
+  const st = { data: null, link: null };
+  const TIPO_LABEL = { alarme: 'Alarmes', tarefa: 'Tarefas', rotina: 'Rotinas', evento: 'Eventos', conta: 'Contas a vencer', fatura: 'Faturas', meta: 'Metas', sistema: 'Avisos do sistema' };
+  const STATUS = { enviado: ['Enviado', 'up'], falhou: ['Falhou', 'down'], bloqueado: ['Não enviado', ''], recebido: ['Recebido', 'info'] };
+  const back = h`<a href="#/cfg" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Configurações</a>`;
+  const hora = (iso) => { const d = new Date(iso); return isNaN(d) ? '' : `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  const sw = (act, on, label, hint, disabled) => h`<div class="li"><span class="main"><span class="t">${label}</span>${hint ? h`<span class="s" style="white-space:normal">${hint}</span>` : ''}</span><label class="toggle"><input type="checkbox" data-on-change="${act}" ${on ? raw('checked') : ''} ${disabled ? raw('disabled') : ''}><span></span></label></div>`;
+
+  async function load(silent) {
+    try { st.data = await P.api.call('tg.status', {}); } catch (e) { if (!silent) ui.toast(e.message, { error: true }); }
+    if (P.router.current() && P.router.current().tab === 'telegram') P.router.render(true);
+  }
+  async function call(route, payload, okMsg, btn) {
+    if (btn) btn.classList.add('loading');
+    try { const r = await P.api.call(route, payload || {}, { mutation: true }); st.data = r.status || r; if (okMsg) ui.toast(okMsg); return r; }
+    catch (e) { ui.toast(e.message, { error: true }); return null; }
+    finally { if (btn) btn.classList.remove('loading'); P.router.render(true); }
+  }
+
+  function render() {
+    const d = st.data;
+    if (!d) return h`<div class="page-head"><div>${back}<h1 class="mt-2">Telegram</h1></div></div>${ui.skeleton()}`;
+    const u = d.usuario, b = d.bot;
+    const estado = !b.configurado ? ['Bot não configurado', ''] : !u.conectado ? ['Não conectado', ''] : !u.ativo ? ['Desligado', ''] : ['Ativo', 'up'];
+    return h`<div class="page-head"><div>${back}<h1 class="mt-2">Telegram</h1><p>Avisos e resumo do dia no seu Telegram. Grátis, pela API oficial de bots.</p></div>
+        <div class="row-sm"><span class="chip ${estado[1]} lg">${estado[0]}</span></div></div>
+      <div class="dash"><div class="span-6 stack">
+        ${d.dono && !b.configurado ? botCard(b) : ''}
+        <div class="card pad-lg"><div class="row"><span class="tile" style="background:var(--primary-tint);color:var(--primary-ink)">${icon('message')}</span><div class="grow"><b>Seu Telegram</b><p class="muted" style="font-size:13px">${u.conectado ? 'Conectado' + (u.nome ? ' como ' + u.nome : '') + '.' : 'Conecte para receber os avisos do Prumo.'}</p></div></div>
+          ${!b.configurado ? h`<p class="faint mt-3" style="font-size:13px">O dono do app precisa configurar o bot primeiro.</p>`
+            : !u.conectado ? h`<ol class="muted mt-3" style="font-size:13.5px;line-height:1.6;padding-left:18px"><li>Toque em <b>Conectar meu Telegram</b>: o Telegram abre na conversa com <b>@${b.bot}</b>.</li><li>Toque em <b>Iniciar</b> (Start) lá.</li><li>Volte aqui e toque em <b>Verificar</b>.</li></ol>
+              <div class="row-sm mt-3" style="flex-wrap:wrap"><button class="btn btn-primary" data-act="tg.link">${icon('external', 'sm')}Conectar meu Telegram</button><button class="btn btn-ghost" data-act="tg.poll">${icon('refresh', 'sm')}Verificar</button></div>
+              ${st.link ? h`<p class="faint mt-3" style="font-size:12.5px">Se não abriu, toque aqui: <a href="${st.link}" target="_blank" rel="noopener">${st.link}</a> (vale 30 min).</p>` : ''}`
+            : h`<div class="list mt-3">
+              ${sw('tg.ativo', u.ativo, 'Usar o Telegram', 'Liga ou desliga tudo para você')}
+              ${sw('tg.auto', u.automatico, 'Enviar avisos automaticamente', 'Alarmes (em até 5 min), tarefas, rotinas, eventos e contas, juntos numa mensagem', !u.ativo)}
+              ${sw('tg.resumo', u.resumo, 'Resumo do dia às 7h', 'Rotinas, tarefas e contas a vencer', !u.ativo)}</div>
+              <div class="group-h mt-3">O que mandar</div>
+              <div class="chips" style="flex-wrap:wrap;margin:0;padding:0">${d.tipos.map((t) => h`<button class="chip ${u.tipos.includes(t) ? 'solid' : ''}" data-act="tg.tipo" data-t="${t}">${TIPO_LABEL[t] || t}</button>`)}</div>
+              <div class="li mt-3"><span class="main"><span class="t">Limite por dia</span><span class="s">Hoje: ${d.uso.hoje} de ${u.limiteDia}</span></span><span class="input-wrap" style="width:120px"><input class="input num" inputmode="numeric" value="${u.limiteDia}" data-on-change="tg.limDia" aria-label="Limite por dia"><span class="suffix">msg</span></span></div>
+              <div class="row-sm mt-4" style="flex-wrap:wrap"><button class="btn btn-ghost" data-act="tg.test" ${u.ativo ? '' : raw('disabled')}>${icon('message', 'sm')}Enviar teste</button><a class="btn btn-ghost" href="https://t.me/${b.bot}" target="_blank" rel="noopener">${icon('external', 'sm')}Abrir conversa</a><button class="btn btn-ghost" data-act="tg.unlink">Desconectar</button></div>
+              <p class="faint mt-3" style="font-size:12.5px">No Telegram, mande <b>/hoje</b> para o resumo do dia ou <b>/parar</b> para desligar os avisos. As respostas chegam em até 5 minutos.</p>`}
+          <a class="btn btn-ghost btn-sm mt-3" href="#/cfg/telegram/comandos">${icon('list', 'sm')}Ver todos os comandos</a>
+        </div>
+      </div>
+      <div class="span-6 stack">
+        ${d.dono && b.configurado ? botCard(b) : ''}
+        <div class="card pad-lg"><div class="row"><b class="grow">Histórico</b><button class="btn-icon" data-act="tg.poll" aria-label="Atualizar">${icon('refresh', 'sm')}</button></div>
+          ${d.historico.length ? h`<div class="list mt-2">${d.historico.map((m) => { const s = STATUS[m.status] || [m.status, '']; return h`<div class="li"><span class="tile sm" style="background:var(--surface-2)">${icon(m.direcao === 'entrada' ? 'down' : 'up', 'sm')}</span><span class="main"><span class="t ellipsis">${m.corpo || '—'}</span><span class="s">${hora(m.em)} · ${m.origem || ''}${m.erro ? ' · ' + m.erro : ''}</span></span><span class="chip ${s[1]}">${s[0]}</span></div>`; })}</div>` : h`<p class="faint mt-2" style="font-size:13px">Nada ainda.</p>`}</div>
+      </div></div>`;
+  }
+
+  function botCard(b) {
+    return h`<div class="card pad-lg"><div class="row"><span class="tile" style="background:var(--primary-tint);color:var(--primary-ink)">${icon('shield')}</span><div class="grow"><b>Bot do Telegram</b><p class="muted" style="font-size:13px">Só você (dono) vê. O token fica nas propriedades do script, nunca na planilha nem no navegador.</p></div></div>
+      ${b.configurado ? h`<p class="mt-3" style="font-size:13.5px">${icon('check-circle', 'sm')} Bot: <b>@${b.bot}</b>${b.nome ? ' · ' + b.nome : ''} · token ${b.token}</p>` : h`<ol class="muted mt-3" style="font-size:13.5px;line-height:1.6;padding-left:18px">
+          <li>No Telegram, abra <a href="https://t.me/BotFather" target="_blank" rel="noopener"><b>@BotFather</b></a> e mande <b>/newbot</b>.</li>
+          <li>Escolha um nome (ex.: <i>Prumo</i>) e um usuário terminado em <i>bot</i> (ex.: <i>prumo_goisdev_bot</i>).</li>
+          <li>Copie o token que ele mandar (formato <i>123456789:AAH…</i>) e cole abaixo.</li></ol>`}
+      <form class="form mt-3" id="tg-cfg" novalidate><div class="field full"><label for="tg-tk">Token do bot</label><input id="tg-tk" class="input" name="token" type="password" autocomplete="off" placeholder="${b.configurado ? 'Deixe em branco para manter' : '123456789:AAH…'}"></div>
+        <button class="btn btn-primary btn-sm mt-2" data-act="tg.saveCfg">${icon('check', 'sm')}Salvar e conferir</button></form>
+      ${b.configurado ? h`<div class="list mt-3">${sw('tg.global', b.ativo, 'Bot ativo', 'Desligado, nenhuma mensagem sai para ninguém')}</div>` : ''}</div>`;
+  }
+
+  P.screen('cfg/telegram', { mod: 'cfg', tab: 'telegram', title: 'Telegram', render, mount() { if (!st.data) load(); } });
+  // ================= Comandos do Telegram (subtela) =================
+  const cm = { data: null, q: '' };
+  async function loadCmds() { try { cm.data = await P.api.call('tg.commands', {}); } catch (e) { ui.toast(e.message, { error: true }); cm.data = { erro: e.message }; } if (P.router.current() && P.router.current().tab === 'telegram-cmds') P.router.render(true); }
+  function renderCmds() {
+    const back2 = h`<a href="#/cfg/telegram" class="muted row-sm" style="font-size:13px">${icon('chev-l', 'xs')}Telegram</a>`;
+    const d = cm.data;
+    if (!d) return h`<div class="page-head"><div>${back2}<h1 class="mt-2">Comandos do Telegram</h1></div></div>${ui.skeleton()}`;
+    if (d.erro) return h`<div class="page-head"><div>${back2}<h1 class="mt-2">Comandos do Telegram</h1></div></div>${ui.empty({ ill: 'search', title: 'Não carregou', text: d.erro, action: { act: 'tg.cmdsLoad', label: 'Tentar de novo' } })}`;
+    const n = P.norm(cm.q), hit = (x) => !n || P.norm([x.cmd, x.args, x.desc, x.exemplo, (x.aliases || []).join(' ')].join(' ')).includes(n);
+    const grupos = {}; d.comandos.filter(hit).forEach((x) => { (grupos[x.grupo] = grupos[x.grupo] || []).push(x); });
+    const outros = {}; d.outros.filter(hit).forEach((x) => { (outros[x.grupo] = outros[x.grupo] || []).push(x); });
+    const row = (x) => h`<div class="li" style="align-items:flex-start"><span class="main"><span class="t"><code class="tg-cmd">${x.cmd}</code>${x.args ? h` <span class="faint">${x.args}</span>` : ''}${(x.aliases || []).length ? h` <span class="faint" style="font-size:12px">(também ${x.aliases.join(', ')})</span>` : ''}${x.ia && !d.ia ? h` <span class="chip">IA desligada</span>` : ''}</span>
+        <span class="s" style="white-space:normal">${x.desc}</span>${x.exemplo && x.exemplo !== x.cmd ? h`<span class="s">Exemplo: <code>${x.exemplo}</code></span>` : ''}</span>
+        ${x.exemplo ? h`<button class="btn-icon sm" data-act="tg.cmdCopy" data-v="${x.exemplo}" aria-label="Copiar ${x.exemplo}">${icon('copy', 'sm')}</button>` : ''}</div>`;
+    const total = d.comandos.length;
+    return h`<div class="page-head"><div>${back2}<h1 class="mt-2">Comandos do Telegram</h1><p>${total} comandos que o bot${d.bot ? ' @' + d.bot : ''} entende hoje, mais respostas, frases e envio de arquivos.</p></div>
+        <div class="row-sm wrap">${d.bot ? h`<a class="btn btn-ghost btn-sm" href="https://t.me/${d.bot}" target="_blank" rel="noopener">${icon('external', 'sm')}Abrir o bot</a>` : ''}${d.dono && d.bot ? h`<button class="btn btn-ghost btn-sm" data-act="tg.cmdMenu">${icon('list', 'sm')}Publicar no menu "/" do Telegram</button>` : ''}</div></div>
+      <div class="filters mb-3"><input class="input" data-on-input="tg.cmdQ" value="${cm.q}" placeholder="Buscar comando ou assunto (ex.: pdf, questões, relatório)" aria-label="Buscar comando"></div>
+      <div class="dash"><div class="span-7 stack">${Object.keys(grupos).length ? Object.entries(grupos).map(([g, xs]) => h`<div class="card pad-lg"><b>${g}</b><div class="list mt-2">${xs.map(row)}</div></div>`) : ui.empty({ ill: 'search', title: 'Nenhum comando com esse termo', small: true })}</div>
+        <div class="span-5 stack">${Object.entries(outros).map(([g, xs]) => h`<div class="card pad-lg"><b>${g}</b><div class="list mt-2">${xs.map((x) => h`<div class="li" style="align-items:flex-start"><span class="main"><span class="t">${x.cmd}</span><span class="s" style="white-space:normal">${x.desc}</span></span></div>`)}</div></div>`)}
+          <div class="card pad-lg"><b>Como funciona</b><p class="muted mt-2" style="font-size:13px">O bot lê as mensagens a cada 5 minutos (ou na hora com "Verificar" na tela do Telegram): as respostas não são instantâneas. Só o chat conectado à sua conta recebe os seus dados; outro chat recebe só as instruções para conectar. "Enviado" quer dizer que o Telegram aceitou a mensagem, não que ela foi lida.</p></div></div></div>`;
+  }
+  P.screen('cfg/telegram/comandos', { mod: 'cfg', tab: 'telegram-cmds', title: 'Comandos do Telegram', render: renderCmds, mount() { if (!cm.data) loadCmds(); } });
+  Object.assign(P.act, {
+    'tg.cmdsLoad': () => { cm.data = null; P.router.render(true); loadCmds(); },
+    'tg.cmdQ': P.debounce((el) => { cm.q = el.value; P.router.render(true); const i = document.querySelector('[data-on-input="tg.cmdQ"]'); if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 250),
+    'tg.cmdCopy': (el) => { const v = el.dataset.v; try { navigator.clipboard.writeText(v).then(() => ui.toast('Copiado: ' + v), () => ui.toast(v)); } catch (e) { ui.toast(v); } },
+    'tg.cmdMenu': async (el) => { el.classList.add('loading'); try { const r = await P.api.call('tg.setCommands', {}, { mutation: true }); ui.toast(`${r.total} comandos publicados no menu "/" do bot`); } catch (e) { ui.toast(e.message, { error: true }); } el.classList.remove('loading'); }
+  });
+
+
+  const saveUser = (payload, msg) => call('tg.saveUser', payload, msg);
+  Object.assign(P.act, {
+    'tg.saveCfg': (el, ev) => { ev && ev.preventDefault(); const v = document.getElementById('tg-tk').value.trim(); if (!v) { ui.toast('Cole o token do @BotFather.', { error: true }); return; } return call('tg.saveConfig', { token: v }, 'Bot conectado', el); },
+    'tg.global': (el) => call('tg.saveConfig', { ativo: el.checked }, el.checked ? 'Bot ligado' : 'Bot desligado para todos'),
+    'tg.link': async (el) => {
+      el.classList.add('loading');
+      try { const r = await P.api.call('tg.linkCode', {}, { mutation: true }); st.link = r.url; window.open(r.url, '_blank', 'noopener'); }
+      catch (e) { ui.toast(e.message, { error: true }); }
+      el.classList.remove('loading'); P.router.render(true);
+    },
+    'tg.poll': async (el) => {
+      if (el) el.classList.add('loading');
+      const before = st.data && st.data.usuario.conectado;
+      const r = await call('tg.poll', {}, null, el);
+      if (r && !before && r.usuario.conectado) ui.toast('Telegram conectado!', { icon: 'check' });
+      else if (r && !r.usuario.conectado) ui.toast('Ainda não chegou. Tocou em Iniciar no Telegram? Tente de novo em alguns segundos.');
+    },
+    'tg.ativo': (el) => saveUser({ ativo: el.checked }, el.checked ? 'Telegram ligado' : 'Telegram desligado'),
+    'tg.auto': async (el) => {
+      if (el.checked) { const ok = await ui.confirm({ title: 'Autorizar avisos automáticos?', text: 'O Prumo junta os avisos novos e manda no Telegram a cada 15 minutos, até o seu limite diário. Você pode desligar aqui ou mandando /parar no Telegram.', ok: 'Autorizar' }); if (!ok) { el.checked = false; return; } }
+      return saveUser({ automatico: el.checked }, el.checked ? 'Avisos automáticos ligados' : 'Avisos automáticos desligados');
+    },
+    'tg.resumo': (el) => saveUser({ resumo: el.checked }, el.checked ? 'Resumo das 7h ligado' : 'Resumo das 7h desligado'),
+    'tg.tipo': (el) => { const cur = new Set(st.data.usuario.tipos); cur.has(el.dataset.t) ? cur.delete(el.dataset.t) : cur.add(el.dataset.t); return saveUser({ tipos: [...cur] }); },
+    'tg.limDia': (el) => { const n = Math.round(P.parseNum(el.value)); if (!(n >= 1 && n <= 200)) { ui.toast('Use um valor entre 1 e 200.', { error: true }); el.value = st.data.usuario.limiteDia; return; } return saveUser({ limiteDia: n }, 'Limite salvo'); },
+    'tg.test': async (el) => { const r = await call('tg.sendTest', {}, null, el); if (r) ui.toast(r.resultado === 'duplicado' ? 'Já enviado neste minuto.' : 'Teste enviado. Confira o Telegram.', { icon: 'message' }); },
+    'tg.unlink': async () => { const ok = await ui.confirm({ title: 'Desconectar o Telegram?', text: 'O Prumo para de mandar mensagens. Você pode conectar de novo quando quiser.', ok: 'Desconectar' }); if (ok) { st.link = null; return call('tg.unlink', {}, 'Telegram desconectado'); } }
+  });
+})();
+</script>
